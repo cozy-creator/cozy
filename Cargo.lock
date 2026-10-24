@@ -373,12 +373,6 @@ checksum = "4c7f02d4ea65f2c1853089ffd8d2787bdbc63de2f0d29dedbcf8ccdfa0ccd4cf"
 
 [[package]]
 name = "base64"
-version = "0.22.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
-
-[[package]]
-name = "base64"
 version = "0.23.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
@@ -471,7 +465,7 @@ name = "calcifer"
 version = "0.11.16"
 dependencies = [
  "axum",
- "base64 0.22.1",
+ "base64",
  "ed25519-dalek",
  "futures-util",
  "getrandom 0.3.4",
@@ -618,7 +612,7 @@ version = "0.11.16"
 dependencies = [
  "anstream",
  "anstyle",
- "base64 0.22.1",
+ "base64",
  "clap",
  "clap_complete",
  "comfy-table",
@@ -1606,7 +1600,7 @@ name = "hub-client"
 version = "0.11.16"
 dependencies = [
  "aws-lc-rs",
- "base64 0.22.1",
+ "base64",
  "ed25519-dalek",
  "http",
  "openapiv3",
@@ -1677,7 +1671,7 @@ version = "0.1.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ddc03d96684f9226b8a787cdb71488417b53ab5ea8fdb1dac946cb9431cc8bff"
 dependencies = [
- "base64 0.23.1",
+ "base64",
  "bytes",
  "futures-channel",
  "futures-util",
@@ -2431,7 +2425,7 @@ version = "4.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d354a98a3d1251555de99e8fdd8afda05573c31b82f59063a7b0a29b5527f120"
 dependencies = [
- "base64 0.23.1",
+ "base64",
  "serde_core",
 ]
 
@@ -2608,7 +2602,7 @@ dependencies = [
 name = "protocol"
 version = "0.11.16"
 dependencies = [
- "base64 0.22.1",
+ "base64",
  "bytes",
  "ed25519-dalek",
  "eventsource-stream",
@@ -2962,7 +2956,7 @@ version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "16a1cfa75cc186dd73d5818e510e042e40927bccc9c236b061cea97e1eb08029"
 dependencies = [
- "base64 0.23.1",
+ "base64",
  "bytes",
  "futures-core",
  "futures-util",
@@ -3379,17 +3373,6 @@ dependencies = [
 
 [[package]]
 name = "serde_json_canonicalizer"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fe52319a927259afbfa5180c5157cd8167edfd3e8c254f9558c7fef44c5649f2"
-dependencies = [
- "ryu-js",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "serde_json_canonicalizer"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "87f7bb64f8c7e9f783fdfe883b5fe93a90bee1597c63705baa91842c5f698620"
@@ -3566,7 +3549,7 @@ version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7944b186fea86436f865540901f0afbd7fa48568ff5f2f4e8b9e27ae758771fc"
 dependencies = [
- "base64 0.23.1",
+ "base64",
  "hex",
  "jiff",
  "serde",
@@ -3616,7 +3599,7 @@ version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "24f58ba2ce9de6e912d5e4043eeb8baa1aeee7ddf9ea19c950a20ee6e0973979"
 dependencies = [
- "base64 0.23.1",
+ "base64",
  "hex",
  "jiff",
  "pem",
@@ -3631,7 +3614,7 @@ version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8d81887abe3161d7f0d04f224236e14390f782ce6f3b5e2717819ef2d7b452cb"
 dependencies = [
- "base64 0.23.1",
+ "base64",
  "const-oid 0.9.6",
  "futures-io",
  "hex",
@@ -3640,7 +3623,7 @@ dependencies = [
  "rustls-webpki",
  "serde",
  "serde_json",
- "serde_json_canonicalizer 0.4.1",
+ "serde_json_canonicalizer",
  "sigstore-bundle",
  "sigstore-crypto",
  "sigstore-merkle",
@@ -3914,7 +3897,7 @@ dependencies = [
  "async-trait",
  "aws-lc-rs",
  "axum",
- "base64 0.22.1",
+ "base64",
  "bytes",
  "clap",
  "ed25519-dalek",
@@ -3938,7 +3921,7 @@ dependencies = [
  "self-replace",
  "serde",
  "serde_json",
- "serde_json_canonicalizer 0.3.2",
+ "serde_json_canonicalizer",
  "sha2 0.10.9",
  "str0m",
  "tar",
@@ -3966,7 +3949,7 @@ dependencies = [
  "async-trait",
  "aws-credential-types",
  "aws-sigv4",
- "base64 0.22.1",
+ "base64",
  "bytes",
  "flate2",
  "futures",
@@ -3997,7 +3980,7 @@ name = "tensorfs-py"
 version = "0.14.0"
 dependencies = [
  "async-trait",
- "base64 0.22.1",
+ "base64",
  "platform",
  "pyo3",
  "serde_json",
