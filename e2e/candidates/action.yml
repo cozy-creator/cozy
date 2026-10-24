@@ -1,13 +1,12 @@
 name: candidates
 description: >
-  The candidates, built on this runner and named for e2e/lib.sh in $CANDIDATES. On Linux, always the whole set
-  (a released Runtime before CPU mode cannot run a model here, so no Linux suite falls back to releases):
-  TensorD (the dev cozy, <version>+dev.g<sha8>), the TensorFS wheel and the cozy-runtime wheel, the change's
-  repo at its commit and the other two at `stack_ref` / `runtime_ref` (master), so a mismatch between them
-  fails here and not on PyPI. On macOS and Windows, only what the change's own repo builds (the rest is the
-  release). `tensord`, `tensorfs` and `runtime` name a release to take instead of a build (Linux): the set a
-  person has, checked against the change. A packages change adds its checkout; on Linux any other change takes
-  packages master ($PACKAGES_MASTER), the packages that ship with this set. The change's repo is at .src.
+  The candidate set, built on this runner for its own OS and named for e2e/lib.sh in $CANDIDATES: TensorD
+  (the dev cozy, <version>+dev.g<sha8>), the TensorFS wheel and the cozy-runtime wheel, the change's repo at
+  its commit and the other two at `stack_ref` / `runtime_ref` (master), so a mismatch between them fails here
+  and not on PyPI, plus packages master ($PACKAGES_MASTER) unless the change is the packages'. No candidate
+  leg tests a released binary: a released Runtime before CPU mode cannot run a model on these runners, and a
+  released cozy carries the bugs master fixed. `tensord`, `tensorfs` and `runtime` name a release to take
+  instead of a build, on Linux (a dispatch checking a published set). The change's repo is at .src.
 inputs:
   repo:
     description: The repo whose change this is
@@ -37,38 +36,35 @@ runs:
   using: composite
   steps:
     - uses: astral-sh/setup-uv@v7
-    - if: inputs.build != '' || runner.os == 'Linux'
-      uses: actions/checkout@v5
+    - uses: actions/checkout@v5
       with:
         repository: cozy-creator/${{ inputs.repo }}
         ref: ${{ inputs.ref }}
         path: .src
-    - if: inputs.repo != 'cozy-creator' && runner.os == 'Linux'
+    - if: inputs.repo != 'cozy-creator'
       uses: actions/checkout@v5
       with:
         repository: cozy-creator/cozy-creator
         ref: ${{ inputs.stack_ref }}
         path: .stack
-    - if: inputs.repo != 'cozy-runtime' && runner.os == 'Linux'
+    - if: inputs.repo != 'cozy-runtime'
       uses: actions/checkout@v5
       with:
         repository: cozy-creator/cozy-runtime
         ref: ${{ inputs.runtime_ref }}
         path: .rt
-    - if: inputs.repo != 'packages' && runner.os == 'Linux'
+    - if: inputs.repo != 'packages'
       uses: actions/checkout@v5
       with:
         repository: cozy-creator/packages
         path: .pkgs
-    - if: inputs.repo != 'packages' && runner.os == 'Linux'
+    - if: inputs.repo != 'packages'
       shell: bash
       run: echo "PACKAGES_MASTER=.pkgs" >> "$GITHUB_ENV"
-    - if: runner.os == 'Linux' || (inputs.build != '' && inputs.repo == 'cozy-creator')
-      uses: Swatinem/rust-cache@v2
+    - uses: Swatinem/rust-cache@v2
       with:
         workspaces: ${{ inputs.repo == 'cozy-creator' && '.src' || '.stack' }} -> target
-    - if: inputs.build != '' || runner.os == 'Linux'
-      shell: bash
+    - shell: bash
       env:
         REPO: ${{ inputs.repo }}
         BUILD: ${{ inputs.build }}
@@ -87,12 +83,6 @@ runs:
         creator=.stack runtime=.rt cozy=1 tfs=1
         [ "$REPO" != cozy-creator ] || creator=.src
         [ "$REPO" != cozy-runtime ] || runtime=.src
-        if [ "$RUNNER_OS" != Linux ]; then
-          [ "$REPO" = cozy-creator ] || creator=''
-          [ "$REPO" = cozy-runtime ] || runtime=''
-          [[ " $BUILD " == *" cozy "* ]] || cozy=''
-          [[ " $BUILD " == *" tensorfs "* ]] || tfs=''
-        fi
         args=()
         release() { python3 -m pip download -q --no-deps --only-binary :all: "$1==$2" -d "$out"; }
         if [ -n "$TENSORD" ]; then
@@ -136,8 +126,3 @@ runs:
         [[ " $BUILD " != *" package "* ]] || args+=(--packages .src)
         echo "CANDIDATES=${args[*]:-}" >> "$GITHUB_ENV"
         echo "candidates: ${args[*]:-none}"
-    - if: inputs.build == '' && runner.os != 'Linux'
-      shell: bash
-      run: |
-        echo "CANDIDATES=" >> "$GITHUB_ENV"
-        echo "candidates: none (the released cozy, Runtime and TensorFS)"
