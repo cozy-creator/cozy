@@ -934,13 +934,22 @@ mod python {
         })
     }
 
-    /// `this` with `changes` in place of its fields, through serde: a change of the wrong shape is
-    /// refused by its path, and one naming no field of the record by its name.
+    /// `this` with `changes` in place of its fields, through serde.
     fn replaced<T: Serialize + serde::de::DeserializeOwned>(this: &T, changes: Option<&Bound<'_, PyDict>>) -> PyResult<T> {
+        match serde_json::to_value(this).map_err(|e| PyValueError::new_err(e.to_string()))? {
+            Value::Object(fields) => merged(fields, changes),
+            _ => Err(PyValueError::new_err("not a record")),
+        }
+    }
+
+    /// The record `fields` and `changes` make, through serde: a change of the wrong shape is
+    /// refused by its path, one naming no field of the record by its name, and a needed field
+    /// left out by its name.
+    fn merged<T: Serialize + serde::de::DeserializeOwned>(
+        mut fields: serde_json::Map<String, Value>,
+        changes: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<T> {
         let error = |e: &dyn std::fmt::Display| PyValueError::new_err(e.to_string());
-        let Value::Object(mut fields) = serde_json::to_value(this).map_err(|e| error(&e))? else {
-            return Err(PyValueError::new_err("not a record"));
-        };
         let mut given = vec![];
         for (key, value) in changes.into_iter().flat_map(|d| d.iter()) {
             let (key, value) = (key.extract::<String>()?, json_of(&value)?);
@@ -1012,6 +1021,13 @@ mod python {
                 fn replace(&self, changes: Option<&Bound<'_, PyDict>>) -> PyResult<Self> {
                     replaced(self, changes)
                 }
+                /// One built from `fields` by name: a field left out takes its default; a needed one
+                /// left out is refused by its name.
+                #[new]
+                #[pyo3(signature = (**fields))]
+                fn new(fields: Option<&Bound<'_, PyDict>>) -> PyResult<Self> {
+                    merged(serde_json::Map::new(), fields)
+                }
             }
         )*};
     }
@@ -1036,6 +1052,13 @@ mod python {
                 #[pyo3(signature = (**changes))]
                 fn replace(&self, changes: Option<&Bound<'_, PyDict>>) -> PyResult<Self> {
                     replaced(self, changes)
+                }
+                /// One built from `fields` by name: a field left out takes its default; a needed one
+                /// left out is refused by its name.
+                #[new]
+                #[pyo3(signature = (**fields))]
+                fn new(fields: Option<&Bound<'_, PyDict>>) -> PyResult<Self> {
+                    merged(serde_json::Map::new(), fields)
                 }
             }
         )*};
