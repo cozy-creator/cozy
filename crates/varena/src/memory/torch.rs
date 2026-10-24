@@ -79,7 +79,7 @@ impl Memory {
     /// thread's routed arena (a request's or a region's), else the process's. Err is
     /// `Error::Exhausted`, whose text is torch's OOM reason, or `Invalid` before torch is served.
     pub fn torch_alloc(&self, bytes: u64, stream: usize, pool: Option<PoolId>) -> Result<u64> {
-        self.torch()?.alloc(bytes, stream, pool)
+        self.device_call(|| self.torch()?.alloc(bytes, stream, pool))
     }
 
     /// Never fails and never waits on the device.
@@ -98,7 +98,7 @@ impl Memory {
 
     /// Before capture begins: maps `expected` bytes into `pool`, making room here.
     pub fn pool_prepare(&self, pool: PoolId, expected: u64) -> Result<()> {
-        self.torch()?.pool_prepare(pool, expected)
+        self.device_call(|| self.torch()?.pool_prepare(pool, expected))
     }
 
     /// torch's begin-allocate-to-pool hook, on the capturing thread before the capture starts on
@@ -128,7 +128,7 @@ impl Memory {
 
     /// An event on `stream` after the pool's use there (a replay and its readers).
     pub fn pool_fence(&self, pool: PoolId, stream: usize) -> Result<()> {
-        self.torch()?.pool_fence(pool, stream)
+        self.device_call(|| self.torch()?.pool_fence(pool, stream))
     }
 
     pub fn torch_stats(&self) -> TorchStats {
@@ -281,10 +281,24 @@ impl Source for Leased {
                     off += len;
                 }
                 Err(e) => {
-                    let _ = self.agent.refused(lease.ticket, lease.phys);
+                    if e.is_sticky() {
+                        // Access setup may have failed after mapping, with rollback unproven.
+                        // Never acknowledge this grant as refused or destroy the import: the
+                        // manager must retain ownership until this executor actually exits.
+                        self.held.lock().insert(id(lease.ticket), Held {
+                            ticket: lease.ticket, phys: lease.phys, pinned: false, committed: false,
+                        });
+                    } else {
+                        let _ = self.agent.refused(lease.ticket, lease.phys);
+                    }
                     failed.get_or_insert(e);
                 }
             }
+        }
+        // A failed map rollback is already fatal. An acknowledgement error must not replace
+        // it with ordinary I/O and hide ownership loss; leave these grants held until exit.
+        if let Some(error) = failed.as_ref().filter(|error| error.is_sticky()) {
+            return Err(error.clone());
         }
         self.agent.mapped(&tickets)?;
         if off < va.len && failed.is_none() {

@@ -759,9 +759,10 @@ impl Torch {
     /// A torch block on `stream`: in `pool`'s arena while a capture routes there, else the thread's
     /// routed arena, else the process's. Err is `Exhausted`, whose text is torch's OOM reason.
     pub fn alloc(&self, bytes: u64, stream: usize, pool: Option<PoolId>) -> Result<u64> {
+        self.check_completion()?;
         let size = bytes.max(1).checked_next_multiple_of(ALIGN).filter(|s| *s < 1 << 50).ok_or_else(|| exhausted(bytes, "no device holds that much"))?;
         let sh = &self.sh;
-        match pool {
+        let result = match pool {
             Some(p) => {
                 sh.capturing_on(p, stream);
                 sh.alloc_in(&sh.arena(Owner::Pool(p)), size, stream, true)
@@ -770,7 +771,15 @@ impl Torch {
                 sh.begun(stream);
                 sh.alloc_in(&sh.routed(), size, stream, sh.capturing())
             }
-        }
+        };
+        if !result.as_ref().err().is_some_and(Error::is_sticky) { self.check_completion()?; }
+        result
+    }
+
+    pub(crate) fn check_completion(&self) -> Result<()> {
+        if self.sh.clocks.read().values().any(|clock| clock.lost.load(Acquire)) {
+            Err(Error::Ownership("an allocator stream's completion is unproven".into()))
+        } else { Ok(()) }
     }
 
     /// Never fails and never waits on the device; a pointer no arena holds is logged.
@@ -906,6 +915,7 @@ impl Torch {
                     sh.install(&a, &mut st, va.base, chunks, None, Tier::Pool);
                 }
                 Err(e) => {
+                    if e.is_sticky() { return Err(e); }
                     sh.unmap(va, chunks, true, false);
                     if !(matches!(e, Error::Exhausted(_)) && sh.give_back()) {
                         return Err(e);
@@ -1236,6 +1246,7 @@ impl Shared {
             Err(e) => {
                 c.lost.store(true, Release);
                 tracing::error!("varena: stream {:#x}'s epoch failed ({why}) and so did its synchronize ({e}): its spans are quarantined", c.stream);
+                self.progressed();
             }
         }
     }
@@ -1331,6 +1342,11 @@ impl Shared {
                     }
                 }
                 Err(e) => {
+                    if e.is_sticky() {
+                        // The map may still exist. Memory's error boundary retains this allocator
+                        // and its source; do not return this VA or release any of its handles.
+                        return Err(e);
+                    }
                     self.unmap(va, chunks, true, false);
                     if !(matches!(e, Error::Exhausted(_)) && self.give_back()) {
                         return Err(e);
@@ -1344,6 +1360,7 @@ impl Shared {
     /// (the poller, a Rust thread, sees them land); false when none is left to give.
     fn give_back(&self) -> bool {
         loop {
+            if self.clocks.read().values().any(|clock| clock.lost.load(Acquire)) { return false; }
             let seen = *self.progress.0.lock();
             let (quiet, pending) = self.idle.lock().bytes();
             if quiet > 0 {
@@ -1357,6 +1374,7 @@ impl Shared {
             self.kick();
             let mut p = self.progress.0.lock();
             while *p == seen {
+                if self.clocks.read().values().any(|clock| clock.lost.load(Acquire)) { return false; }
                 self.progress.1.wait(&mut p);
             }
         }
@@ -1701,7 +1719,11 @@ impl Direct {
             e => e,
         })?;
         if let Err(e) = self.backend.map(va, off, &p, Access::ReadWrite) {
-            let _ = self.allowance.destroy(&*self.backend, p);
+            if e.is_sticky() {
+                self.held.lock().insert(p.id, p);
+            } else {
+                let _ = self.allowance.destroy(&*self.backend, p);
+            }
             return Err(e);
         }
         let id = p.id;
