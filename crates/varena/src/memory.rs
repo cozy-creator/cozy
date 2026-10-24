@@ -340,6 +340,9 @@ impl Memory {
         if let Some(error) = result.as_ref().err().filter(|e| e.is_sticky() || matches!(e, Error::Internal(_) | Error::Closed(_))) {
             self.inner.lost_backing(error);
         }
+        if !result.as_ref().err().is_some_and(|e| e.is_sticky() || matches!(e, Error::Internal(_) | Error::Closed(_))) {
+            self.inner.check_ownership()?;
+        }
         result
     }
 
