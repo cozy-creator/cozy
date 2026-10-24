@@ -326,11 +326,13 @@ impl PyMemory {
         detached(py, &self.gpu.uuid, || self.memory().serve_standalone_torch().map(drop))
     }
 
-    /// Host pages of `gpu.memory` bytes (CPU, MPS), on the table `gpu.uuid` names.
+    /// Host pages of `gpu.memory` bytes (CPU, MPS), never past the host's limit (its tightest
+    /// cgroup's), on the table `gpu.uuid` names.
     #[staticmethod]
     fn host(py: Python<'_>, gpu: PyGpuId) -> PyResult<Self> {
-        let id = GpuId { uuid: gpu.uuid, model: gpu.model, memory: gpu.memory };
-        PyMemory::open(py, (KDL_CPU, 0), || Ok((id.clone(), Box::new(HostBackend::new(id.memory)) as Box<dyn Backend>)))
+        let memory = platform::contain::host_memory::limit().map_or(gpu.memory, |limit| limit.min(gpu.memory));
+        let id = GpuId { uuid: gpu.uuid, model: gpu.model, memory };
+        PyMemory::open(py, (KDL_CPU, 0), || Ok((id.clone(), Box::new(host_backend(id.memory)) as Box<dyn Backend>)))
     }
 
     /// Registers `set` and brings it to `level`; returns its id.
@@ -981,4 +983,18 @@ pub fn install(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("StaleBinding", py.get_type::<StaleBinding>())?;
     parent.add_submodule(&m)?;
     py.import("sys")?.getattr("modules")?.set_item("tensorfs._ext.varena", &m)
+}
+
+/// Host pages spilling to the TensorFS home (the store's disk): under memory pressure the kernel
+/// writes them back and drops them, never OOM-kills the executor. With no spill directory they
+/// stay in shared anonymous memory, with a warning.
+fn host_backend(limit: u64) -> HostBackend {
+    let dir = tensorfs::home::resolve(None).map_err(|e| e.to_string()).map(|root| root.join("spill"));
+    match dir.and_then(|d| std::fs::create_dir_all(&d).map(|()| d).map_err(|e| e.to_string())) {
+        Ok(dir) => HostBackend::spilling(limit, dir),
+        Err(why) => {
+            tracing::warn!("varena: host pages stay in anonymous memory, which only swap pages: no spill directory ({why})");
+            HostBackend::new(limit)
+        }
+    }
 }

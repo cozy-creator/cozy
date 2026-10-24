@@ -182,6 +182,44 @@ pub fn page(len: u64) -> Result<Owned> {
     Ok(fd)
 }
 
+/// A host page of `len` bytes the kernel can write back and drop under memory pressure: an
+/// unlinked regular file in `dir` (a memfd, like any shared anonymous memory, pages only to
+/// swap, so a capped cgroup is OOM-killed instead). Its disk is reserved now: a full disk is
+/// `ENOSPC` here, never a SIGBUS later.
+pub fn spill_page(dir: &std::path::Path, len: u64) -> Result<Owned> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).mode(0o600);
+    let file = match options.clone().custom_flags(libc::O_TMPFILE).open(dir) {
+        Ok(file) => file,
+        // A filesystem with no O_TMPFILE: a fresh name, unlinked at once.
+        Err(e) if matches!(e.raw_os_error(), Some(libc::EOPNOTSUPP | libc::EISDIR | libc::EINVAL)) => {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let path = dir.join(format!("varena-{}-{}", std::process::id(), NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+            let file = options.create_new(true).open(&path).map_err(Error::os("create a spill page"))?;
+            std::fs::remove_file(&path).map_err(Error::os("unlink a spill page"))?;
+            file
+        }
+        Err(e) => return Err(Error::os("create a spill page")(e)),
+    };
+    // SAFETY: reserving blocks of a file this function opened.
+    let errno = unsafe { libc::posix_fallocate(file.as_raw_fd(), 0, len as libc::off_t) };
+    if errno != 0 {
+        return Err(Error::os("reserve a spill page")(std::io::Error::from_raw_os_error(errno)));
+    }
+    Ok(file.into())
+}
+
+/// Starts writing a spill page's dirty bytes back, so the kernel can drop them at once under
+/// pressure: a fill dirties faster than a capped cgroup's writeback cleans.
+pub fn write_back(page: &Owned, len: u64) -> Result<()> {
+    // SAFETY: an asynchronous writeback request on a descriptor the caller holds.
+    if unsafe { libc::sync_file_range(page.as_raw_fd(), 0, len as libc::off64_t, libc::SYNC_FILE_RANGE_WRITE) } != 0 {
+        return Err(Error::os("write a spill page back")(std::io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
 /// A read-only description of a page: what another process imports.
 pub fn export(page: &Owned) -> Result<Owned> {
     crate::shm::reopen(page.as_fd(), false)

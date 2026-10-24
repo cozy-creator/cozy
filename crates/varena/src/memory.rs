@@ -1440,6 +1440,12 @@ impl Inner {
         // once the copy stream is proven drained.
         let ownership_lost = landed.iter().any(|out| matches!(out, Err(Error::Ownership(_))));
         let drained = !ownership_lost && (landed.iter().all(Result::is_ok) || self.backend.drain().is_ok());
+        // A spilling host device starts their writeback (no lock held: it may wait on I/O).
+        for ((_, (va, off, span)), landed) in pages.iter().zip(&landed) {
+            if landed.is_ok() {
+                self.backend.landed(va.base + off, *span);
+            }
+        }
         let mut sticky = false;
         let mut st = self.state.lock();
         if !drained {
@@ -2506,6 +2512,7 @@ impl Pin {
         self.transformed.store(true, Ordering::Release);
         let _ = self.inner.guard(|| {
             let event = self.inner.backend.record(self.stream)?;
+            self.inner.backend.landed(self.ptr, self.len);
             let mut st = self.inner.lock();
             if let Some(h) = st.homes.get_mut(&self.key) {
                 let old = std::mem::replace(&mut h.ready, event);
