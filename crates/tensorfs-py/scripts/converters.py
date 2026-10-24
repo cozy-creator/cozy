@@ -52,6 +52,7 @@ from typing import Any
 import numpy as np
 import torch
 from diffusers.loaders import single_file_utils
+from transformers import AutoConfig, AutoModelForImageTextToText
 
 PINS = {"diffusers": "0.40.0", "transformers": "5.16.1"}
 ROOT = Path(__file__).resolve().parents[1]
@@ -584,6 +585,53 @@ def ideogram4() -> dict[str, Any]:
     return {"name": "ideogram4.fp8", "components": [component]}
 
 
+#: Qwen3.5-architecture MoE checkpoints whose experts are stored fused, one table per key set.
+QWEN_MOE = {"qwen3.6-35b-a3b.experts": "Qwen/Qwen3.6-35B-A3B@995ad96eacd98c81ed38be0c5b274b04031597b0"}
+#: A fused tensor's role, and the per-expert Linear it becomes in cozy-runtime's `moe.RoutedExpert`.
+QWEN_EXPERTS = {"gate_up_proj": "gate_and_up_proj", "down_proj": "down_proj"}
+
+
+def qwen_moe(name: str, pinned: str) -> dict[str, Any]:
+    """Every key as stored, except each layer's fused experts (`experts.gate_up_proj` [E, 2I, H],
+    `experts.down_proj` [E, H, I]), which become one row per expert, `experts.{e}.gate_and_up_proj.weight`
+    and `.down_proj.weight`: the blocks cozy-runtime's `moe.split` builds, which its weight paging moves one
+    expert at a time. The source's config stays the construction config (`keep_config`). Targets are the
+    census of Transformers' model plus the multi-token-prediction layer cozy-runtime's `lm.Draft` adds
+    (`mtp.*`, one decoder layer at the first full-attention index), experts split."""
+    repo, _, commit = pinned.partition("@")
+    index = json.loads(fetch(f"{HF}/{repo}/resolve/{commit}/model.safetensors.index.json"))["weight_map"]
+    config = json.loads(fetch(f"{HF}/{repo}/resolve/{commit}/config.json"))
+    text = config["text_config"]
+    experts, inner, hidden = text["num_experts"], text["moe_intermediate_size"], text["hidden_size"]
+    fused = {"gate_up_proj": [experts, 2 * inner, hidden], "down_proj": [experts, hidden, inner]}
+    with torch.device("meta"):
+        model = AutoModelForImageTextToText.from_config(AutoConfig.for_model(**config))
+        space = sys.modules[type(model).__module__]
+        layer = space.Qwen3_5MoeDecoderLayer(model.config.text_config, text["layer_types"].index("full_attention"))
+    census = [*model.state_dict(), "mtp.fc.weight", "mtp.pre_fc_norm_embedding.weight", "mtp.pre_fc_norm_hidden.weight",
+              *(f"mtp.layers.0.{k}" for k in layer.state_dict()), "mtp.norm.weight"]
+    assert set(census) == set(index), sorted(set(census) ^ set(index))[:5]
+    rows, expect, targets = [], {}, []
+    for key in census:
+        stem, _, role = key.rpartition(".")
+        if not (stem.endswith(".experts") and role in QWEN_EXPERTS):
+            rows.append(row(key, key))
+            targets.append(key)
+            continue
+        shape = fused[role]
+        expect[key] = shape
+        ops = {"take": [0, ["{e}"]], "shape": shape[1:]}
+        rows.append([f"{stem}.{{e}}.{QWEN_EXPERTS[role]}.weight", key, ops, {"e": experts}])
+        stand_in = np.arange(math.prod(shape[:2]) * 2).reshape(shape[0], shape[1], 2)
+        for e in range(experts):
+            got = apply(stand_in, {"take": [0, [e]], "shape": [shape[1], 2]})
+            assert (got == stand_in[e]).all(), (key, e)
+            targets.append(f"{stem}.{e}.{QWEN_EXPERTS[role]}.weight")
+    assert len(targets) == len(set(targets)) == len(index) + len(expect) * (experts - 1)
+    return {"name": name, "keep_config": True,
+            "components": [{"name": "model", "expect": dict(sorted(expect.items())), "rows": rows}]}
+
+
 def generate() -> dict[str, dict[str, Any]]:
     sdxl, shapes = single_file("sdxl.single_file")
     anima, _ = single_file("anima.single_file")
@@ -597,6 +645,7 @@ def generate() -> dict[str, dict[str, Any]]:
         "sdxl.lora": sdxl_lora(sdxl, shapes),
         "seedvr2": seedvr2(),
         "ideogram4.fp8": ideogram4(),
+        **{name: qwen_moe(name, pinned) for name, pinned in QWEN_MOE.items()},
     }
 
 

@@ -23,7 +23,7 @@ macro_rules! table {
 }
 
 /// The built-in tables.
-pub const TABLES: [&str; 7] = [
+pub const TABLES: [&str; 8] = [
     table!("sdxl.single_file"),
     table!("anima.single_file"),
     table!("h3.native"),
@@ -31,6 +31,7 @@ pub const TABLES: [&str; 7] = [
     table!("sdxl.lora"),
     table!("seedvr2"),
     table!("ideogram4.fp8"),
+    table!("qwen3.6-35b-a3b.experts"),
 ];
 
 #[derive(Debug, Deserialize)]
@@ -51,6 +52,10 @@ pub struct Table {
     /// Documents the output carries, by path.
     #[serde(default)]
     pub files: BTreeMap<String, serde_json::Value>,
+    /// The source's `config.json` stays its component's config: the table only re-lays the
+    /// tensors of the layout that config builds (Transformers' fused experts, one per expert).
+    #[serde(default)]
+    pub keep_config: bool,
     pub components: Vec<Component>,
 }
 
@@ -84,7 +89,45 @@ pub struct Component {
     /// Shape preconditions on source keys.
     #[serde(default)]
     pub expect: BTreeMap<String, Vec<u64>>,
+    #[serde(deserialize_with = "rows")]
     pub rows: Vec<Row>,
+}
+
+/// A component's rows. `[target, source, ops, {"e": n}]` stands for n rows, `e` = 0..n: `{e}`
+/// in its strings is the number, and so is a `"{e}"` value (one row per expert of a fused
+/// tensor: `{"take": [0, ["{e}"]]}`).
+fn rows<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Vec<Row>, D::Error> {
+    use serde::de::Error;
+    let mut out = Vec::new();
+    for value in Vec::<serde_json::Value>::deserialize(d)? {
+        let serde_json::Value::Array(parts) = &value else {
+            out.push(Row::deserialize(value).map_err(D::Error::custom)?);
+            continue;
+        };
+        let [target, source, ops, each] = parts.as_slice() else {
+            out.push(Row::deserialize(value).map_err(D::Error::custom)?);
+            continue;
+        };
+        let each: BTreeMap<String, u64> =
+            serde_json::from_value(each.clone()).map_err(D::Error::custom)?;
+        let mut texts = vec![serde_json::json!([target, source, ops]).to_string()];
+        for (name, n) in &each {
+            let mark = format!("{{{name}}}");
+            let value = format!("\"{mark}\"");
+            texts = (texts.iter())
+                .flat_map(|t| {
+                    (0..*n).map(|i| {
+                        t.replace(&value, &i.to_string())
+                            .replace(&mark, &i.to_string())
+                    })
+                })
+                .collect();
+        }
+        for text in texts {
+            out.push(serde_json::from_str(&text).map_err(D::Error::custom)?);
+        }
+    }
+    Ok(out)
 }
 
 #[derive(Debug, Deserialize)]
