@@ -2233,7 +2233,9 @@ impl Pool {
                     sequence_parallel_degree: 1,
                     import_only: true,
                     leases: None,
+                    memory_protocol: device_executor::memory_protocol(None),
                     memory_mode: self.config.host.mode.into(),
+                    memo: executor.memo_settings(),
                 },
                 &mut device_executor::Baseline,
             )?;
@@ -2641,7 +2643,9 @@ impl Pool {
                     call_interfaces: crate::calls::call_interfaces(held, &interface_path),
                     constructions: constructions(&plan),
                     leases,
+                    memory_protocol: device_executor::memory_protocol(leases),
                     memory_mode: self.config.host.mode.into(),
+                    memo: session.executor.memo_settings(),
                 },
                 &mut callbacks,
             )?)?;

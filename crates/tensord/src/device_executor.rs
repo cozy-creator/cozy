@@ -53,7 +53,6 @@ pub struct Hello {
     /// GPU's manager; any other runs its memory alone.
     pub memory_protocol: u32,
     pub sealed: BTreeMap<String, String>,
-    pub torch_loaded: bool,
 }
 
 /// The lease protocol (design varena-leases), where varena serves one.
@@ -136,8 +135,6 @@ pub struct Binding {
     pub variant: String,
     pub development: bool,
     pub custody: String,
-    pub objective: String,
-    pub steps_basis: u64,
     pub placement: String,
     pub package: String,
     pub model: String,
@@ -166,8 +163,6 @@ impl Default for Binding {
             variant: String::new(),
             development: false,
             custody: "canonical".into(),
-            objective: String::new(),
-            steps_basis: 0,
             placement: String::new(),
             package: String::new(),
             model: String::new(),
@@ -206,7 +201,12 @@ pub enum DeviceCommand {
         /// for an executor speaking the lease protocol; a GPU nobody serves runs its own pages.
         #[serde(skip_serializing_if = "Option::is_none")]
         leases: Option<u32>,
+        /// The memory contract it serves ([`memory_protocol`]): the lease protocol, or 0 (its own).
+        memory_protocol: u32,
         memory_mode: MemoryMode,
+        /// Its stage memo tiers, when this machine memoizes ([`DeviceExecutor::memo_settings`]).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        memo: Option<MemoSettings>,
     },
     Load {
         construction: String,
@@ -306,6 +306,20 @@ pub enum DeviceCommand {
         actor: String,
         tensorfs: protocol::machine::TensorFSOptions,
     },
+}
+
+/// A Start's `memory_protocol`: the lease protocol where it names leases this machine serves,
+/// else 0.
+pub fn memory_protocol(leases: Option<u32>) -> u32 {
+    leases.and(LEASES).unwrap_or(0)
+}
+
+/// An executor's stage memo tiers (`memo: stage/1`): its in-memory tier at its own default (-1)
+/// and the largest entry this machine keeps.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct MemoSettings {
+    pub process_bytes: i64,
+    pub entry_bytes: u64,
 }
 
 /// One constructed model slot of a session: its checkpoint and the components it uses.
@@ -732,7 +746,7 @@ impl Line {
         let Some(writer) = self.0.upgrade() else {
             return false;
         };
-        let bytes = command_bytes(command, false);
+        let bytes = command_bytes(command);
         bytes.and_then(|bytes| seam::write_body(&mut writer.lock().unwrap(), &bytes)).is_ok()
     }
     pub fn same(&self, other: &Line) -> bool {
@@ -742,15 +756,8 @@ impl Line {
 
 /// `command`'s wire bytes. Only the typed TensorFS options may carry supplied access: the bytes
 /// keep the token, every other field is scanned.
-fn command_bytes(command: &DeviceCommand, memo: bool) -> io::Result<Vec<u8>> {
+fn command_bytes(command: &DeviceCommand) -> io::Result<Vec<u8>> {
     let mut value = serde_json::to_value(command)?;
-    if let DeviceCommand::Start { leases, .. } = command {
-        // The memory contract this Start serves: leases, or none (standalone).
-        value["memory_protocol"] = leases.and(LEASES).unwrap_or(0).into();
-        if memo {
-            value["memo"] = serde_json::json!({"process_bytes": -1, "entry_bytes": crate::memo::ENTRY_BYTES});
-        }
-    }
     let bytes = serde_json::to_vec(&value)?;
     if let (true, Some(options)) = (
         matches!(command, DeviceCommand::Load { tensorfs: Some(_), .. } | DeviceCommand::Invoke { tensorfs: Some(_), .. }
@@ -1626,7 +1633,7 @@ impl DeviceExecutor {
         services: &mut impl Services,
         watch: &Watch,
     ) -> io::Result<Frame> {
-        let bytes = command_bytes(command, self.memo.is_some())?;
+        let bytes = command_bytes(command)?;
         seam::write_body(&mut self.writer.lock().unwrap(), &bytes)?;
         let mut last = Advance::default();
         loop {
@@ -1691,6 +1698,11 @@ impl DeviceExecutor {
             platform::handles::send_fd(&writer, &descriptor)?;
         }
         Ok(())
+    }
+
+    /// Its Start's `memo`: the tiers its stage memo serves, when this machine memoizes.
+    pub fn memo_settings(&self) -> Option<MemoSettings> {
+        self.memo.as_ref().map(|_| MemoSettings { process_bytes: -1, entry_bytes: crate::memo::ENTRY_BYTES })
     }
 
     /// Attempt-keyed cooperative cancellation; observer teardown never calls this.
