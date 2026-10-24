@@ -92,6 +92,9 @@ pub struct Chunk {
     pub pins: u32,
     /// A reclaim request is out for it.
     pub asked: bool,
+    /// Asked back across the stall look's looks and still held: its own executor's ask never
+    /// counts on it (its return waits on that process's own progress, a cycle of one).
+    pub overdue: bool,
     pub advice: Advice,
 }
 
@@ -300,7 +303,7 @@ fn coming(s: &Snapshot, asker: Option<u64>, cyclic: &BTreeSet<u64>) -> (u64, u64
             match c.state {
                 State::Granted if asker.is_some_and(|a| a != e.id) => later += c.bytes,
                 State::Revoking | State::Released | State::Refused => bytes += c.bytes,
-                State::Mapped if c.asked && c.pins == 0 => bytes += c.bytes,
+                State::Mapped if c.asked && c.pins == 0 && !(c.overdue && asker == Some(e.id)) => bytes += c.bytes,
                 State::Mapped if c.asked && Some(e.id) != asker && !cyclic.contains(&e.id) => {
                     bytes += c.bytes;
                     on.insert(e.id);
@@ -422,12 +425,11 @@ impl<'a> Run<'a> {
         self.chunk(e, c).is_some_and(|ch| ch.state == State::Mapped && !ch.asked && !self.taken.contains(&(e, c)))
     }
 
-    /// The graphs to drop before `c` can go; `None` when something else pins it.
+    /// The graphs to drop before `c` can go; `None` when something else pins it. A graph's
+    /// chunks go with it whether or not the table shows its pins (its holder may keep them
+    /// itself): a graph goes whole, never chunk by chunk.
     fn needs(&self, e: usize, c: usize) -> Option<Vec<usize>> {
         let (ch, by, graphs) = (self.chunk(e, c)?, at(&self.f.pinned_by, e, c)?, &self.ex(e)?.graphs);
-        if ch.pins == 0 {
-            return Some(vec![]);
-        }
         if ch.pins as usize > by.len() {
             return None;
         }
@@ -436,6 +438,11 @@ impl<'a> Run<'a> {
 
     fn free_now(&self, e: usize, c: usize) -> bool {
         self.open(e, c) && self.needs(e, c).is_some_and(|n| n.is_empty())
+    }
+
+    /// An executor declined a page asked back (asked, and pinned by it since): its work holds it.
+    fn declined(&self, e: usize) -> bool {
+        self.ex(e).is_some_and(|x| x.chunks.iter().any(|ch| ch.asked && ch.pins > 0 && ch.state == State::Mapped))
     }
 
     /// A region's chunk: it goes with its region, never alone.
@@ -688,7 +695,11 @@ impl<'a> Run<'a> {
             return self.got >= target;
         }
         let Some((asker, (_, far, slots))) = own else { return self.got >= target };
-        self.water(vec![(asker, far.into_iter().chain(slots).collect())], Stage::Step, target);
+        // Its own current step, unless it already declined one of its pages (in use): then that
+        // set is its own Memory's to stream, never this ask's to wait on.
+        if !self.declined(asker) {
+            self.water(vec![(asker, far.into_iter().chain(slots).collect())], Stage::Step, target);
+        }
         // Others' pinned, unprotected chunks: asked now, given at their unpin.
         for (e, x) in self.s.executors.iter().enumerate() {
             if e == asker || self.cyclic.contains(&x.id) {

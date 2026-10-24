@@ -59,6 +59,9 @@ const ANY: usize = usize::MAX;
 pub const FLOAT: u64 = 64 << 20;
 /// The poller's cadence while epochs are outstanding: it doubles to the longest while nothing lands.
 const NAP: Duration = Duration::from_micros(50);
+/// The lease stall rule's window (three looks of 500 ms): a wait on this process's own idle
+/// spans that sees no epoch land this long gives up.
+const STALL: Duration = Duration::from_millis(1500);
 const NAP_MAX: Duration = Duration::from_millis(2);
 
 /// torch's `MempoolId_t`.
@@ -1341,7 +1344,10 @@ impl Shared {
     }
 
     /// The source is short: this process's idle spans go back to it. Pending ones are waited for
-    /// (the poller, a Rust thread, sees them land); false when none is left to give.
+    /// (the poller, a Rust thread, sees them land) while the poller progresses; false when none
+    /// is left to give, or when [`STALL`] passed with none landing (a capture another thread
+    /// holds open stops the epochs, and that thread may need what this one holds: no wait on
+    /// this process itself).
     fn give_back(&self) -> bool {
         loop {
             let seen = *self.progress.0.lock();
@@ -1357,7 +1363,9 @@ impl Shared {
             self.kick();
             let mut p = self.progress.0.lock();
             while *p == seen {
-                self.progress.1.wait(&mut p);
+                if self.progress.1.wait_for(&mut p, STALL).timed_out() && *p == seen {
+                    return false;
+                }
             }
         }
     }
