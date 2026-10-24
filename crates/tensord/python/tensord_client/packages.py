@@ -33,7 +33,7 @@ class PackageError(Exception):
 
 def describe(project: Path, environment_python: Path | None = None) -> msgspec.Raw:
     request = Describe(str(project), str(environment_python) if environment_python else None)
-    result = subprocess.check_output([sys.executable, "-m", "tensord_client.runtime_describe"],
+    result = subprocess.check_output([sys.executable, "-m", "cozy_runtime.cli.main", "machine-describe"],
                                      input=msgspec.json.encode(request))
     reply = DESCRIPTION_DECODER.decode(result)
     if isinstance(reply, DescribeFailed):
@@ -58,7 +58,8 @@ def read_metadata(project: Path) -> PackageMetadata:
 BOOTSTRAP = ("import pathlib,runpy,sys;"
              "root=pathlib.Path(sys.executable).absolute().parent.parent;"
              "sys.path[:0]=[str(p) for p in (*(root/'lib').glob('python*/site-packages'),root/'Lib'/'site-packages') if p.is_dir()];"
-             "runpy.run_module('tensord_client.runtime_describe',run_name='__main__')")
+             "sys.argv=['cozy-runtime','machine-describe'];"
+             "runpy.run_module('cozy_runtime.cli.main',run_name='__main__')")
 
 
 def in_environment(interpreter: Path, request: msgspec.Struct, decoder: msgspec.json.Decoder):

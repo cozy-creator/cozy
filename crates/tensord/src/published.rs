@@ -1836,8 +1836,8 @@ struct Locked {
 /// The Runtime SDK pair: the machine's own, where it has one.
 const SDK: [&str; 2] = ["cozy-runtime", "tensorfs"];
 
-/// The environment's root digest and the other Apps it holds, described inside it by the
-/// machine's client without importing them (`runtime_describe`). A failed description fails
+/// The environment's root digest and the other Apps it holds, described inside it by its own
+/// Runtime without importing them (`cozy-runtime machine-describe`). A failed description fails
 /// this preparation; it never publishes an environment with silently missing callees.
 pub fn describe_environment(
     python: &str,
@@ -1854,7 +1854,7 @@ pub fn describe_environment(
     const BOOTSTRAP: &str = "import pathlib,runpy,sys;\
         root=pathlib.Path(sys.executable).absolute().parent.parent;\
         sys.path[:0]=[str(p) for p in (*(root/'lib').glob('python*/site-packages'),root/'Lib'/'site-packages') if p.is_dir()];\
-        runpy.run_module('tensord_client.runtime_describe',run_name='__main__')";
+        sys.argv=['cozy-runtime','machine-describe'];runpy.run_module('cozy_runtime.cli.main',run_name='__main__')";
     let described = Command::new(python)
         .args(["-I", "-S", "-c", BOOTSTRAP])
         .stdin(Stdio::piped())
