@@ -86,6 +86,8 @@ pub struct Swept {
     pub memo: usize,
     /// Unpacked wheels of the machine's uv cache (`uv_entries`).
     pub uv_cache: usize,
+    /// Derived-weights bytes TensorD let go (`derived::Derived`), first on a low disk.
+    pub derived: u64,
 }
 
 /// The persistent compiled-kernel store (`Seal::prepare`'s `<root>/u<uid>/`). Every executor
@@ -116,6 +118,8 @@ pub struct Caches<'a> {
     pub uv_cache: Option<&'a Path>,
     /// The filesystem the machine's state is on (`measure`; a test's own).
     pub disk: &'a dyn Fn() -> io::Result<Disk>,
+    /// The derived-weights cache, the first thing a low disk drops.
+    pub derived: Option<&'a crate::derived::Derived>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -513,6 +517,12 @@ pub fn sweep(caches: &Caches) -> io::Result<Swept> {
     }
 
     let filesystem = FileId::at(root)?.dev;
+    let Some(short) = (caches.disk)()?.short() else {
+        return Ok(swept);
+    };
+    if let Some(derived) = caches.derived {
+        swept.derived = derived.shrink(short);
+    }
     let Some(short) = (caches.disk)()?.short() else {
         return Ok(swept);
     };
