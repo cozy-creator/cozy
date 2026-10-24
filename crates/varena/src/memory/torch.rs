@@ -281,7 +281,16 @@ impl Source for Leased {
                     off += len;
                 }
                 Err(e) => {
-                    let _ = self.agent.refused(lease.ticket, lease.phys);
+                    if e.is_sticky() {
+                        // Access setup may have failed after mapping, with rollback unproven.
+                        // Never acknowledge this grant as refused or destroy the import: the
+                        // manager must retain ownership until this executor actually exits.
+                        self.held.lock().insert(id(lease.ticket), Held {
+                            ticket: lease.ticket, phys: lease.phys, pinned: false, committed: false,
+                        });
+                    } else {
+                        let _ = self.agent.refused(lease.ticket, lease.phys);
+                    }
                     failed.get_or_insert(e);
                 }
             }
