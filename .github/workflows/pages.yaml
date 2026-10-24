@@ -1,6 +1,6 @@
 name: pages
 
-# The browser player, web/player, at https://cozy-creator.github.io/cozy/play/: the public
+# The browser player, web/player, at https://cozy-creator.github.io/cozy-creator/play/: the public
 # HTTPS origin `cozy run play` links open. GitHub-hosted runners only.
 on:
   push:
