@@ -126,10 +126,12 @@ remove_cozy() {
   case $RUNNER_OS in
     Linux)
       systemctl --user disable --now cozy-calcifer cozy-machine > "$OUT/remove.log" 2>&1 || true
+      pkill -f "$HOME/.cozy/bin/cozy" || true; sleep 2
       rm -rf ~/.cozy ~/.config/cozy ~/.local/share/bash-completion/completions/cozy ~/.config/fish/completions/cozy.fish ;;
     macOS)
       launchctl bootout "gui/$(id -u)/com.cozy-creator.calcifer" > "$OUT/remove.log" 2>&1 || true
       launchctl bootout "gui/$(id -u)/com.cozy-creator.machine" >> "$OUT/remove.log" 2>&1 || true
+      pkill -f "$HOME/.cozy/bin/cozy" || true; sleep 2
       rm -rf ~/.cozy ~/.config/cozy ~/Library/LaunchAgents/com.cozy-creator.*.plist ;;
     Windows)
       powershell -NoProfile -c 'Remove-ItemProperty HKCU:\Software\Microsoft\Windows\CurrentVersion\Run cozy-calcifer, cozy-machine -ErrorAction SilentlyContinue; Get-Process cozy -ErrorAction SilentlyContinue | Stop-Process -Force; Start-Sleep 2; Remove-Item -Recurse -Force ~\.cozy, $env:LOCALAPPDATA\cozy -ErrorAction SilentlyContinue; $path = ([Environment]::GetEnvironmentVariable("Path", "User") -split ";") -ne "$HOME\.cozy\bin"; [Environment]::SetEnvironmentVariable("Path", $path -join ";", "User")' > "$OUT/remove.log" 2>&1 || true ;;
