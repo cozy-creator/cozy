@@ -6,6 +6,12 @@ use crate::{
     process::{reap_group, tail, Liveness, Meter, Watch, Watching},
     seam,
 };
+pub use protocol::executor::{
+    Activate, Adapter, Answer, Bearer, Binding, ByteGrant, CallInterface, CallProgress, Command,
+    Construction, Event, Fork, Frame, Hello, HostFrame, InputFile, InputMetadata, Invoke, Kind,
+    Level, Load, LoadFacts, Map, MemoSettings, Metrics, ModelLoad, Outcome, Output, PrepareRequest,
+    Probe, PublishPart, Residency, ResultRef, Start, Unload, RESULT_DOCUMENT,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use platform::{
@@ -17,14 +23,12 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     path::{Path, PathBuf},
-    process::{Child, Command, ExitStatus, Stdio},
+    process::{Child, ExitStatus, Stdio},
     sync::{Arc, Mutex},
     time::Duration,
 };
 #[cfg(unix)]
 use std::os::{fd::AsRawFd, unix::process::ExitStatusExt};
-
-pub const RESULT_DOCUMENT: &str = "result.canonical";
 
 #[derive(Clone, Debug)]
 pub struct ExecutorConfig {
@@ -39,20 +43,6 @@ pub struct ExecutorConfig {
     /// Give the executor its own scope in this namespace: a cgroup when the host delegates
     /// one, else a token its descendants inherit.
     pub cgroup_namespace: Option<String>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize)]
-#[serde(default)]
-pub struct Hello {
-    pub pid: u32,
-    pub ppid: u32,
-    pub pgid: u32,
-    pub runtime_version: String,
-    pub tensorfs_version: String,
-    /// Executor memory wire contract ([`Contract`]): the lease protocol leases chunks from each
-    /// GPU's manager; any other runs its memory alone.
-    pub memory_protocol: u32,
-    pub sealed: BTreeMap<String, String>,
 }
 
 /// The lease protocol (design varena-leases), where varena serves one.
@@ -71,241 +61,30 @@ pub enum Contract {
     Standalone,
 }
 
-impl Hello {
-    pub fn contract(&self) -> Contract {
-        match Some(self.memory_protocol) == LEASES {
-            true => Contract::Leases,
-            false => Contract::Standalone,
-        }
-    }
-
-    /// Refuses a Start naming leases to an executor that does not speak them.
-    fn accepts(&self, command: &DeviceCommand) -> io::Result<()> {
-        if matches!(command, DeviceCommand::Start { leases: Some(_), .. }) && self.contract() != Contract::Leases {
-            return Err(io::Error::new(io::ErrorKind::Unsupported, format!(
-                "Runtime {} speaks memory protocol {}: it reads no leases",
-                self.runtime_version, self.memory_protocol,
-            )));
-        }
-        Ok(())
+/// How an executor's memory is served, by the protocol its Hello speaks.
+pub fn contract(hello: &Hello) -> Contract {
+    match Some(hello.memory_protocol) == LEASES {
+        true => Contract::Leases,
+        false => Contract::Standalone,
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(default)]
-pub struct Adapter {
-    pub model_id: String,
-    pub r#ref: String,
-    pub scale: f64,
-    pub kind: String,
-    pub component: String,
-    pub source_component: String,
-    pub family: String,
-}
-impl Default for Adapter {
-    fn default() -> Self {
-        Self {
-            model_id: String::new(),
-            r#ref: String::new(),
-            scale: 1.0,
-            kind: "lora".into(),
-            component: String::new(),
-            source_component: String::new(),
-            family: String::new(),
-        }
+/// Refuses a Start naming leases to an executor that does not speak them.
+fn accepts(hello: &Hello, command: &Command) -> io::Result<()> {
+    if matches!(command, Command::Start(Start { leases: Some(_), .. })) && contract(hello) != Contract::Leases {
+        return Err(io::Error::new(io::ErrorKind::Unsupported, format!(
+            "Runtime {} speaks memory protocol {}: it reads no leases",
+            hello.runtime_version, hello.memory_protocol,
+        )));
     }
+    Ok(())
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(default)]
-pub struct Binding {
-    pub application: String,
-    pub package_interface: String,
-    pub model_class: String,
-    pub model_binding_path: String,
-    pub model_parameter_name: String,
-    pub model_parameter_names: Vec<String>,
-    pub component: String,
-    pub components: Vec<String>,
-    pub snapshots: BTreeMap<String, String>,
-    pub store: String,
-    pub snapshot: String,
-    pub release: String,
-    /// Hardware derivation variant, e.g. sm86; empty lets the SDK measure it. Never a catalog lane.
-    pub variant: String,
-    pub development: bool,
-    pub custody: String,
-    pub placement: String,
-    pub package: String,
-    pub model: String,
-    pub adapters: Vec<Adapter>,
-    /// A group's placeable components and the GPU that keeps each, an index within the group
-    /// (0: GPU 0, the serial scope's; g: GPU g keeps it resident for the group), decided by
-    /// TensorD at Load (`memory::homes`).
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    pub homes: BTreeMap<String, u32>,
-}
-impl Default for Binding {
-    fn default() -> Self {
-        Self {
-            application: String::new(),
-            package_interface: String::new(),
-            model_class: String::new(),
-            model_binding_path: String::new(),
-            model_parameter_name: String::new(),
-            model_parameter_names: Vec::new(),
-            component: String::new(),
-            components: Vec::new(),
-            snapshots: BTreeMap::new(),
-            store: String::new(),
-            snapshot: String::new(),
-            release: String::new(),
-            variant: String::new(),
-            development: false,
-            custody: "canonical".into(),
-            placement: String::new(),
-            package: String::new(),
-            model: String::new(),
-            adapters: Vec::new(),
-            homes: BTreeMap::new(),
-        }
-    }
+/// A refusal of one executor request, its detail bounded.
+pub fn refused(seq: u64, code: &str, detail: impl Into<String>) -> Answer {
+    Answer::refused(seq, code, crate::triage::ends(&detail.into(), 1024))
 }
 
-/// One model of a many-model construction (an entrypoint with several model slots).
-#[derive(Clone, Debug, Serialize)]
-pub struct ModelLoad {
-    pub binding: Binding,
-}
-
-#[derive(Clone, Debug, Serialize)]
-#[serde(tag = "cmd", rename_all = "snake_case")]
-pub enum DeviceCommand {
-    Hello,
-    Shutdown,
-    Start {
-        devices: String,
-        application: String,
-        package_interface: PathBuf,
-        sequence_parallel_degree: u32,
-        #[serde(skip_serializing_if = "is_false")]
-        import_only: bool,
-        /// What its attempts may call: the Runtime installs their callers before it imports
-        /// the package and brokers each attempt's calls.
-        #[serde(skip_serializing_if = "Vec::is_empty")]
-        call_interfaces: Vec<CallInterface>,
-        /// Each constructed slot's checkpoint, so Runtime schedules fetches before it imports.
-        #[serde(skip_serializing_if = "Vec::is_empty")]
-        constructions: Vec<Construction>,
-        /// The namespace (TensorD's uid) each GPU's lease listener (`lease-<uuid>`) is named in,
-        /// for an executor speaking the lease protocol; a GPU nobody serves runs its own pages.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        leases: Option<u32>,
-        /// The memory contract it serves ([`memory_protocol`]): the lease protocol, or 0 (its own).
-        memory_protocol: u32,
-        /// Its stage memo tiers, when this machine memoizes ([`DeviceExecutor::memo_settings`]).
-        #[serde(skip_serializing_if = "Option::is_none")]
-        memo: Option<MemoSettings>,
-    },
-    Load {
-        construction: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        tensorfs: Option<protocol::machine::TensorFSOptions>,
-        /// The request's signer: the Runtime keeps its bearer per signer and endpoint.
-        #[serde(skip_serializing_if = "String::is_empty")]
-        actor: String,
-        devices: String,
-        sequence_parallel_degree: u32,
-        binding: Box<Binding>,
-        /// Several model slots in one construction (H3 turbo: base + LoRA); Runtime builds
-        /// these models and loads their granted weights, ignoring `binding`.
-        #[serde(skip_serializing_if = "Vec::is_empty")]
-        models: Vec<ModelLoad>,
-        #[serde(skip_serializing_if = "String::is_empty")]
-        attention_pin: String,
-    },
-    Activate {
-        construction: String,
-    },
-    PrepareRequest {
-        request_id: String,
-        construction: String,
-        entrypoint: String,
-        payload: Value,
-        /// Checked before entry, so a bad pin is the request's refusal, not a fault.
-        #[serde(skip_serializing_if = "String::is_empty")]
-        attention_kernel: String,
-        /// The request's weight precision (16, 8 or 4); 16 holds every attention site exact.
-        #[serde(skip_serializing_if = "is_zero")]
-        bits: u32,
-        /// File inputs by field path (identity only; the bytes arrive with Invoke).
-        #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-        input_metadata: BTreeMap<String, Value>,
-    },
-    Invoke {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        tensorfs: Option<Box<protocol::machine::TensorFSOptions>>,
-        /// Retained asset capacity derived from the actual installed result schema.
-        max_output_bytes: u64,
-        request_id: String,
-        construction: String,
-        entrypoint: String,
-        spool: PathBuf,
-        deadline_s: Option<f64>,
-        #[serde(skip_serializing_if = "String::is_empty")]
-        attention_kernel: String,
-        #[serde(skip_serializing_if = "is_zero")]
-        bits: u32,
-        /// File inputs by field path: read-only copies in this call's spool.
-        #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-        inputs: BTreeMap<String, Value>,
-        /// Input trees by reference: (read-only directory, manifest digest).
-        #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-        trees: BTreeMap<String, (PathBuf, String)>,
-        /// Each `Weights[M]` parameter's checkpoint (`sha256:<hex>`, its header), which the
-        /// Runtime opens from the store itself.
-        #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-        sources: BTreeMap<String, String>,
-        /// Declared outputs and bounds, enforced by Runtime's public Writer.
-        #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-        weights: BTreeMap<String, u64>,
-        #[serde(skip_serializing_if = "String::is_empty")]
-        destination: String,
-        #[serde(skip_serializing_if = "String::is_empty")]
-        actor: String,
-        #[serde(skip_serializing_if = "String::is_empty")]
-        operation: String,
-        /// The family whose GPUs its calls share (`Execution::family`): while it waits on a
-        /// child call it yields under this name (varena `Request::yielding`), so the child is
-        /// admitted beside it.
-        #[serde(skip_serializing_if = "String::is_empty")]
-        family: String,
-    },
-    /// Warming: the loaded construction's models are loaded at `level` (`gpu` or `ram`; varena
-    /// places them), nothing run.
-    Map {
-        construction: String,
-        level: &'static str,
-    },
-    Unload {
-        construction: String,
-    },
-    Probe {
-        collect: bool,
-    },
-    /// Fork this import-only executor into a new one on its own seam (`fork/1`).
-    Fork {
-        socket: PathBuf,
-        root: PathBuf,
-        environment: BTreeMap<String, String>,
-    },
-    /// `actor`'s newest bearer at `tensorfs.endpoint`, sent outside any exchange (`Line`) and
-    /// answered by nothing: the executor's reads and uploads there present it from now on.
-    Bearer {
-        actor: String,
-        tensorfs: protocol::machine::TensorFSOptions,
-    },
-}
 
 /// A Start's `memory_protocol`: the lease protocol where it names leases this machine serves,
 /// else 0.
@@ -313,412 +92,15 @@ pub fn memory_protocol(leases: Option<u32>) -> u32 {
     leases.and(LEASES).unwrap_or(0)
 }
 
-/// An executor's stage memo tiers (`memo: stage/1`): its in-memory tier at its own default (-1)
-/// and the largest entry this machine keeps.
-#[derive(Clone, Copy, Debug, Serialize)]
-pub struct MemoSettings {
-    pub process_bytes: i64,
-    pub entry_bytes: u64,
-}
-
-/// One constructed model slot of a session: its checkpoint and the components it uses.
-#[derive(Clone, Debug, Serialize)]
-pub struct Construction {
-    pub path: String,
-    pub manifest: String,
-    pub components: Vec<String>,
-}
-
-/// One callable an attempt may call: its own package's, or another App's of its environment.
-#[derive(Clone, Debug, Serialize)]
-pub struct CallInterface {
-    pub module: String,
-    pub export: String,
-    pub interface_path: PathBuf,
-    #[serde(rename = "self")]
-    pub self_call: bool,
-    /// Another package's interface: the Runtime installs its typed callers from it (a caller
-    /// imports the callee's function and calls it with its request's fields as arguments).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub interface_document: Option<Value>,
-    /// A Runtime built-in surface (`operations`): the Runtime binds it from its own code.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub builtin: Option<String>,
-}
-impl DeviceCommand {
-    /// The run a command executes and the spool its executor reads and writes.
-    fn spool(&self) -> Option<(&str, &Path)> {
-        match self {
-            Self::Invoke {
-                request_id, spool, ..
-            } => Some((request_id.as_str(), spool.as_path())),
-            _ => None,
-        }
-    }
-    fn name(&self) -> &'static str {
-        match self {
-            Self::Hello => "hello",
-            Self::Shutdown => "shutdown",
-            Self::Start { .. } => "start",
-            Self::Load { .. } => "load",
-            Self::Activate { .. } => "activate",
-            Self::PrepareRequest { .. } => "prepare_request",
-            Self::Invoke { .. } => "invoke",
-            Self::Map { .. } => "map",
-            Self::Unload { .. } => "unload",
-            Self::Probe { .. } => "probe",
-            Self::Fork { .. } => "fork",
-            Self::Bearer { .. } => "bearer",
-        }
+/// The run a command executes and the spool its executor reads and writes.
+fn spool(command: &Command) -> Option<(&str, &Path)> {
+    match command {
+        Command::Invoke(invoke) => Some((invoke.request_id.as_str(), invoke.spool.as_path())),
+        _ => None,
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum Event {
-    Progress,
-    Request,
-    #[serde(other)]
-    Unknown,
-}
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum Kind {
-    Publish,
-    /// A weights output's TensorFS reference, which Runtime committed or uploaded.
-    CheckpointItem,
-    StageMemoLookup,
-    StageMemoStore,
-    Progress,
-    ExecutionActivity,
-    ChildCall,
-    ChildPoll,
-    ChildCancel,
-    ChildForget,
-    ChildEvents,
-    GpuRelease,
-    ModelPrefetch,
-    /// A `progress` event carrying a retained `log` observation (`Telemetry.log`).
-    Log,
-    /// A `progress` event telling the executor's work count (`work`): what its Runtime did for
-    /// its calls (blocks entered, graphs replayed, LM steps, construction legs).
-    Work,
-    #[default]
-    #[serde(other)]
-    Unknown,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-pub struct ResultRef {
-    pub digest: String,
-    pub length: u64,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-pub struct Outcome {
-    pub terminal: String,
-    #[serde(default)]
-    pub origin: String,
-    #[serde(default)]
-    pub code: String,
-    #[serde(default)]
-    pub message: String,
-    /// The raising traceback of a failed invocation (diagnostics, never a terminal field).
-    #[serde(default)]
-    pub traceback: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct Output {
-    pub output_id: String,
-    pub asset_ref: String,
-    pub kind: String,
-    #[serde(default)]
-    pub media_type: String,
-    #[serde(default)]
-    pub size_bytes: Option<u64>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct HostFrame {
-    pub handle: String,
-    pub codec: String,
-    pub raw: String,
-    pub raw_bytes: u64,
-    #[serde(default)]
-    pub media_type: String,
-    #[serde(default)]
-    pub facts: BTreeMap<String, Value>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-#[serde(default)]
-pub struct Metrics {
-    pub handler_ms: Option<f64>,
-    pub device_lease_ms: Option<f64>,
-    pub d2h_wait_ms: Option<f64>,
-    pub peak_vram_bytes: Option<i64>,
-    pub peak_reserved_bytes: Option<i64>,
-    pub activation_peak_bytes: Option<i64>,
-    pub activation_peaks: BTreeMap<String, i64>,
-    pub allocated_at_start_bytes: Option<i64>,
-    pub working_peak_vram_bytes: Option<i64>,
-    pub rss_at_end_bytes: Option<i64>,
-    pub started_unix: Option<f64>,
-    pub gpu_count: Option<u32>,
-    pub shape_cell: Option<String>,
-}
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-#[serde(default)]
-pub struct LoadFacts {
-    pub cuda_init_ms: Option<f64>,
-    pub prepare_ms: Option<f64>,
-    pub stages: Vec<(String, f64)>,
-    pub warm_ms: Option<f64>,
-    pub filled_bytes: Option<u64>,
-    pub device_free_bytes: Option<i64>,
-    pub device_total_bytes: Option<i64>,
-    pub allocator_bytes: Option<i64>,
-    pub reserved_bytes: Option<i64>,
-    pub rss_bytes: Option<i64>,
-    /// The attention kernel each component's sites were given, and what was skipped and why.
-    pub attention: Option<Value>,
-}
-
-/// One decode per frame; only consumed business fields are represented.
-#[derive(Clone, Debug, Default, Deserialize)]
-#[serde(default)]
-pub struct Frame {
-    pub event: Option<Event>,
-    /// A request or progress frame whose fields did not decode (a negative byte count, run
-    /// 10078): why. A request is refused alone under its own sequence number and a progress
-    /// frame is dropped; the executor and its other work go on.
-    #[serde(skip)]
-    pub malformed: String,
-    pub reply: String,
-    pub ok: bool,
-    pub code: String,
-    pub detail: String,
-    /// A refusal's own terminal (`refused`/`failed`) and origin (`request`/`author`/`runtime`).
-    pub terminal: String,
-    pub origin: String,
-    /// A traced command refusal's raising traceback.
-    pub traceback: String,
-    #[serde(flatten)]
-    pub hello: Hello,
-    pub outcome: Option<Outcome>,
-    pub quiescent: bool,
-    pub poisoned: String,
-    pub reused: bool,
-    /// `start` of a group (degree > 1): the follower ranks' pids, rank 1 first.
-    pub follower_pids: Vec<u32>,
-    pub result_ref: Option<ResultRef>,
-    pub outputs: Vec<Output>,
-    pub frames: Vec<HostFrame>,
-    pub max_output_bytes: Option<u64>,
-    pub request_id: String,
-    pub seq: u64,
-    pub kind: Kind,
-    pub descriptor: bool,
-    pub name: String,
-    pub sha256: String,
-    pub length: u64,
-    /// `load` and `invoke` telemetry: one of a shape this machine does not read is absent, never
-    /// the reply's failure.
-    #[serde(deserialize_with = "lenient")]
-    pub facts: Option<LoadFacts>,
-    #[serde(deserialize_with = "lenient")]
-    pub metrics: Option<Metrics>,
-    /// `invoke`: varena's record of the request (`Stats`), kept whole; another frame's `memory`
-    /// of another shape (an older Hello's list) reads as absent.
-    #[serde(deserialize_with = "lenient")]
-    pub memory: Option<serde_json::Map<String, Value>>,
-    /// `invoke`: the Runtime's residency report, relayed into the run's measurements; one of
-    /// another shape reads as absent.
-    #[serde(deserialize_with = "lenient")]
-    pub residency: Option<Residency>,
-    pub stage: String,
-    pub position: Option<u64>,
-    pub total: Option<u64>,
-    pub stage_fraction: Option<f64>,
-    pub overall_fraction: Option<f64>,
-    pub step_ms: Option<f64>,
-    pub advance: u64,
-    /// `work`: the executor's work count, which moves while it works for its calls.
-    pub work: u64,
-    /// `progress`: the child call whose stage a job relays (the Runtime sends null for none).
-    pub call_request: Option<String>,
-    /// A retained observation (`kind` log): `name` is its message, `value` its level and
-    /// `fields` its scalars.
-    pub value: Value,
-    pub fields: Value,
-    /// PrepareRequest: the request's normalized features (its shape).
-    pub features: BTreeMap<String, Value>,
-    // `publish` (Outputs.publish): one product of a declared output.
-    pub output: String,
-    pub label: String,
-    pub asset_ref: String,
-    pub asset_kind: String,
-    pub media_type: String,
-    pub size_bytes: u64,
-    pub digest: String,
-    pub parts: Vec<PublishPart>,
-    /// `start`: the executor's legs, `[[name, ms], ...]`; read leniently.
-    pub stages: Value,
-    /// `invoke`: the executor's stage and step tracks, its ranks' execution records (GPU,
-    /// attention served) and its observation tail; read leniently, kept as the run's
-    /// measurements.
-    pub attribution: Value,
-    pub execution: Value,
-    pub observations: Value,
-    /// `invoke`: some attention site of the call applied the request's pin.
-    pub attention_applied: bool,
-    /// `invoke`: the rows of how the request was served other than as sent; read row by row
-    /// (`adjustments`).
-    pub adjustments: Value,
-    // `child_*` (a job's managed calls): the call's index, callee and canonical request.
-    pub call_index: u64,
-    pub module: String,
-    pub export: String,
-    pub payload: String,
-    pub progress_label: String,
-    // `stage_memo_*` (a memoized Model method): its key and scope (`stage`, `length` above), and
-    // on a store the spool file it offers with what producing it cost.
-    pub key: String,
-    pub numerics: String,
-    pub local: String,
-    pub cost_ms: f64,
-    /// `checkpoint_item`: the immutable TensorFS reference Runtime committed or uploaded.
-    pub repo_id: String,
-    pub revision: String,
-    pub variant: String,
-    pub tag: String,
-}
-
-impl Frame {
-    /// A `log` observation (`Telemetry.log`) as its log line: the level (debug, info, warning
-    /// or error) and the message followed by ` key=value` for each field.
-    pub fn log(&self) -> Option<(&'static str, String)> {
-        if self.kind != Kind::Log {
-            return None;
-        }
-        let level = match self.value.as_str().map(str::to_ascii_lowercase).as_deref() {
-            Some("warning" | "warn") => "warning",
-            Some("error" | "critical" | "fatal") => "error",
-            Some("debug") => "debug",
-            _ => "info",
-        };
-        let mut text = self.name.clone();
-        for (key, value) in self.fields.as_object().into_iter().flatten() {
-            match value {
-                Value::String(s) if !s.is_empty() && !s.contains(char::is_whitespace) => {
-                    text.push_str(&format!(" {key}={s}"))
-                }
-                other => text.push_str(&format!(" {key}={other}")),
-            }
-        }
-        Some((level, text))
-    }
-}
-
-/// One part of a composite product: a spool file and the media time it adds.
-#[derive(Clone, Debug, Default, Deserialize)]
-#[serde(default)]
-pub struct PublishPart {
-    pub local: String,
-    pub duration_us: u64,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct Answer {
-    pub event: &'static str,
-    pub seq: u64,
-    pub ok: bool,
-    pub code: String,
-    pub detail: String,
-    /// One fd follows the answer. Sent only when true.
-    #[serde(skip_serializing_if = "is_false")]
-    pub descriptor: bool,
-    pub sha256: String,
-    pub length: u64,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub digest: String,
-    #[serde(skip_serializing_if = "is_zero")]
-    pub sequence: u64,
-    /// `CallState` (a managed call): its state, child, canonical result and byte grants.
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub state: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub child_request_id: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub result: String,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub byte_grants: Vec<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub progress: Option<Value>,
-    /// A failed child call's raising traceback, whole (its triage's).
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub traceback: String,
-    /// A memo hit: the entry's verified copy in the run's spool, and what producing it cost.
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub local: String,
-    #[serde(skip_serializing_if = "is_zero_ms")]
-    pub cost_ms: f64,
-    /// The memo scope computed one key twice, differently: the executor stops reusing it.
-    #[serde(skip_serializing_if = "is_false")]
-    pub disputed: bool,
-    /// A memo store: whether the entry was kept, else why not.
-    #[serde(skip_serializing_if = "is_false")]
-    pub stored: bool,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub reason: String,
-}
-fn is_zero_ms(value: &f64) -> bool {
-    *value == 0.0
-}
-impl Answer {
-    pub fn unavailable(seq: u64) -> Self {
-        Self {
-            event: "answer",
-            seq,
-            ok: false,
-            code: "capability_unavailable".into(),
-            detail: "owner has not qualified this operation".into(),
-            descriptor: false,
-            sha256: String::new(),
-            length: 0,
-            digest: String::new(),
-            sequence: 0,
-            state: String::new(),
-            child_request_id: String::new(),
-            result: String::new(),
-            byte_grants: Vec::new(),
-            progress: None,
-            traceback: String::new(),
-            local: String::new(),
-            cost_ms: 0.0,
-            disputed: false,
-            stored: false,
-            reason: String::new(),
-        }
-    }
-    pub fn ok(seq: u64) -> Self {
-        Self {
-            ok: true,
-            code: String::new(),
-            detail: String::new(),
-            ..Self::unavailable(seq)
-        }
-    }
-    pub fn refused(seq: u64, code: &str, detail: impl Into<String>) -> Self {
-        Self {
-            code: code.into(),
-            detail: crate::triage::ends(&Into::<String>::into(detail), 1024),
-            ..Self::unavailable(seq)
-        }
-    }
-}
 
 pub trait Services {
     fn progress(&mut self, _: &Frame) {}
@@ -741,7 +123,7 @@ impl Services for Baseline {}
 pub struct Line(std::sync::Weak<Mutex<LocalStream>>);
 impl Line {
     /// Sends `command`, answered by nothing; false once the executor is gone.
-    pub fn send(&self, command: &DeviceCommand) -> bool {
+    pub fn send(&self, command: &Command) -> bool {
         let Some(writer) = self.0.upgrade() else {
             return false;
         };
@@ -755,12 +137,16 @@ impl Line {
 
 /// `command`'s wire bytes. Only the typed TensorFS options may carry supplied access: the bytes
 /// keep the token, every other field is scanned.
-fn command_bytes(command: &DeviceCommand) -> io::Result<Vec<u8>> {
+fn command_bytes(command: &Command) -> io::Result<Vec<u8>> {
     let mut value = serde_json::to_value(command)?;
     let bytes = serde_json::to_vec(&value)?;
     if let (true, Some(options)) = (
-        matches!(command, DeviceCommand::Load { tensorfs: Some(_), .. } | DeviceCommand::Invoke { tensorfs: Some(_), .. }
-            | DeviceCommand::Bearer { .. }),
+        match command {
+            Command::Load(load) => load.tensorfs.is_some(),
+            Command::Invoke(invoke) => invoke.tensorfs.is_some(),
+            Command::Bearer(_) => true,
+            _ => false,
+        },
         value.get_mut("tensorfs").and_then(Value::as_object_mut),
     ) {
         options.remove("token");
@@ -1002,7 +388,7 @@ impl Codec {
             .generation_hold
             .as_ref()
             .map(|hold| hold.as_raw_fd());
-        let mut command = Command::new(&self.config.python);
+        let mut command = std::process::Command::new(&self.config.python);
         platform::process::inherit_nothing(&mut command);
         command
             .args([
@@ -1388,11 +774,11 @@ impl DeviceExecutor {
             forked.insert(name.into(), token.into());
         }
         let reply = self.command(
-            &DeviceCommand::Fork {
+            &Command::Fork(Fork {
                 socket: config.socket.clone(),
                 root: config.root.clone(),
                 environment: forked,
-            },
+            }),
             &mut Baseline,
         );
         let pid = match reply {
@@ -1518,7 +904,7 @@ impl DeviceExecutor {
             log_from: 0,
             memo: None,
         };
-        let hello = executor.command(&DeviceCommand::Hello, &mut Baseline)?;
+        let hello = executor.command(&Command::Hello, &mut Baseline)?;
         let mismatched = config.seal.mismatches(&hello.hello.sealed);
         if !hello.ok
             || hello.hello.pid != executor.birth.pid
@@ -1590,13 +976,13 @@ impl DeviceExecutor {
     /// which closes the channel and returns this call with the measurement.
     pub fn command(
         &mut self,
-        command: &DeviceCommand,
+        command: &Command,
         services: &mut impl Services,
     ) -> io::Result<Frame> {
         // Refuse leases to an executor that does not speak them before writing the command.
-        self.hello.accepts(command)?;
+        accepts(&self.hello, command)?;
         let meter = match command {
-            DeviceCommand::Invoke { .. } => Meter::Work,
+            Command::Invoke(_) => Meter::Work,
             _ => Meter::Burn,
         };
         let watching = Watching::start(
@@ -1613,7 +999,7 @@ impl DeviceExecutor {
         let result = self.exchange(command, services, &watching.watch());
         *self.watched.lock().unwrap() = None;
         // Whatever the run was computing when its exchange ended, its waiters compute themselves.
-        if let (Some(memo), Some((run, _))) = (&self.memo, command.spool()) {
+        if let (Some(memo), Some((run, _))) = (&self.memo, spool(command)) {
             memo.release(run);
         }
         let (killed, worst_gap) = watching.finish();
@@ -1628,7 +1014,7 @@ impl DeviceExecutor {
 
     fn exchange(
         &mut self,
-        command: &DeviceCommand,
+        command: &Command,
         services: &mut impl Services,
         watch: &Watch,
     ) -> io::Result<Frame> {
@@ -1659,7 +1045,7 @@ impl DeviceExecutor {
                 {
                     // A lookup may wait on the run computing its key: not this executor's stillness.
                     watch.serving(true);
-                    let answer = match (&self.memo, command.spool()) {
+                    let answer = match (&self.memo, spool(command)) {
                         (Some(memo), Some((run, spool))) => memo.answer(run, spool, &frame),
                         _ => Answer::unavailable(frame.seq),
                     };
@@ -1711,7 +1097,7 @@ impl DeviceExecutor {
 
     /// Ask the executor to exit, then observe that exact exit (killing only a wedge).
     pub fn shutdown(mut self) -> io::Result<()> {
-        let asked = self.command(&DeviceCommand::Shutdown, &mut Baseline);
+        let asked = self.command(&Command::Shutdown, &mut Baseline);
         let ended = self.terminate()?;
         asked?;
         if !ended.status.success() {
@@ -1909,30 +1295,6 @@ pub fn read_result(spool: &Path, reply: &Frame) -> io::Result<Value> {
     }
     serde_json::from_slice(&bytes).map_err(io::Error::other)
 }
-/// A field of the shape this machine reads, else absent: never a reason to refuse the frame.
-/// The Runtime's residency report on an invoke reply: its notes and, per model, its graph
-/// regions' counters (captures, replays, pool bytes, eager gaps). Relayed whole: fields this
-/// TensorD does not know are kept.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct Residency {
-    pub notes: serde_json::Map<String, Value>,
-    pub graphs: BTreeMap<String, serde_json::Map<String, Value>>,
-    #[serde(flatten)]
-    pub other: serde_json::Map<String, Value>,
-}
-
-fn lenient<'de, D: serde::Deserializer<'de>, T: serde::de::DeserializeOwned>(d: D) -> Result<Option<T>, D::Error> {
-    Ok(serde_json::from_value(Value::deserialize(d)?).ok())
-}
-
-fn is_zero<T: Default + PartialEq>(value: &T) -> bool {
-    *value == T::default()
-}
-fn is_false(value: &bool) -> bool {
-    !*value
-}
-
 fn write_frame(
     stream: &mut LocalStream,
     value: &impl Serialize,
@@ -1989,7 +1351,7 @@ fn refuse_malformed(
     if frame.descriptor {
         drop(platform::handles::recv_fd(stream)?);
     }
-    let answer = Answer::refused(frame.seq, "malformed_request", frame.malformed.clone());
+    let answer = refused(frame.seq, "malformed_request", frame.malformed.clone());
     write_frame(stream, &answer)
 }
 pub fn write_answer(
