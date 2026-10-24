@@ -564,6 +564,8 @@ impl Zygote {
 
 /// A parent that died (killed, out of memory): the pool starts a new one.
 const ENDED: &str = "import-only executor ended";
+/// Under the pool's root: the generations with an import-only parent up.
+const PARENTS: &str = "parents.json";
 
 /// The `sessions` key of `plan`'s executor whose lane starts at GPU `start`.
 fn session_key(plan: &str, start: usize) -> String {
@@ -863,6 +865,7 @@ impl Pool {
         let Some(zygote) = victim else {
             return false;
         };
+        self.record_parents();
         if let ZygoteState::Ready(parent) = std::mem::take(&mut *zygote.state.lock().unwrap()) {
             if let Err(error) = parent.shutdown() {
                 tracing::warn!("ending an idle import-only executor: {error}");
@@ -1095,6 +1098,7 @@ impl Pool {
                 .collect();
             ended.into_iter().filter_map(|key| zygotes.remove(&key)).collect()
         };
+        self.record_parents();
         for zygote in parents {
             if let ZygoteState::Ready(parent) = std::mem::take(&mut *zygote.state.lock().unwrap()) {
                 if let Err(error) = parent.shutdown() {
@@ -2184,14 +2188,29 @@ impl Pool {
 
     /// Drop a dead parent, if it is still the generation's: the next launch starts another.
     fn forget_parent(&self, held: &HeldGeneration, dead: &Arc<Zygote>) {
-        let mut zygotes = self.zygotes.lock().unwrap();
-        let key = parent_app(held);
-        if zygotes
-            .get(&key)
-            .is_some_and(|current| Arc::ptr_eq(current, dead))
         {
-            zygotes.remove(&key);
+            let mut zygotes = self.zygotes.lock().unwrap();
+            let key = parent_app(held);
+            if zygotes.get(&key).is_some_and(|current| Arc::ptr_eq(current, dead)) {
+                zygotes.remove(&key);
+            }
         }
+        self.record_parents();
+    }
+
+    /// The generations with an import-only parent up, kept for the next start: a restart
+    /// prestarts them off the request path (`recorded_parents`). The pool's own end keeps it.
+    fn record_parents(&self) {
+        let up: std::collections::BTreeSet<String> = self.zygotes.lock().unwrap().iter().filter(|(_, z)| z.ready()).map(|((generation, _), _)| generation.clone()).collect();
+        let written = serde_json::to_vec(&up).map_err(io::Error::from).and_then(|bytes| platform::durable::swap(&self.root.join(PARENTS), &bytes, 0o600).map_err(io::Error::from));
+        if let Err(error) = written {
+            tracing::warn!("recording the import-only parents: {error}");
+        }
+    }
+
+    /// The generations that had an import-only parent when the machine last ran.
+    pub fn recorded_parents(&self) -> Vec<String> {
+        fs::read(self.root.join(PARENTS)).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default()
     }
 
     /// The generation's import-only executor, and whether the caller must start it. None
@@ -2215,6 +2234,7 @@ impl Pool {
     /// Brings `zygote` up as `held`'s import-only parent, and tells the engine it did (or failed).
     fn start_parent(&self, zygote: &Zygote, held: &HeldGeneration) {
         zygote.set(self.import_only(held));
+        self.record_parents();
         if let Some(engine) = self.engine.get().and_then(Weak::upgrade) {
             engine.notify_activity();
         }

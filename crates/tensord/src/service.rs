@@ -215,6 +215,9 @@ impl Service {
     /// still exiting are gone: they fence it, as they fence requests.
     pub(crate) fn rewarm(&self, gpu: &Arc<Pool>) -> io::Result<()> {
         let (fence, started) = (self.startup_gpu_births.lock().unwrap().clone(), self.started_ticks);
+        // The import-only parents the machine had when it stopped come back with the warm sets,
+        // so a package's first request after a restart forks instead of importing.
+        let parents: Vec<_> = gpu.recorded_parents().iter().filter_map(|generation| self.catalog.resolve(generation).ok()).collect();
         let (gpu, engine) = (gpu.clone(), self.engine.clone());
         std::thread::Builder::new().name("warm-set-restore".into()).spawn(move || {
             let mut seen = engine.activity_epoch();
@@ -225,6 +228,7 @@ impl Service {
                 seen = engine.wait_activity(seen, Some(std::time::Duration::from_millis(100)));
             }
             gpu.keep_all(&engine);
+            parents.into_iter().for_each(|held| gpu.prespawn(held));
         })?;
         Ok(())
     }
