@@ -133,7 +133,8 @@ pub async fn info(ctx: &Context, package: &PackageRef) -> Result<ExitCode, Error
         warned = warnings(ctx, &hub, package, release).await?;
     }
     let info = Info {
-        package: package.package(),
+        // The name as published: the Hub finds `qwen3-5` for `qwen3.5`.
+        package: format!("{}/{}", card.package.org, card.package.name),
         latest_release: card.package.latest_release,
         releases,
         warnings: warned,
