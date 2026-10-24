@@ -1003,7 +1003,14 @@ struct Yanked {
     yanked_at: String,
 }
 
-pub async fn yank(ctx: &Context, package: &PackageRef) -> Result<ExitCode, Error> {
+#[derive(Serialize)]
+struct Unyanked {
+    package: String,
+    release: String,
+    changed: bool,
+}
+
+pub async fn yank(ctx: &Context, package: &PackageRef, undo: bool) -> Result<ExitCode, Error> {
     let Some(release) = &package.release else {
         return Err(Error::new(
             Kind::Usage,
@@ -1012,6 +1019,40 @@ pub async fn yank(ctx: &Context, package: &PackageRef) -> Result<ExitCode, Error
         ));
     };
     let hub = ctx.hub()?;
+    if undo {
+        let unyanked = ctx
+            .hub_signed_in(&hub)?
+            .unyank_package_release(
+                &package.org,
+                &package.name,
+                release,
+                &types::Empty(Default::default()),
+            )
+            .await
+            .map_err(hub_error)?
+            .into_inner();
+        let result = Unyanked {
+            package: package.package(),
+            release: unyanked.release,
+            changed: unyanked.changed,
+        };
+        match ctx.json {
+            true => output::json(&result),
+            false => output::Record::new()
+                .field("package", format!("{}@{}", result.package, result.release))
+                .field(
+                    "status",
+                    if result.changed {
+                        "un-yanked"
+                    } else {
+                        "not yanked"
+                    },
+                )
+                .note("It is the unversioned default again when it is the newest release.")
+                .print(ctx),
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
     let yanked = ctx
         .hub_signed_in(&hub)?
         .yank_package_release(
@@ -1042,7 +1083,7 @@ pub async fn yank(ctx: &Context, package: &PackageRef) -> Result<ExitCode, Error
                 },
             )
             .field("yanked at", &result.yanked_at)
-            .note("Machines that hold it keep it; nothing new installs it.")
+            .note("Machines that hold it keep it; only an exact pin installs it.")
             .print(ctx),
     }
     Ok(ExitCode::SUCCESS)
