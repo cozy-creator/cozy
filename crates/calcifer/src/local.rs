@@ -111,8 +111,12 @@ impl Local {
         loop {
             if served_at(&self.ready()) > before && self.running() {
                 info!(ms = began.elapsed().as_millis() as u64, "this computer's machine serves");
-                // Calcifer started it: Calcifer reaps it when it exits, idle or ended.
-                tokio::task::spawn_blocking(move || drop(child.wait()));
+                // Calcifer started it: Calcifer reaps it when it exits, idle or ended. A thread of its
+                // own, which Calcifer's exit never waits for: the machine outlives Calcifer.
+                std::thread::Builder::new()
+                    .name("reap-tensord".into())
+                    .spawn(move || drop(child.wait()))
+                    .map_err(|e| failed(e.to_string()))?;
                 return self.endpoint();
             }
             match child.try_wait() {

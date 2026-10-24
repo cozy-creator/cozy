@@ -52,7 +52,13 @@ pub fn main() -> ExitCode {
     }
     let served = match config::load(Flags::default()) {
         Ok(loaded) => match tokio::runtime::Runtime::new() {
-            Ok(runtime) => runtime.block_on(serve(&loaded)),
+            // Stopped, Calcifer exits now: nothing left on the runtime holds the process (or its
+            // service) past `down`.
+            Ok(runtime) => {
+                let served = runtime.block_on(serve(&loaded));
+                runtime.shutdown_background();
+                served
+            }
             Err(e) => Err(refuse(
                 &loaded.home,
                 Error::new(Kind::Internal, "calcifer_runtime", e.to_string()),
