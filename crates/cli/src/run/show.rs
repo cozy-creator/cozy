@@ -2,7 +2,8 @@
 //! made: where its execution time went (executor start, construction, each stage and its steps,
 //! and what no measurement covers), the models it ran as resolved (release and lane), each
 //! component's attention and GEMM kernels, every GPU's attention kernels (the one that served,
-//! the others and why not), each model's memory per step, its calls, and its log.
+//! the others and why not), each GPU's memory (bytes moved by source, per step, and what make
+//! room took), its calls, and its log.
 use std::{collections::BTreeMap, process::ExitCode};
 
 use protocol::{
@@ -38,53 +39,45 @@ fn lenient<'de, D: serde::Deserializer<'de>, T: Default + serde::de::Deserialize
     Ok(T::deserialize(serde_json::Value::deserialize(d)?).unwrap_or_default())
 }
 
-/// Its executor's memory (TensorD `memory::call::CallMemory`); `stats` is the executor's own:
-/// each model's passes, the evictions with their rung and reason, the activation peak per
-/// shape, and what each GPU still held at the end.
+/// Its executor's memory (TensorD's `call_memory`): torch's high-water marks and, under `stats`,
+/// the invoke reply's own `memory`: per GPU, varena's record of the request (`varena::memory::Stats`,
+/// one definition from the Runtime to here) beside its fill ceilings and torch's peak.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct Memory {
     #[serde(deserialize_with = "lenient")]
-    stats: Stats,
+    stats: Gpus,
 }
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
-struct Stats {
-    rows: Vec<Step>,
-    evictions: Vec<Eviction>,
-    peaks: Vec<Peak>,
-    leftover_by_gpu: Vec<(u32, u64)>,
+struct Gpus {
+    /// One row per GPU; a row of a shape this CLI does not read is left out alone.
+    #[serde(deserialize_with = "each")]
+    varena: Vec<GpuMemory>,
+}
+
+/// Each row of a list that reads, the others left out.
+fn each<'de, D: serde::Deserializer<'de>, T: serde::de::DeserializeOwned>(d: D) -> Result<Vec<T>, D::Error> {
+    let rows = Vec::<serde_json::Value>::deserialize(d).unwrap_or_default();
+    Ok(rows.into_iter().filter_map(|row| T::deserialize(row).ok()).collect())
 }
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
-struct Step {
-    model: String,
+struct GpuMemory {
     gpu: u32,
-    resident: u64,
-    paged_in: u64,
-    streamed: u64,
-    stall_ns: u64,
-    activations: u64,
+    ceiling: Option<Ceiling>,
+    stats: varena::memory::Stats,
+    torch_peak: u64,
 }
 
+/// TensorFS's measured fill ceilings on that GPU: host to device and disk, GB/s.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
-struct Eviction {
-    model: String,
-    rung: u32,
-    reason: String,
-    nbytes: u64,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(default)]
-struct Peak {
-    model: String,
-    shape: String,
-    peak: u64,
-    cuts: Vec<String>,
+struct Ceiling {
+    h2d_gbps: Option<f64>,
+    disk_gbps: f64,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -270,13 +263,14 @@ pub async fn exec(ctx: &Context, id: &str, once: bool) -> Result<ExitCode, Error
     );
     gpus.print(ctx, "attention kernels");
     let memory = grid(
-        &["MODEL", "GPU", "STEPS", "RESIDENT", "PAGED IN", "STREAMED", "STALL", "PEAK"],
+        &["GPU", "KEPT", "LEASED", "STORE", "STALL", "PEAK", "TORCH", "COMPUTE", "EVICTED", "LEFTOVER"],
         &measured,
         memory_rows,
     );
     memory.print(ctx, "memory");
-    grid(&["MODEL", "RUNG", "REASON", "COUNT", "BYTES"], &measured, eviction_rows).print(ctx, "evictions");
-    grid(&["MODEL", "SHAPE", "PEAK", "CUTS"], &measured, peak_rows).print(ctx, "activation peaks");
+    let steps = grid(&["GPU", "STEP", "CAPACITY", "HIT", "KEPT", "STORE", "PREFETCHED", "EVICTED"], &measured, step_rows);
+    steps.print(ctx, "memory by step");
+    grid(&["GPU", "STEP", "FOR", "NEED", "FREED", "WAITED"], &measured, make_room_rows).print(ctx, "make room");
     if !run.calls.is_empty() {
         anstream::println!("\ncalls");
         let mut table =
@@ -584,58 +578,115 @@ fn gpu_rows(measured: &Measured) -> Vec<Vec<String>> {
     rows
 }
 
-/// Each model's passes in the order it first ran: the last pass's resident bytes, the bytes
-/// copied home and streamed over all of them, the prefetch stall, and the largest activation
-/// peak; then any torch bytes a GPU still held at the request's end.
+/// Each GPU's whole request: the bytes moved by source (kept from the manager's retention, leased
+/// and filled, read from the store) at their rate against the measured ceiling, the stall, the
+/// most it held (pages and torch's bytes), torch's own peak, the compute bytes, what make_room took
+/// and what it still held at the end.
 fn memory_rows(measured: &Measured) -> Vec<Vec<String>> {
-    let memory = &measured.m.memory.stats;
-    let mut order: Vec<(&str, u32)> = vec![];
-    for step in &memory.rows {
-        if !order.contains(&(step.model.as_str(), step.gpu)) {
-            order.push((&step.model, step.gpu));
+    let row = |g: &GpuMemory| {
+        let s = &g.stats;
+        let h2d = g.ceiling.as_ref().and_then(|c| c.h2d_gbps);
+        let disk = g.ceiling.as_ref().map(|c| c.disk_gbps);
+        let leftover = s.leftover + s.outlived.iter().map(|o| o.bytes).sum::<u64>();
+        vec![
+            g.gpu.to_string(),
+            moved(&s.moved.kept, None),
+            moved(&s.moved.leased, h2d),
+            moved(&s.moved.store, disk),
+            duration(s.stall_ns as f64 / 1e6),
+            output::bytes(s.peak),
+            output::bytes(g.torch_peak),
+            output::bytes(s.compute),
+            evicted(&s.evicted),
+            output::bytes(leftover),
+        ]
+    };
+    measured.m.memory.stats.varena.iter().map(row).collect()
+}
+
+/// Bytes and, when they took time, their rate and its share of the ceiling: `3.2 GiB @ 11.4 GB/s (48%)`.
+fn moved(fills: &varena::memory::Fills, ceiling: Option<f64>) -> String {
+    if fills.bytes == 0 {
+        return "-".into();
+    }
+    let mut text = output::bytes(fills.bytes);
+    if fills.ns > 0 {
+        let gbps = fills.bytes as f64 / fills.ns as f64;
+        text.push_str(&format!(" @ {gbps:.1} GB/s"));
+        if let Some(c) = ceiling.filter(|c| *c > 0.0) {
+            text.push_str(&format!(" ({:.0}%)", 100.0 * gbps / c));
         }
     }
-    let mut rows: Vec<Vec<String>> = order
-        .into_iter()
-        .map(|(model, gpu)| {
-            let steps: Vec<&Step> = memory.rows.iter().filter(|s| s.model == model && s.gpu == gpu).collect();
-            let sum = |f: fn(&Step) -> u64| steps.iter().map(|s| f(s)).sum::<u64>();
-            vec![
-                model.into(),
-                gpu.to_string(),
-                steps.len().to_string(),
-                output::bytes(steps.last().map_or(0, |s| s.resident)),
-                output::bytes(sum(|s| s.paged_in)),
-                output::bytes(sum(|s| s.streamed)),
-                duration(sum(|s| s.stall_ns) as f64 / 1e6),
-                output::bytes(steps.iter().map(|s| s.activations).max().unwrap_or(0)),
-            ]
-        })
+    text
+}
+
+/// What make_room took, by class (F, O, S, N, D, W, P): `F 1.2 GiB, S 300 MiB`.
+fn evicted(by_class: &[u64; 7]) -> String {
+    let taken: Vec<String> = ["F", "O", "S", "N", "D", "W", "P"]
+        .iter()
+        .zip(by_class)
+        .filter(|(_, bytes)| **bytes > 0)
+        .map(|(class, bytes)| format!("{class} {}", output::bytes(*bytes)))
         .collect();
-    for (gpu, bytes) in memory.leftover_by_gpu.iter().filter(|(_, bytes)| *bytes > 0) {
-        let dash = || "-".to_string();
-        rows.push(vec!["leftover".into(), gpu.to_string(), dash(), output::bytes(*bytes), dash(), dash(), dash(), dash()]);
+    or_dash(&taken.join(", "))
+}
+
+/// Each GPU's steps: the free bytes at its start, the bytes its binds found mapped (hit), adopted
+/// (kept) and read (store), how many were prefetched, and what make_room took in it.
+fn step_rows(measured: &Measured) -> Vec<Vec<String>> {
+    let mut rows = vec![];
+    for g in &measured.m.memory.stats.varena {
+        let mut by_step: BTreeMap<u32, [u64; 4]> = BTreeMap::new();
+        for r in &g.stats.trace {
+            let cell = by_step.entry(r.step).or_default();
+            let at = match r.origin {
+                varena::memory::Origin::Hit => 0,
+                varena::memory::Origin::Kept => 1,
+                varena::memory::Origin::Store => 2,
+            };
+            cell[at] += r.bytes;
+            if r.speculative {
+                cell[3] += r.bytes;
+            }
+        }
+        for step in 0..g.stats.steps.len() as u32 {
+            by_step.entry(step).or_default();
+        }
+        for (step, [hit, kept, store, prefetched]) in by_step {
+            let stats = g.stats.steps.get(step as usize);
+            let bytes = |n: u64| if n == 0 { "-".to_string() } else { output::bytes(n) };
+            rows.push(vec![
+                g.gpu.to_string(),
+                step.to_string(),
+                stats.map_or("-".into(), |s| output::bytes(s.capacity)),
+                bytes(hit),
+                bytes(kept),
+                bytes(store),
+                bytes(prefetched),
+                stats.map_or("-".into(), |s| evicted(&s.evicted)),
+            ]);
+        }
     }
     rows
 }
 
-/// Evictions by model, rung and reason.
-fn eviction_rows(measured: &Measured) -> Vec<Vec<String>> {
-    let mut counted: BTreeMap<(&str, u32, &str), (u64, u64)> = BTreeMap::new();
-    for e in &measured.m.memory.stats.evictions {
-        let entry = counted.entry((&e.model, e.rung, &e.reason)).or_default();
-        *entry = (entry.0 + 1, entry.1 + e.nbytes);
+/// Each make_room that had to take bytes: its step, what asked, the bytes asked and taken, and the
+/// release events it waited on.
+fn make_room_rows(measured: &Measured) -> Vec<Vec<String>> {
+    let mut rows = vec![];
+    for g in &measured.m.memory.stats.varena {
+        for m in &g.stats.make_room {
+            rows.push(vec![
+                g.gpu.to_string(),
+                m.step.to_string(),
+                m.trigger.to_string(),
+                output::bytes(m.need),
+                output::bytes(m.freed),
+                m.waited.to_string(),
+            ]);
+        }
     }
-    let row = |((model, rung, reason), (count, bytes)): ((&str, u32, &str), (u64, u64))| {
-        vec![model.into(), rung.to_string(), reason.into(), count.to_string(), output::bytes(bytes)]
-    };
-    counted.into_iter().map(row).collect()
-}
-
-/// The activation peak each model measured at each shape key, and the cuts in force there.
-fn peak_rows(measured: &Measured) -> Vec<Vec<String>> {
-    let row = |p: &Peak| vec![p.model.clone(), p.shape.clone(), output::bytes(p.peak), or_dash(&p.cuts.join(", "))];
-    measured.m.memory.stats.peaks.iter().map(row).collect()
+    rows
 }
 
 fn or_dash(text: &str) -> String {
@@ -657,3 +708,4 @@ fn duration(ms: f64) -> String {
         ),
     }
 }
+

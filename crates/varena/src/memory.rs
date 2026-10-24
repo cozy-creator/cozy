@@ -147,10 +147,12 @@ impl Drop for Retained {
 }
 
 /// Where a bound block's bytes came from.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 #[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.varena", frozen, eq, eq_int, skip_from_py_object))]
 pub enum Origin {
     /// Already mapped and filled.
+    #[default]
     Hit,
     /// Adopted from the lease manager's retention: no copy.
     Kept,
@@ -171,7 +173,8 @@ impl Origin {
 }
 
 /// One bind: the page-reference trace the gate computes Belady MIN from.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 #[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.varena", frozen, get_all, skip_from_py_object))]
 pub struct Ref {
     pub step: u32,
@@ -184,7 +187,8 @@ pub struct Ref {
 }
 
 /// Bytes filled from one source and the time the fills took, summed.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 #[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.varena", frozen, get_all, skip_from_py_object))]
 pub struct Fills {
     pub bytes: u64,
@@ -192,7 +196,8 @@ pub struct Fills {
 }
 
 /// Bytes moved, by source: fill time over bytes against the measured ceiling gives the %.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 #[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.varena", frozen, get_all, skip_from_py_object))]
 pub struct Moved {
     /// Leased pages adopted from the manager's retention (no copy; `ns` is the ask, import and map).
@@ -205,7 +210,8 @@ pub struct Moved {
 }
 
 /// One step of a request.
-#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 #[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.varena", frozen, get_all, skip_from_py_object))]
 pub struct StepStats {
     /// The free bytes at its start: the manager's figure, or the standalone budget's.
@@ -214,8 +220,10 @@ pub struct StepStats {
     pub evicted: [u64; 7],
 }
 
-/// One request's record (the design's §5 bar).
-#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
+/// One request's record (the design's §5 bar): what the Runtime relays and `cozy run show` reads,
+/// tolerantly (a member another release lacks takes its default).
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 #[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.varena", frozen, get_all, skip_from_py_object))]
 pub struct Stats {
     pub request: String,
@@ -245,13 +253,14 @@ pub struct Stats {
 }
 
 /// One `make_room` that had to take bytes: what asked, how many bytes, what it took.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 #[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.varena", frozen, get_all, skip_from_py_object))]
 pub struct MakeRoom {
     /// The request's plan step then.
     pub step: u32,
     /// A bind or a range's preparation.
-    pub trigger: &'static str,
+    pub trigger: std::borrow::Cow<'static, str>,
     /// The free bytes asked for.
     pub need: u64,
     /// The bytes its rounds took (pages unmapped).
@@ -1730,7 +1739,7 @@ impl Inner {
     /// have, else only when a round takes nothing and nothing of its own is about to come back
     /// (a fill: waited for). `why` and `req` name it in the request's record.
     fn make_room(&self, bytes: u64, keep: &[Key], why: &'static str, req: Option<u64>, free_only: bool) -> Result<u64> {
-        let mut record = MakeRoom { step: 0, trigger: why, need: bytes, freed: 0, waited: 0 };
+        let mut record = MakeRoom { step: 0, trigger: why.into(), need: bytes, freed: 0, waited: 0 };
         let out = loop {
             let mut st = self.lock();
             // A refused create, or a manager's refusal, says there is less than the figures: the

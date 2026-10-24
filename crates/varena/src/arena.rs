@@ -117,7 +117,8 @@ pub trait Source: Send + Sync {
 }
 
 /// A block of a request's arena still live at the request's end.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 #[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.varena", frozen, get_all, skip_from_py_object))]
 pub struct Outlived {
     pub ptr: u64,
