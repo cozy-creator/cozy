@@ -25,11 +25,16 @@ log "yield-$TAG hold: game run $g $(status_of "$g")"
 
 "$CLI" run sdxl/generate --on "$M" --json --detach prompt="a lighthouse on a cliff at dawn, photo" seed:=$((R + 301)) >"sdxl-ramp-$TAG.ndjson" 2>&1
 n=$(run_number "sdxl-ramp-$TAG.ndjson")
-for _ in $(seq 300); do [ "$(status_of "$n")" = in_progress ] && break; sleep 2; done
+[ -n "$n" ] || { log "yield-$TAG ramp: the sdxl run's number is unreadable ($(head -c 200 "sdxl-ramp-$TAG.ndjson" | tr '\n' ' ')); ramp skipped"; return 0; }
+for _ in $(seq 300); do s=$(status_of "$n"); [ "$s" = in_progress ] || [ "$s" = completed ] || [ "$s" = failed ] && break; sleep 2; done
 sleep 20  # the proof's own pause: well into its denoising loop, its weights bound
 log "yield-$TAG ramp: sdxl run $n is $(status_of "$n"); the game ramps"
 t=$(date +%s); "$CLI" run ./game.py --on "$M" --json >"game-ramp-$TAG.ndjson" 2>&1; log "yield-$TAG game ramp run took $(( $(date +%s) - t ))s"
-until s=$(status_of "$n"); [ "$s" = completed ] || [ "$s" = failed ] || [ "$s" = canceled ]; do sleep 5; done
+# Until sdxl ends; a status unreadable 30 times running (no news in 150 s) ends the wait instead.
+blind=0; until s=$(status_of "$n"); [ "$s" = completed ] || [ "$s" = failed ] || [ "$s" = canceled ]; do
+  if [ -z "$s" ]; then blind=$((blind + 1)); [ "$blind" -lt 30 ] || { s=unreadable; break; }; else blind=0; fi
+  sleep 5
+done
 g=$(run_number "game-ramp-$TAG.ndjson"); timeout 120 "$CLI" run show "$g" --json >"game-ramp-$TAG.json" 2>&1
 timeout 120 "$CLI" run show "$n" --json >"sdxl-ramp-$TAG.json" 2>&1
 log "yield-$TAG ramp: sdxl run $n $s; game run $g $(status_of "$g")"
