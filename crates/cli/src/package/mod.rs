@@ -94,10 +94,13 @@ enum Command {
         #[arg(long)]
         root: bool,
     },
-    /// Yank a release: machines that hold it keep it, nothing new installs it.
+    /// Yank a release: machines that hold it keep it, only an exact pin installs it.
     Yank {
         /// [org/]name@release
         release: String,
+        /// Un-yank it instead: the unversioned default again (a gated candidate's promotion).
+        #[arg(long)]
+        undo: bool,
     },
 }
 
@@ -132,7 +135,9 @@ pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
         Command::List { on, once } => machine::list(ctx, on.map(Into::into), once).await,
         Command::Lock { upgrade, root } => author::lock(ctx, &upgrade, root).await,
         Command::Publish { root } => author::publish(ctx, root).await,
-        Command::Yank { release } => author::yank(ctx, &PackageRef::parse(&release)?).await,
+        Command::Yank { release, undo } => {
+            author::yank(ctx, &PackageRef::parse(&release)?, undo).await
+        }
     }
 }
 

@@ -1012,6 +1012,27 @@ paths:
         4XX: {$ref: '#/components/responses/Error'}
         5XX: {$ref: '#/components/responses/Error'}
 
+  /v1/packages/{org}/{name}/releases/{release}/unyank:
+    post:
+      operationId: unyank_package_release
+      tags: [packages]
+      summary: Un-yanks a release, making it the unversioned default's candidate again (a gated release's promotion).
+      security: [{bearer: []}]
+      parameters:
+      - {$ref: '#/components/parameters/Org'}
+      - {$ref: '#/components/parameters/Name'}
+      - {$ref: '#/components/parameters/Release'}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/Empty'}}}
+      responses:
+        '200':
+          description: The un-yanked release.
+          content:
+            application/json: {schema: {$ref: '#/components/schemas/PackageUnyank'}}
+        4XX: {$ref: '#/components/responses/Error'}
+        5XX: {$ref: '#/components/responses/Error'}
+
   /v1/rental-placements:
     post:
       operationId: place_rental
@@ -2427,6 +2448,13 @@ components:
         release: {type: string}
         state: {type: string}
         yanked_at: {type: string, format: date-time}
+    PackageUnyank:
+      type: object
+      required: [changed, release, state]
+      properties:
+        changed: {type: boolean}
+        release: {type: string}
+        state: {type: string}
     PresignedUpload:
       type: object
       required: [url, required_headers]
