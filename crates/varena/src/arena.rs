@@ -1647,15 +1647,26 @@ pub struct Direct {
     backend: Arc<dyn Backend>,
     allowance: Arc<Allowance>,
     held: Mutex<HashMap<u64, Physical>>,
+    /// The Memory's room for `bytes` (its weight pages give way in its victim order, as a
+    /// manager's revoke would): true when it made some.
+    room: Room,
 }
 
+/// A standalone Memory's make_room for torch's chunks.
+pub type Room = Box<dyn Fn(u64) -> bool + Send + Sync>;
+
 impl Direct {
-    pub fn new(backend: Arc<dyn Backend>, allowance: Arc<Allowance>) -> Direct {
-        Direct { backend, allowance, held: Mutex::new(HashMap::new()) }
+    pub fn new(backend: Arc<dyn Backend>, allowance: Arc<Allowance>, room: Room) -> Direct {
+        Direct { backend, allowance, held: Mutex::new(HashMap::new()), room }
     }
 
     fn one(&self, va: Va, off: u64, len: u64) -> Result<Chunk> {
-        let p = self.allowance.create(&*self.backend, len).map_err(|e| match e {
+        let made = match self.allowance.create(&*self.backend, len) {
+            // Short: the weights it shares the allowance with give way, then once more.
+            Err(_) if (self.room)(len) => self.allowance.create(&*self.backend, len),
+            made => made,
+        };
+        let p = made.map_err(|e| match e {
             Error::Device { code: OUT_OF_MEMORY, .. } => exhausted(len, "the device is out of memory"),
             e => e,
         })?;

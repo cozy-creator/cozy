@@ -65,7 +65,10 @@ impl Memory {
     /// Standalone, chosen explicitly when no compatible manager serves this GPU: the device's
     /// own pages, within the allowance its weight pages share (rev 6).
     pub fn serve_standalone_torch(&self) -> Result<Arc<Torch>> {
-        self.serve_torch(Arc::new(Direct::new(self.inner.backend.clone(), self.inner.allowance.clone())))
+        // Short, torch's chunks take room the way a weight bind does (no manager to revoke).
+        let me = Arc::downgrade(&*self.inner);
+        let room = Box::new(move |bytes| me.upgrade().is_some_and(|inner| inner.make_room(bytes, &[], "torch", None, false).is_ok()));
+        self.serve_torch(Arc::new(Direct::new(self.inner.backend.clone(), self.inner.allowance.clone(), room)))
     }
 
     /// The device's torch allocator: refused until one is served.

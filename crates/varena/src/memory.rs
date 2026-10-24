@@ -1795,9 +1795,23 @@ impl Inner {
                 self.unlock(st);
                 break Ok(free);
             }
+            // Torch's quiet idle spans first, in both modes: the cheapest bytes (the policy's stage
+            // 1, this process's free list), before any weight page. Leased they go back to the
+            // manager the ask is retried with; standalone, to the allowance weights share. No
+            // state lock across them (R10).
+            if let Some(torch) = self.torch.get().cloned() {
+                self.unlock(st);
+                let given = torch.reclaim(bytes - free);
+                if given > 0 {
+                    record.freed += given;
+                    continue;
+                }
+                st = self.lock();
+            }
             // Idle work (a request opened idle, a free-only bind) takes free bytes only; nothing
-            // takes more than it could ever have (its pinned pages stay).
-            let pinned: u64 = st.table.pages().filter(|(k, p)| p.mapped && (!p.pins.is_empty() || p.filling) && !keep.contains(k)).map(|(_, p)| p.bytes).sum();
+            // takes more than it could ever have (its pinned pages stay; a page still filling is
+            // the round's once it lands, waited for below).
+            let pinned: u64 = st.table.pages().filter(|(k, p)| p.mapped && !p.pins.is_empty() && !keep.contains(k)).map(|(_, p)| p.bytes).sum();
             let idle = free_only || req.and_then(|r| st.table.request(r)).is_some_and(|r| r.idle);
             if idle || bytes > (free + st.table.mapped()).saturating_sub(pinned) {
                 let out = short(&st);
