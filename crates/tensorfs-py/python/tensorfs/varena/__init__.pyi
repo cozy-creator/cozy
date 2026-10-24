@@ -136,10 +136,11 @@ class Memory:
 
     def retain(self, set: int, blocks: list[int]) -> Retained: ...
     def context_measurable(self) -> bool: ...
-    def bind(self, set: int, block: int, stream: int = 0, evict: bool = True) -> Pin:
+    def bind(self, set: int, block: int, stream: int = 0, evict: bool = True, request: Request | None = None) -> Pin:
         """Block (region) `block` of `set`, mapped and filled; `stream` (a CUstream, 0 the default)
         waits on the fill, and tensors made from the pin are consumed on it only. With `evict`
-        false it maps into free bytes only, `Exhausted` at once when they are short."""
+        false it maps into free bytes only, `Exhausted` at once when they are short. Its fill and
+        trace go to `request`, else to the request whose pass on this thread runs `set`."""
 
     def classes(self) -> list[int]:
         """Mapped bytes by class (F, O, S, N, D, W, P)."""

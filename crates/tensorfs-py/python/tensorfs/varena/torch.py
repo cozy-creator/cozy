@@ -706,12 +706,22 @@ class Memory:
             self.native.fill(model.id, _fill(model.fill))
 
     def _current(self) -> Request:
-        r = _request.get()
-        if r is None and len(self.requests) == 1:
-            r = next(iter(self.requests))
+        r = self._open_request()
         if r is None:
             raise Unbound("a loaded model's forward runs inside `mem.request(...)`")
         return r
+
+    def _open_request(self) -> Request | None:
+        """This thread's request, else the only one open."""
+        r = _request.get()
+        if r is None and len(self.requests) == 1:
+            r = next(iter(self.requests))
+        return r
+
+    def _for(self) -> NativeRequest | None:
+        """The native request a bind's fill and trace go to: a hold binds before its pass opens."""
+        r = self._open_request()
+        return r.native if r is not None and r.ended is None else None
 
     # -- passes
 
@@ -820,7 +830,7 @@ class Memory:
         owns the pin, so the page stays bound while it lives (the escaped-view rule). Counted as
         an off-forward read."""
         model = block.model
-        pin = self.native.bind(model.id, block.region, self._stream() or 0)
+        pin = self.native.bind(model.id, block.region, self._stream() or 0, request=self._for())
         if self.device.type in ("cpu", "cuda"):
             window = pin.window()
             window.keep(pin)
@@ -851,7 +861,7 @@ class Memory:
     def _bind(self, block: _Block, stream: int | None, pin: Pin | None = None, evict: bool = True) -> None:
         model = block.model
         if pin is None:
-            pin = self.native.bind(model.id, block.region, stream or 0, evict)
+            pin = self.native.bind(model.id, block.region, stream or 0, evict, self._for())
         if self.device.type in ("cpu", "cuda"):
             if block.views is None or block.at != pin.ptr:  # a new mapping: its views once
                 window = pin.window()

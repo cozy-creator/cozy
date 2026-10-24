@@ -1068,15 +1068,26 @@ impl Memory {
     }
 
     /// Maps and fills block `block` of `set`; `stream` (a `CUstream`, 0 the default) waits on
-    /// the fill in-stream, and the release is ordered after its work.
-    pub fn bind(&self, set: SetId, block: u32, stream: usize) -> Result<Pin> {
-        self.inner.guard(|| self.inner.bind_for(set.0, block, stream, None, &[], false))
+    /// the fill in-stream, and the release is ordered after its work. Its fill and trace go to
+    /// `request` (a hold taken before its pass opens), else to the request whose pass on this
+    /// thread runs `set`.
+    pub fn bind(&self, set: SetId, block: u32, stream: usize, request: Option<&Request>) -> Result<Pin> {
+        let req = self.request_id(request)?;
+        self.inner.guard(|| self.inner.bind_for(set.0, block, stream, req, &[], false))
     }
 
     /// [`Memory::bind`] into free bytes only: `Exhausted` at once when they lack the block's,
     /// nothing taken.
-    pub fn bind_free(&self, set: SetId, block: u32, stream: usize) -> Result<Pin> {
-        self.inner.guard(|| self.inner.bind_for(set.0, block, stream, None, &[], true))
+    pub fn bind_free(&self, set: SetId, block: u32, stream: usize, request: Option<&Request>) -> Result<Pin> {
+        let req = self.request_id(request)?;
+        self.inner.guard(|| self.inner.bind_for(set.0, block, stream, req, &[], true))
+    }
+
+    fn request_id(&self, request: Option<&Request>) -> Result<Option<u64>> {
+        match request {
+            Some(r) if !Arc::ptr_eq(&self.inner, &r.inner) => Err(Error::Invalid("bind and request use different devices".into())),
+            r => Ok(r.map(|r| r.id)),
+        }
     }
 
     /// Retains stable virtual addresses for exactly these blocks, without making them resident.

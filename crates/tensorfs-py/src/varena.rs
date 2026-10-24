@@ -362,11 +362,14 @@ impl PyMemory {
 
     /// Block `block` of `set`, mapped and filled; `stream` (a `CUstream`, 0 the default) waits
     /// on the fill and is the only stream a tensor made from it may be consumed on. With
-    /// `evict` false it maps into free bytes only, `Exhausted` at once when they are short.
-    #[pyo3(signature = (set, block, stream = 0, evict = true))]
-    fn bind(&self, py: Python<'_>, set: u32, block: u32, stream: usize, evict: bool) -> PyResult<PyPin> {
+    /// `evict` false it maps into free bytes only, `Exhausted` at once when they are short. Its
+    /// fill and trace go to `request`, else to the request whose pass on this thread runs `set`.
+    #[pyo3(signature = (set, block, stream = 0, evict = true, request = None))]
+    fn bind(&self, py: Python<'_>, set: u32, block: u32, stream: usize, evict: bool, request: Option<PyRef<'_, PyRequest>>) -> PyResult<PyPin> {
         let m = self.memory();
-        let pin = detached(py, &self.gpu.uuid, || if evict { m.bind(SetId(set), block, stream) } else { m.bind_free(SetId(set), block, stream) })?;
+        let request = request.map(|r| r.get(py)).transpose()?;
+        let r = request.as_deref();
+        let pin = detached(py, &self.gpu.uuid, || if evict { m.bind(SetId(set), block, stream, r) } else { m.bind_free(SetId(set), block, stream, r) })?;
         Ok(PyPin { ptr: pin.ptr, len: pin.len, fresh: pin.fresh, stream, dl: self.dl, gpu: self.gpu.uuid.clone(), pin: Arc::new(Held::new(pin)) })
     }
 
