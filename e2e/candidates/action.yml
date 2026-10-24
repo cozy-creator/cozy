@@ -5,8 +5,11 @@ description: >
   its commit and the other two at `stack_ref` / `runtime_ref` (master), so a mismatch between them fails here
   and not on PyPI, plus packages master ($PACKAGES_MASTER) unless the change is the packages'. No candidate
   leg tests a released binary: a released Runtime before CPU mode cannot run a model on these runners, and a
-  released cozy carries the bugs master fixed. `tensord`, `tensorfs` and `runtime` name a release to take
-  instead of a build, on Linux (a dispatch checking a published set). The change's repo is at .src.
+  released cozy carries the bugs master fixed. `tensord`, `tensorfs` and `runtime` take a built candidate
+  instead of a build (a release's set, its GitHub prerelease, or a published one), for this runner's OS: a
+  version (PyPI for the wheels, the `v<version>` release for cozy), a release tag (cozy-creator's
+  `v<version>` / `tensorfs-v<version>`, cozy-runtime's `v<version>`; this OS's asset, checked against the
+  release's SHA256SUMS), or a URL#sha256=<hex>. The change's repo is at .src.
 inputs:
   repo:
     description: The repo whose change this is
@@ -24,13 +27,13 @@ inputs:
     description: The cozy-runtime commit the Runtime comes from, unless the change is cozy-runtime's
     default: master
   tensord:
-    description: A cozy release (GitHub) to take as TensorD instead of building it
+    description: TensorD (cozy) to take instead of building it, this OS's (a version, a release tag or URL#sha256=)
     default: ''
   tensorfs:
-    description: A TensorFS release (PyPI) to take instead of building it
+    description: The TensorFS wheel to take instead of building it, this OS's (a PyPI version, a release tag or URL#sha256=)
     default: ''
   runtime:
-    description: A cozy-runtime release (PyPI) to take instead of building it
+    description: The cozy-runtime wheel to take instead of building it, this OS's (a PyPI version, a release tag or URL#sha256=)
     default: ''
 runs:
   using: composite
@@ -84,17 +87,63 @@ runs:
         [ "$REPO" != cozy-creator ] || creator=.src
         [ "$REPO" != cozy-runtime ] || runtime=.src
         args=()
-        release() { python3 -m pip download -q --no-deps --only-binary :all: "$1==$2" -d "$out"; }
+        # A built candidate for this OS: take <repo> <spec> <wheel name | cozy>; prints the file it fetched.
+        case "$RUNNER_OS-$(uname -m)" in
+          Linux-x86_64) whl='manylinux*x86_64.whl' target=x86_64-unknown-linux-gnu ;;
+          Linux-aarch64) whl='manylinux*aarch64.whl' target=aarch64-unknown-linux-gnu ;;
+          macOS-arm64) whl='macosx*arm64.whl' target=aarch64-apple-darwin ;;
+          macOS-x86_64) whl='macosx*x86_64.whl' target=x86_64-apple-darwin ;;
+          Windows-*) whl='win_amd64.whl' target=x86_64-pc-windows-msvc ;;
+        esac
+        sum() { if command -v sha256sum > /dev/null; then sha256sum "$1"; else shasum -a 256 "$1"; fi | cut -d' ' -f1; }
+        take() {
+          local repo=$1 spec=$2 name=$3 dir file want
+          dir=$(mktemp -d)
+          if [[ $spec == *://* ]]; then
+            file=$dir/$(basename "${spec%%#*}"); curl -fsSL -o "$file" "${spec%%#*}"
+            want=${spec##*#sha256=}; [ "$want" = "$spec" ] || [ "$(sum "$file")" = "$want" ] || { echo "$file: not sha256 $want" >&2; return 1; }
+          elif [[ $spec == v* || $spec == tensorfs-v* || $name == cozy ]]; then
+            [[ $spec == v* || $spec == tensorfs-v* ]] || spec=v$spec
+            if [ "$name" = cozy ]; then
+              gh release download "$spec" -R "cozy-creator/$repo" -D "$dir" -p "cozy-$target.*" -p SHA256SUMS -p '*.sha256' || true
+            else
+              gh release download "$spec" -R "cozy-creator/$repo" -D "$dir" -p "$name-*-$whl" -p "$name-*-py3-none-any.whl" -p SHA256SUMS || true
+            fi
+            # This OS's archive, or wheel: abi3 first, then CPython 3.12's, then the pure one.
+            file=''
+            for f in "$dir"/cozy-"$target".tar.gz "$dir"/cozy-"$target".zip "$dir"/$name-*-abi3-$whl "$dir"/$name-*-cp312-cp312-$whl "$dir"/$name-*-py3-none-any.whl; do
+              [ -e "$f" ] && { file=$f; break; }
+            done
+            [ -n "$file" ] || { echo "release $spec of cozy-creator/$repo has no $name for $target" >&2; return 1; }
+            want=$( (cat "$dir"/SHA256SUMS "$file.sha256" 2>/dev/null || true) | grep -F "$(basename "$file")" | head -1 | cut -d' ' -f1)
+            [ -z "$want" ] || [ "$(sum "$file")" = "$want" ] || { echo "$file: not its SHA256SUMS $want" >&2; return 1; }
+          else
+            uvx -q --from pip pip download -q --no-deps --only-binary :all: "${name//_/-}==$spec" -d "$dir"
+            file=$(ls "$dir"/*.whl | head -1)
+          fi
+          if [ "$name" = cozy ] && [[ $file != *.whl ]]; then
+            # dist's archive: one top directory holding cozy (cozy.exe on Windows).
+            uv run -q --no-project python - "$file" "$out/cozy$exe" <<'PY'
+        import sys, tarfile, zipfile
+        src, dst = sys.argv[1:]
+        if src.endswith(".zip"):
+            z = zipfile.ZipFile(src); data = z.read(next(n for n in z.namelist() if n.split("/")[-1] in ("cozy", "cozy.exe")))
+        else:
+            t = tarfile.open(src); data = t.extractfile(next(m for m in t.getmembers() if m.name.split("/")[-1] == "cozy")).read()
+        open(dst, "wb").write(data)
+        PY
+            chmod +x "$out/cozy$exe"; file=$out/cozy$exe
+          else
+            cp "$file" "$out/"; file=$out/$(basename "$file")
+          fi
+          echo "$file"
+        }
         if [ -n "$TENSORD" ]; then
-          # dist's archive: one top directory holding cozy.
-          gh release download "v$TENSORD" -R cozy-creator/cozy-creator -p "cozy-$(uname -m)-unknown-linux-gnu.tar.gz" -O - \
-            | tar -xzO --wildcards '*/cozy' > "$out/cozy$exe"
-          chmod +x "$out/cozy$exe"; cozy=''
-          args+=(--cozy-bin "$out/cozy$exe")
-          echo "TensorD: $("$out/cozy$exe" --version), the release"
+          args+=(--cozy-bin "$(take cozy-creator "$TENSORD" cozy)"); cozy=''
+          echo "TensorD: $("$out/cozy$exe" --version), taken ($TENSORD)"
         fi
-        if [ -n "$TENSORFS" ]; then release tensorfs "$TENSORFS"; tfs=''; args+=(--tensorfs-wheel "$(ls "$out"/tensorfs-*.whl)"); fi
-        if [ -n "$RUNTIME" ]; then release cozy-runtime "$RUNTIME"; runtime=''; args+=(--runtime-wheel "$(ls "$out"/cozy_runtime-*.whl)"); fi
+        if [ -n "$TENSORFS" ]; then args+=(--tensorfs-wheel "$(take cozy-creator "$TENSORFS" tensorfs)"); tfs=''; fi
+        if [ -n "$RUNTIME" ]; then args+=(--runtime-wheel "$(take cozy-runtime "$RUNTIME" cozy_runtime)"); runtime=''; fi
         if [ -n "$creator" ] && [ -n "$cozy" ]; then
           # TensorD: the dev build `cozy machine update --tensord` takes, dev-build.yaml's stamp.
           (cd "$creator"
