@@ -29,11 +29,9 @@ import_release() {
     | sort -rn | head -1 | cut -d' ' -f2- | sed 's|/lib/python[^/]*/site-packages/.*||')
   py=$env/bin/python
   [ -x "$py" ] || { check "$1: no environment holds $2 $3"; return; }
-  # TensorD's own bootstrap: -I -S, then only the environment's site-packages.
-  "$py" -I -S -c "import pathlib,runpy,sys
-root=pathlib.Path(sys.executable).absolute().parent.parent
-sys.path[:0]=[str(p) for p in root.glob('lib/python*/site-packages') if p.is_dir()]
-sys.argv=sys.argv[1:]; runpy.run_path(sys.argv[0], run_name='__main__')" "$PROBE" "$2" > "$OUT/import-$1.log" 2>&1 \
+  # The environment's own interpreter, isolated (-I) but with its site: a checkout installs editable, through
+  # a .pth that -S would skip.
+  "$py" -I "$PROBE" "$2" > "$OUT/import-$1.log" 2>&1 \
     || check "$1: $(grep -m3 '^FAIL' "$OUT/import-$1.log" | tr '\n' ' ')"
   tail -2 "$OUT/import-$1.log"
   [ -z "$CAND_RT" ] || grep -q "^cozy-runtime $(basename "$CAND_RT" | cut -d- -f2)," "$OUT/import-$1.log" \
