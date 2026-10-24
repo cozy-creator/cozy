@@ -8,9 +8,9 @@
 #         Recorded: each block's wait, the ramp's total, and that sdxl completed.
 ln -sfn "$HERE/cells/game.py" game.py; ln -sfn "$HERE/cells/game_hold.py" game_hold.py
 TAG=${YIELD_TAG:-dev}
-gpu() { timeout 60 "$CLI" machine show "$M" --json 2>/dev/null | python3 -c 'import json,sys; g=[x for x in json.load(sys.stdin).get("gpus",[]) if x.get("memory")]; print(g[0]["memory"][sys.argv[1]] if g else 0)' "$1"; }
-run_number() { grep -o '"number":[0-9]*' "$1" | head -1 | cut -d: -f2; }
-status_of() { timeout 60 "$CLI" run show "$1" --json 2>/dev/null | grep -o '"status":"[a-z_]*"' | tail -1 | cut -d'"' -f4; }
+gpu() { timeout 60 "$CLI" machine show "$M" --json 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); g=[x for x in (d.get("status") or {}).get("gpus") or d.get("gpus") or [] if x.get("memory")]; print(g[0]["memory"].get(sys.argv[1], 0) if g else 0)' "$1"; }
+run_number() { grep -o '"number": *[0-9]*' "$1" | head -1 | grep -o '[0-9]*$'; }
+status_of() { [ -n "$1" ] && timeout 60 "$CLI" run show "$1" --json 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("status",""))' 2>/dev/null; }
 
 "$CLI" run sdxl/generate --on "$M" --warm off >/dev/null 2>&1
 "$CLI" run sdxl/generate --on "$M" --warm installed >"warm-installed-$TAG.log" 2>&1
