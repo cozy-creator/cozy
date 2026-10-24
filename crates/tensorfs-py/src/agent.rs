@@ -50,7 +50,7 @@ fn write(why: *mut c_char, len: usize, text: &str) {
 /// `why` names `why_len + 1` zeroed writable bytes and `code` names a writable int, or either
 /// pointer is null. Both remain valid for this call. The versioned shim enforces this ABI.
 #[no_mangle]
-pub unsafe extern "C" fn varena_agent_alloc(bytes: u64, device: c_int, stream: usize, routed: c_int, pool_a: u64, pool_b: u64, why: *mut c_char, why_len: usize, code: *mut c_int) -> u64 {
+pub unsafe extern "C" fn varena_agent_alloc_v2(bytes: u64, device: c_int, stream: usize, routed: c_int, pool_a: u64, pool_b: u64, why: *mut c_char, why_len: usize, code: *mut c_int) -> u64 {
     let served = catch_unwind(AssertUnwindSafe(|| {
         let memory = serving(device).ok_or_else(|| Error::Invalid(format!("no Memory is open on CUDA device {device}")))?;
         memory.torch_alloc(bytes, stream, (routed != 0).then_some(PoolId(pool_a, pool_b)))
