@@ -739,6 +739,13 @@ impl Drop for Held {
     }
 }
 
+/// The most this process's memory can reach: physical memory, or less under a limit on it (a
+/// cgroup); None when unreadable. What is sized to the host is sized from this.
+#[pyfunction]
+fn host_limit() -> Option<u64> {
+    platform::contain::host_memory::limit()
+}
+
 /// Pins the binding holds now (Python's pin objects and the tensors that keep one).
 #[pyfunction]
 fn pins_held() -> u64 {
@@ -976,6 +983,7 @@ pub fn install(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<varena::arena::Outlived>()?;
     m.add_class::<varena::arena::Ended>()?;
     m.add_function(wrap_pyfunction!(pins_held, &m)?)?;
+    m.add_function(wrap_pyfunction!(host_limit, &m)?)?;
     m.add("VarenaError", py.get_type::<VarenaError>())?;
     m.add("Exhausted", py.get_type::<Exhausted>())?;
     m.add("StaleBinding", py.get_type::<StaleBinding>())?;
