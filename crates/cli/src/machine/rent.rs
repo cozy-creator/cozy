@@ -69,12 +69,19 @@ pub async fn exec(ctx: &Context, rent: Rent) -> Result<ExitCode, Error> {
     };
     let calcifer = ctx.calcifer().await?;
     // The Hub's price for exactly this order, agreed before it is placed or resumed.
-    let quote: Quote = calcifer.post("/v1/rental-quotes", &ask(None), None).await?;
-    if !agree(ctx, &price(&sku, gpus, &quote))? {
+    let quote = calcifer.post("/v1/rental-quotes", &ask(None), None).await?;
+    let quoted = RunQuote {
+        sku: sku.clone(),
+        gpus: Some(gpus),
+        quote,
+        why: None,
+        alternatives: vec![],
+    };
+    if !agree(ctx, &quoted)? {
         output::say(ctx, "nothing was rented");
         return Ok(ExitCode::SUCCESS);
     }
-    let agreed = Some(quote.agreed());
+    let agreed = Some(quoted.quote.agreed());
     let rented: Rented = match calcifer.post("/v1/machines", &ask(agreed), Some(&key)).await {
         // An answer lost on the way back may still have placed the order: only its key resumes it.
         Err(e) if minted && matches!(e.kind, Kind::Unavailable | Kind::Internal) => {
@@ -163,13 +170,13 @@ impl Notices {
 
 /// What a renter is charged: the GPUs and our price an hour (`1× L40S at $1.64/h`). Disk and
 /// traffic are never the renter's, whatever a provider charges us.
-pub(crate) fn price(sku: &str, gpus: u32, q: &Quote) -> String {
+fn price(sku: &str, gpus: u32, q: &Quote) -> String {
     format!("{gpus}× {} at {}/h", sku.to_ascii_uppercase(), usd(q.gpu_usd_micros_per_hour))
 }
 
-/// A run's quote as `price` says it, then why the Hub placed it there and the machines it would
-/// rent instead, each against the pick: its time and its price an hour.
-pub(crate) fn placed(q: &RunQuote) -> String {
+/// A quote as `price` says it, then why the Hub placed it there and the machines it would rent
+/// instead, each against the pick: its time and its price an hour.
+fn placed(q: &RunQuote) -> String {
     let mut said = price(&q.sku, q.gpus.unwrap_or(1), &q.quote);
     if let Some(why) = &q.why {
         said += &format!("\n  {why}");
@@ -193,11 +200,23 @@ pub(crate) fn placed(q: &RunQuote) -> String {
     said
 }
 
-/// The renter's yes to the quote `said` (its first line the offer, the rest why): `--yes`, else a
-/// person's on a terminal (a no is `false`). With neither nothing is rented, and the refusal
-/// carries the offer, in text and JSON.
-pub(crate) fn agree(ctx: &Context, said: &str) -> Result<bool, Error> {
-    let (offer, why) = said.split_once('\n').unwrap_or((said, ""));
+/// The renter's yes to `quoted` (said as `placed`: its first line the offer, the rest why):
+/// `--yes`, else a person's on a terminal (a no is `false`). With neither nothing is rented, and
+/// the refusal carries the offer, in text and JSON. `--json` first prints the quote as one line,
+/// for tools to check: the machine, our price an hour, and the disk the Hub sized for it.
+pub(crate) fn agree(ctx: &Context, quoted: &RunQuote) -> Result<bool, Error> {
+    if ctx.json {
+        output::ndjson(&serde_json::json!({"quote": {
+            "sku": quoted.sku,
+            "gpus": quoted.gpus.unwrap_or(1),
+            "usd_micros_per_hour": quoted.quote.gpu_usd_micros_per_hour,
+            "container_disk_gb": quoted.quote.disk_gb,
+            "why": quoted.why,
+            "alternatives": quoted.alternatives,
+        }}));
+    }
+    let said = placed(quoted);
+    let (offer, why) = said.split_once('\n').unwrap_or((&said, ""));
     if ctx.yes {
         output::say(ctx, &format!("Renting {offer}"));
         if !why.is_empty() {
