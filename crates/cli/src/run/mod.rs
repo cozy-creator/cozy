@@ -57,7 +57,7 @@ struct RunArgs {
     gpus: Option<u32>,
     /// precision lane: 16, 8 or 4 bits, of the function's main model; its LoRAs and other
     /// models take the default. Absent, 8 is preferred, in the encoding the GPUs run best, else
-    /// whatever works.
+    /// whatever works; an Apple GPU runs 16.
     #[arg(long, value_parser = ["16", "8", "4"])]
     lane: Option<String>,
     /// Pin an attention kernel for this run: everywhere, or at one `[slot/]component`.
@@ -497,8 +497,8 @@ async fn send(ctx: &Context, submission: SubmitRun, key: &str, detach: bool) -> 
     follow(ctx, submitted.run, detach).await
 }
 
-/// Warns that a GPU function sent to a ready machine with no supported GPU runs on its CPU,
-/// slowly, and how to rent one instead.
+/// Warns that a GPU function sent to a ready machine with no supported GPU (an NVIDIA GPU, or an
+/// Apple Silicon Mac's own) runs on its CPU, slowly, or is refused there, and how to rent one.
 pub(crate) async fn gpuless(ctx: &Context, on: &On, interface: &Interface, callable: &Callable, target: &str) {
     let On::Machine(name) = on else { return };
     if !interface.gpu(callable) {
@@ -516,7 +516,7 @@ pub(crate) async fn gpuless(ctx: &Context, on: &On, interface: &Interface, calla
     });
     if none {
         output::warn(&format!(
-            "{name} has no supported GPU, so {target} runs on its CPU, slowly; `--on new` rents one: cozy run {target} … --on new"
+            "{name} has no supported GPU, so {target} runs on its CPU, slowly, or not at all if it loads a model; `--on new` rents one: cozy run {target} … --on new"
         ));
     }
 }
