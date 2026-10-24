@@ -85,6 +85,9 @@ struct Header {
     /// kernel longer than the looks is no stall; a stream that never completes is a GPU hang,
     /// the Runtime's health path).
     busy: AtomicU64,
+    /// 1 while a request (not idle work) is open in the agent's holder: pins it holds go at that
+    /// request's step's end. 0 (an older agent writes none): idle, never waited on.
+    running: AtomicU64,
 }
 
 /// The manager's figures in a table's header.
@@ -235,6 +238,14 @@ impl Table {
 
     pub fn set_busy(&self, busy: bool) {
         self.header().busy.store(u64::from(busy), Release);
+    }
+
+    pub fn running(&self) -> bool {
+        self.header().running.load(Acquire) == 1
+    }
+
+    pub fn set_running(&self, running: bool) {
+        self.header().running.store(u64::from(running), Release);
     }
 
     fn ack(&self) {

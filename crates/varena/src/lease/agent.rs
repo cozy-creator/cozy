@@ -336,6 +336,11 @@ impl Agent {
         self.table.set_busy(busy);
     }
 
+    /// A request (not idle work) is (not) open in its holder: only then are its pins waited on.
+    pub fn running(&self, running: bool) {
+        self.table.set_running(running);
+    }
+
     pub fn pin(&self, ticket: Ticket) -> Result<bool> {
         self.table.pin(ticket.slot)
     }

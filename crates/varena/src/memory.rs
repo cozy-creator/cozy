@@ -1294,6 +1294,7 @@ impl Inner {
             }
             // Events still pending: its GPU work is running, never a stall.
             agent.busy(st.events.values().any(|q| !q.is_empty()));
+            agent.running(st.table.requests.iter().any(|r| !r.idle));
             self.redecline(st);
             self.land(st, agent);
             self.offer_derived(st, agent);

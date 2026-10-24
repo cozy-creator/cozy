@@ -92,6 +92,10 @@ pub enum Record {
     /// An ask back held by a pin (`slot`, `pins` of them) for `looks` looks: reported, never
     /// ended.
     Pinned { pid: u32, slot: u32, pins: u32, looks: u32, waited_ms: u64 },
+    /// An ask left waiting: what it needs, what counts as coming, the pids whose pins it waits
+    /// on (each running a request), and its own chunks Revoking and asked back. Logged when any
+    /// of these changes.
+    Wait { pid: u32, ask: u64, bytes: u64, coming: u64, on: Vec<u32>, own_revoking: u64, own_asked: u64 },
 }
 
 /// What TensorD answers for the manager.
@@ -305,6 +309,8 @@ struct Exec {
     /// Its regions and graphs, as its agent last reported them, and those asked back whole.
     regions: BTreeMap<u64, RegionFacts>,
     reclaiming: BTreeSet<u64>,
+    /// Its waiting ask's last Wait record: (ask, coming, on), so an unchanged wait logs once.
+    logged: Option<(u64, u64, Vec<u64>)>,
 }
 
 struct Leased {
@@ -597,7 +603,7 @@ impl Manager {
             let mut b = self.books.lock();
             b.next += 1;
             let id = b.next;
-            let exec = Exec { pid: peer.pid, identity, table, end: end.clone(), free: (0..slots).collect(), leased: BTreeMap::new(), waiting: VecDeque::new(), asked: BTreeMap::new(), progress: 0, seen: (0, 0), still: 0, stalled: false, reported: BTreeSet::new(), waits_on: BTreeSet::new(), regions: BTreeMap::new(), reclaiming: BTreeSet::new() };
+            let exec = Exec { pid: peer.pid, identity, table, end: end.clone(), free: (0..slots).collect(), leased: BTreeMap::new(), waiting: VecDeque::new(), asked: BTreeMap::new(), progress: 0, seen: (0, 0), still: 0, stalled: false, reported: BTreeSet::new(), waits_on: BTreeSet::new(), regions: BTreeMap::new(), reclaiming: BTreeSet::new(), logged: None };
             b.executors.insert(id, exec);
             id
         };
@@ -1073,7 +1079,7 @@ impl Manager {
                     kind => regions.push(policy::Region { id: *rid, chunks: f.slots.clone(), swappable: kind == crate::region::Reclaimable::Swappable, last_use: f.last_use, next_use, produce_ns: f.cost_ns }),
                 }
             }
-            executors.push(policy::Executor { id: *id, chunks: e.leased.iter().filter_map(chunk).collect(), regions, graphs, waits_on });
+            executors.push(policy::Executor { id: *id, chunks: e.leased.iter().filter_map(chunk).collect(), regions, graphs, waits_on, running: e.table.running() });
         }
         let page_cache = cache.iter().map(|k| b.retained.get(k).map_or(0, |v| v.values().map(|p| p.len).sum())).collect();
         let host = b.sample.map(|s| s.host).unwrap_or_default();
@@ -1145,7 +1151,20 @@ impl Manager {
                     }
                 }
                 Answer::Wait { on } => {
+                    let pids: Vec<u32> = on.iter().filter_map(|x| b.executors.get(x).map(|e| e.pid)).collect();
+                    let coming = policy::coming_for(&snapshot, exec);
+                    let own = snapshot.executors.iter().find(|x| x.id == exec).map_or((0, 0), |x| {
+                        let sum = |f: &dyn Fn(&policy::Chunk) -> bool| x.chunks.iter().filter(|c| f(c)).map(|c| c.bytes).sum::<u64>();
+                        (sum(&|c| c.state == State::Revoking), sum(&|c| c.state == State::Mapped && c.asked))
+                    });
                     if let Some(e) = b.executors.get_mut(&exec) {
+                        if let Some(ask) = e.waiting.front() {
+                            let now = (ask.id, coming, on.clone());
+                            if e.logged.as_ref() != Some(&now) {
+                                out.records.push(Record::Wait { pid: e.pid, ask: ask.id, bytes: ask.bytes, coming, on: pids, own_revoking: own.0, own_asked: own.1 });
+                                e.logged = Some(now);
+                            }
+                        }
                         e.waits_on = on.into_iter().collect();
                     }
                     // Starts the look's cadence if it slept; never makes a look early.

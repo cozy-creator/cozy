@@ -80,6 +80,9 @@ pub struct Executor {
     pub graphs: Vec<Graph>,
     /// Executors whose pins its waiting ask counts on (its last [`Answer::Wait`]).
     pub waits_on: Vec<u64>,
+    /// A request (not idle work) is open in it: its pins go at that request's step's end. An
+    /// idle executor's pins are never waited on (they may never go): an ask is refused instead.
+    pub running: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -301,7 +304,7 @@ fn coming(s: &Snapshot, asker: Option<u64>, cyclic: &BTreeSet<u64>) -> (u64, u64
                 State::Granted if asker.is_some_and(|a| a != e.id) => later += c.bytes,
                 State::Revoking | State::Released | State::Refused => bytes += c.bytes,
                 State::Mapped if c.asked && c.pins == 0 => bytes += c.bytes,
-                State::Mapped if c.asked && Some(e.id) != asker && !cyclic.contains(&e.id) => {
+                State::Mapped if c.asked && Some(e.id) != asker && !cyclic.contains(&e.id) && e.running => {
                     bytes += c.bytes;
                     on.insert(e.id);
                 }
@@ -310,6 +313,12 @@ fn coming(s: &Snapshot, asker: Option<u64>, cyclic: &BTreeSet<u64>) -> (u64, u64
         }
     }
     (bytes, later, on)
+}
+
+/// What `asker`'s ask counts as coming: chunks given back or on their way, and running
+/// executors' pinned chunks asked back (the manager's Wait record).
+pub fn coming_for(s: &Snapshot, asker: u64) -> u64 {
+    coming(s, Some(asker), &BTreeSet::new()).0
 }
 
 /// Every executor whose waiting ask waits, directly or through others, on `of`'s pins.
@@ -689,9 +698,10 @@ impl<'a> Run<'a> {
         }
         let Some((asker, (_, far, slots))) = own else { return self.got >= target };
         self.water(vec![(asker, far.into_iter().chain(slots).collect())], Stage::Step, target);
-        // Others' pinned, unprotected chunks: asked now, given at their unpin.
+        // Others' pinned, unprotected chunks: asked now, given at their unpin; only a running
+        // request's unpin comes.
         for (e, x) in self.s.executors.iter().enumerate() {
-            if e == asker || self.cyclic.contains(&x.id) {
+            if e == asker || self.cyclic.contains(&x.id) || !x.running {
                 continue;
             }
             for (c, ch) in x.chunks.iter().enumerate() {
