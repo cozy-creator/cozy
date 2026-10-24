@@ -203,6 +203,9 @@ impl Device {
                         by
                     })
             });
+        // A container's driver names the host's pids, none of them a process here: it cannot
+        // account this machine's processes.
+        let processes = processes.filter(|by| by.is_empty() || by.keys().any(|pid| crate::process::Birth::of(*pid).is_ok()));
         Ok(Reading {
             total,
             free,
