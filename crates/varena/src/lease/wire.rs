@@ -76,6 +76,10 @@ pub enum ToManager {
         region: Option<Region>,
         #[serde(default)]
         fill: Option<String>,
+        /// Prefetch, a warm-up or preload, idle work (a capture): free bytes above high only,
+        /// never a reclaim. An older agent's asks read as demand.
+        #[serde(default)]
+        speculative: bool,
     },
     /// A disk entry for derived weights of `key`, `bytes` long: answered by [`ToAgent::Entry`].
     Derive { key: String, bytes: u64 },

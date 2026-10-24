@@ -12,7 +12,8 @@
 //! so 1 GiB and 1.5 GiB on every GPU (a host test device with no reserve has none).
 //! A demand allocation may take free down to min, a speculative one only down to high. Free under
 //! low starts background reclaim of cold pages up to high; free under min (foreign growth)
-//! reclaims everything unprotected up to high. A new foreign process takes every cold page.
+//! reclaims everything unprotected up to high plus what grew outside since the last reading (a
+//! ramping tenant's next block). A new foreign process takes every cold page.
 //!
 //! Reclaim takes, machine-wide, each stage only while the cheaper ones fall short:
 //! 1. per-process free lists (never the asker's own; all of them while another process waits);
@@ -55,6 +56,9 @@ pub struct Snapshot {
     pub reserved: u64,
     /// This reading only: a foreign process absent when sampling began crossed 256 MiB.
     pub new_foreign: bool,
+    /// What the device lost outside the books since the last decision's reading (a foreign
+    /// process ramping): under min, reclaim covers it too, so the next block it loads is free.
+    pub grown: u64,
     /// The GPU page cache's entries' bytes, oldest first.
     pub page_cache: Vec<u64>,
     pub executors: Vec<Executor>,
@@ -217,7 +221,10 @@ pub fn decide(s: &Snapshot, asks: &[Ask]) -> Decision {
     }
     if free < low {
         let (coming, _, _) = coming(s, None, &BTreeSet::new());
-        let short = high - free - i128::from(coming) - i128::from(run.got);
+        // Under min, also what grew outside since the last reading: one tick covers a ramping
+        // tenant's last tick of growth. Nothing outside growing, it is 0.
+        let ramp = if free < min { i128::from(s.grown) } else { 0 };
+        let short = high + ramp - free - i128::from(coming) - i128::from(run.got);
         if short > 0 {
             run.cover(clamp(short), None, if free < min { Scope::Unprotected } else { Scope::Cold });
         }
