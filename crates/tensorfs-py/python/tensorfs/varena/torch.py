@@ -85,13 +85,15 @@ class NotRegistered(VarenaError):
 class Weights:
     """A module's stored weights: a component of a TensorFS checkpoint. `release` names the
     package release (the fill code's identity), `shard` the rank's slice, `keys` the stored
-    tensors the module builds (all by default)."""
+    tensors the module builds (all by default), `bound` the module path a stored key binds to
+    where the two differ (a checkpoint stored under another naming): blocks are module paths."""
 
     ck: tensorfs.Checkpoint
     component: str
     release: str = ""
     shard: str = "0/1"
     keys: Collection[str] | None = None
+    bound: Mapping[str, str] | None = None
 
 
 class Filling(Protocol):
@@ -568,7 +570,8 @@ class Memory:
         owned: dict[str, list[str]] = {}
         for key in w.ck.components[w.component].tensors:
             if w.keys is None or key in w.keys:
-                owned.setdefault(_block_of(key, paths), []).append(f"{w.component}/{key}")
+                path = w.bound.get(key, key) if w.bound else key
+                owned.setdefault(_block_of(path, paths), []).append(f"{w.component}/{key}")
         order = [p for p in ("", *paths) if p in owned]
         # A set is one checkpoint's component as one module builds it: two models of a release that share a
         # component name (two DiTs' `transformer`, two LoRAs' `model`) are two sets, and so are two modules
