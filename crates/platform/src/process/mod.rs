@@ -505,6 +505,11 @@ impl Detached {
     pub fn try_wait(&mut self) -> Result<Option<ExitStatus>> {
         self.0.try_wait().map_err(Error::os("wait for a process"))
     }
+
+    /// Its exit: what a spawner that outlives it reaps, so no zombie stays behind (Unix).
+    pub fn wait(&mut self) -> Result<ExitStatus> {
+        self.0.wait().map_err(Error::os("wait for a process"))
+    }
 }
 
 impl Tree {
