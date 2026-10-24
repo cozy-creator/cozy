@@ -8,8 +8,8 @@ use crate::{
     catalog::HeldGeneration,
     device_executor::{
         self, channel_lost, Activate, Answer, Binding, Cancellation, Command, Construction,
-        DeviceExecutor, ExecutorConfig, Forked, Frame, Invoke, Kind, Load, Map, ModelLoad,
-        InputFile, InputMetadata, PrepareRequest, Services, Start,
+        DeviceExecutor, ExecutorConfig, Forked, Frame, Invoke, Load, Map, ModelLoad,
+        InputFile, InputMetadata, PrepareRequest, Request, Services, Start,
     },
     execution::Engine,
     gpu_allocation::Claims,
@@ -3652,17 +3652,17 @@ impl Services for Callbacks<'_> {
         frame: &Frame,
         descriptor: Option<File>,
     ) -> io::Result<(Answer, Option<File>)> {
-        if frame.kind == Kind::Publish {
+        if let Some(Request::Publish(publish)) = &frame.request {
             drop(descriptor);
             let answer = match &self.spool {
-                Some(spool) => crate::products::publish(self.engine, self.generation, self.id, spool, frame),
+                Some(spool) => crate::products::publish(self.engine, self.generation, self.id, spool, frame.seq, publish),
                 None => Answer::unavailable(frame.seq),
             };
             return Ok((answer, None));
         }
-        if frame.kind == Kind::CheckpointItem {
+        if let Some(Request::CheckpointItem(item)) = &frame.request {
             drop(descriptor);
-            return Ok((crate::products::checkpoint(self.engine, self.generation, self.id, frame), None));
+            return Ok((crate::products::checkpoint(self.engine, self.generation, self.id, frame.seq, item), None));
         }
         drop(descriptor);
         match self.caller {

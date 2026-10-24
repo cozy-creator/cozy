@@ -7,10 +7,11 @@ use crate::{
     seam,
 };
 pub use protocol::executor::{
-    Activate, Adapter, Answer, Bearer, Binding, ByteGrant, CallInterface, CallProgress, Command,
-    Construction, Event, Fork, Frame, Hello, HostFrame, InputFile, InputMetadata, Invoke, Kind,
-    Level, Load, LoadFacts, Map, MemoSettings, Metrics, ModelLoad, Outcome, Output, PrepareRequest,
-    Probe, PublishPart, Residency, ResultRef, Start, Unload, RESULT_DOCUMENT,
+    Activate, Adapter, Answer, Bearer, Binding, ByteGrant, CallInterface, CallProgress, CheckpointItem,
+    Command, Construction, Event, Fork, Frame, Hello, HostFrame, InputFile, InputMetadata, Invoke,
+    Kind, Level, Load, LoadFacts, Map, MemoSettings, Metrics, ModelLoad, ModelPrefetch, Outcome,
+    Output, PrepareRequest, Probe, Publish, PublishPart, Request, Residency, ResultRef,
+    StageMemoStore, Start, Unload, RESULT_DOCUMENT,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -1041,12 +1042,12 @@ impl DeviceExecutor {
                     services.progress(&frame)
                 }
                 Some(Event::Request)
-                    if matches!(frame.kind, Kind::StageMemoLookup | Kind::StageMemoStore) =>
+                    if matches!(frame.request, Some(Request::StageMemoLookup(_) | Request::StageMemoStore(_))) =>
                 {
                     // A lookup may wait on the run computing its key: not this executor's stillness.
                     watch.serving(true);
                     let answer = match (&self.memo, spool(command)) {
-                        (Some(memo), Some((run, spool))) => memo.answer(run, spool, &frame),
+                        (Some(memo), Some((run, spool))) => memo.answer(run, spool, frame.seq, frame.request.as_ref().expect("a memo request")),
                         _ => Answer::unavailable(frame.seq),
                     };
                     watch.serving(false);
@@ -1258,8 +1259,7 @@ fn advances(frame: &Frame, last: &mut Advance) -> bool {
             *last = now;
             moved
         }
-        Kind::Publish | Kind::CheckpointItem | Kind::ChildCall => true,
-        _ => false,
+        _ => matches!(frame.request, Some(Request::Publish(_) | Request::CheckpointItem(_) | Request::ChildCall(_))),
     }
 }
 
@@ -1322,17 +1322,24 @@ fn decode_frame(bytes: &[u8]) -> io::Result<Frame> {
     let seq = fields.get("seq").and_then(Value::as_u64);
     let descriptor = fields.get("descriptor").and_then(Value::as_bool).unwrap_or(false);
     let reply = fields.get("reply").and_then(Value::as_str).unwrap_or_default().to_owned();
-    serde_path_to_error::deserialize(Value::Object(fields)).or_else(|error| match (event, seq) {
+    let request = (event == Some(Event::Request)).then(|| Request::decode(Value::Object(fields.clone())));
+    let frame: Result<Frame, _> = serde_path_to_error::deserialize(Value::Object(fields));
+    let frame = match (frame, request) {
+        (Ok(_), Some(Err(why))) => Err(why),
+        (Ok(frame), request) => Ok(Frame { request: request.and_then(Result::ok), ..frame }),
+        (Err(error), _) => Err(error.to_string()),
+    };
+    frame.or_else(|error| match (event, seq) {
         (Some(Event::Request), Some(seq)) => Ok(Frame {
             event,
             seq,
             descriptor,
-            malformed: error.to_string(),
+            malformed: error.clone(),
             ..Frame::default()
         }),
         (Some(Event::Progress), _) => Ok(Frame {
             event,
-            malformed: error.to_string(),
+            malformed: error,
             ..Frame::default()
         }),
         _ => Err(io::Error::new(
@@ -1384,3 +1391,4 @@ fn scan(value: &Value) -> io::Result<()> {
     }
     Ok(())
 }
+

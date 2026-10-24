@@ -6,7 +6,7 @@
 //! disk's covering plan (`reclaim`), and on a low disk a new entry is not written (a miss,
 //! never an error).
 use crate::{
-    device_executor::{Answer, Frame, Kind},
+    device_executor::{Answer, Request, StageMemoStore},
     reclaim::{self, TTL},
 };
 use platform::durable::Mode;
@@ -74,55 +74,51 @@ impl Memo {
         })
     }
 
-    /// Answers a memo frame of `run`, whose executor reads and writes `spool`.
-    pub fn answer(&self, run: &str, spool: &Path, frame: &Frame) -> Answer {
-        let mut answer = Answer::ok(frame.seq);
-        if !key_ok(&frame.key) {
-            return crate::device_executor::refused(
-                frame.seq,
-                "memo_key_invalid",
-                "a memo key is 16 to 128 letters and digits",
-            );
+    /// Answers a memo request (`seq`) of `run`, whose executor reads and writes `spool`; any
+    /// other request is not this memo's.
+    pub fn answer(&self, run: &str, spool: &Path, seq: u64, request: &Request) -> Answer {
+        let (key, scope) = match request {
+            Request::StageMemoLookup(r) => (&r.key, (r.stage.clone(), r.numerics.clone())),
+            Request::StageMemoStore(r) => (&r.key, (r.stage.clone(), r.numerics.clone())),
+            _ => return Answer::unavailable(seq),
+        };
+        if !key_ok(key) {
+            return crate::device_executor::refused(seq, "memo_key_invalid", "a memo key is 16 to 128 letters and digits");
         }
-        match frame.kind {
-            Kind::StageMemoLookup => match self.lookup(run, spool, frame) {
-                Ok(Some((local, cost_ms))) => (answer.local, answer.cost_ms) = (local, cost_ms),
-                Ok(None) => answer.disputed = self.disputed(frame),
-                // An unreadable tier is a miss the run computes through.
-                Err(error) => tracing::warn!("stage memo {}: {error}", &frame.key[..16]),
-            },
-            _ => {
-                let stored = self.store(spool, frame);
-                self.settle(&frame.key, run);
+        let mut answer = Answer::ok(seq);
+        match request {
+            Request::StageMemoStore(offer) => {
+                let stored = self.store(spool, offer, &scope);
+                self.settle(key, run);
                 match stored {
-                    Ok(reason) => {
-                        (answer.stored, answer.reason) = (reason.is_empty(), reason.into())
-                    }
+                    Ok(reason) => (answer.stored, answer.reason) = (reason.is_empty(), reason.into()),
                     Err(error) => answer.reason = error.to_string(),
                 }
-                answer.disputed = answer.reason == "present" && self.disputed(frame);
+                answer.disputed = answer.reason == "present" && self.disputed(&scope);
             }
+            _ => match self.lookup(run, spool, key, &scope) {
+                Ok(Some((local, cost_ms))) => (answer.local, answer.cost_ms) = (local, cost_ms),
+                Ok(None) => answer.disputed = self.disputed(&scope),
+                // An unreadable tier is a miss the run computes through.
+                Err(error) => tracing::warn!("stage memo {}: {error}", &key[..16]),
+            },
         }
         answer
     }
 
-    fn disputed(&self, frame: &Frame) -> bool {
-        let scope = (frame.stage.clone(), frame.numerics.clone());
-        self.state.lock().unwrap().disputed.contains(&scope)
+    /// The scope (stage, numerics) computed one key twice, differently.
+    fn disputed(&self, scope: &(String, String)) -> bool {
+        self.state.lock().unwrap().disputed.contains(scope)
     }
 
     /// A verified copy in the run's spool with what it cost to produce, or a miss that claims
     /// the key for this run.
-    fn lookup(&self, run: &str, spool: &Path, frame: &Frame) -> io::Result<Option<(String, f64)>> {
-        let key = &frame.key;
+    fn lookup(&self, run: &str, spool: &Path, key: &String, scope: &(String, String)) -> io::Result<Option<(String, f64)>> {
         loop {
             let entry = {
                 let mut state = self.state.lock().unwrap();
                 loop {
-                    if state
-                        .disputed
-                        .contains(&(frame.stage.clone(), frame.numerics.clone()))
-                    {
+                    if state.disputed.contains(scope) {
                         return Ok(None);
                     }
                     if let Some(entry) = self.entry(key) {
@@ -161,34 +157,33 @@ impl Memo {
     }
 
     /// Why the offered entry was not stored; empty when it was.
-    fn store(&self, spool: &Path, frame: &Frame) -> io::Result<&'static str> {
-        if frame.local.is_empty() {
+    fn store(&self, spool: &Path, offer: &StageMemoStore, scope: &(String, String)) -> io::Result<&'static str> {
+        if offer.local.is_empty() {
             return Ok("declined"); // the executor's own decision; its reason is its own record
         }
-        if frame.length == 0 || frame.length > ENTRY_BYTES {
+        if offer.length == 0 || offer.length > ENTRY_BYTES {
             return Ok("too_large");
         }
         if reclaim::measure(&self.root)?.short().is_some() {
             return Ok("disk_low");
         }
-        let Some(raw) = spooled(spool, Path::new(&frame.local), frame.length) else {
+        let Some(raw) = spooled(spool, Path::new(&offer.local), offer.length) else {
             return Ok("local");
         };
         let sha256 = sha256::hex_digest(&raw);
-        let home = self.root.join(&frame.key);
-        if let Some(existing) = self.entry(&frame.key) {
+        let home = self.root.join(&offer.key);
+        if let Some(existing) = self.entry(&offer.key) {
             if existing.sha256 != sha256 {
-                let scope = (frame.stage.clone(), frame.numerics.clone());
-                self.state.lock().unwrap().disputed.insert(scope);
+                self.state.lock().unwrap().disputed.insert(scope.clone());
             }
             return Ok("present");
         }
         // Written beside its home and renamed in whole: a reader never sees part of an entry.
         let staged = self
             .root
-            .join(format!(".{}-{}", frame.key, std::process::id()));
+            .join(format!(".{}-{}", offer.key, std::process::id()));
         fs::create_dir_all(&staged)?;
-        let cost_us = (frame.cost_ms.max(0.0) * 1000.0) as u64;
+        let cost_us = (offer.cost_ms.max(0.0) * 1000.0) as u64;
         fs::write(staged.join(format!("{sha256}-{cost_us}")), &raw)?;
         let _ = fs::remove_dir(&home); // an emptied home, if one is left
         match fs::rename(&staged, &home) {

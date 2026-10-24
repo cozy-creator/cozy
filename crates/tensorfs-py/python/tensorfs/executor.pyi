@@ -198,3 +198,69 @@ Command: TypeAlias = Hello | Shutdown | Start | Load | Activate | PrepareRequest
 
 def decode_command(data: bytes) -> Command: ...
 def decode_answer(data: bytes) -> Answer: ...
+
+class ChildEvents(_Wire): ...
+
+class ChildCall(_Wire):
+    call_index: int
+    module: str
+    export: str
+    payload: str
+    progress_label: str
+
+class ChildPoll(_Wire):
+    call_index: int
+
+class ChildCancel(_Wire):
+    call_index: int
+
+class ChildForget(_Wire):
+    call_index: int
+
+class GpuRelease(_Wire): ...
+
+class ModelPrefetch(_Wire):
+    module: str
+    export: str
+    payload: str
+
+class PublishPart(_Wire):
+    local: str
+    duration_us: int
+
+class Publish(_Wire):
+    output: str
+    label: str
+    asset_ref: str
+    asset_kind: str
+    media_type: str
+    size_bytes: int
+    digest: str
+    parts: list[PublishPart]
+
+class CheckpointItem(_Wire):
+    output: str
+    repo_id: str
+    revision: str
+    tag: str
+    variant: str
+
+class StageMemoLookup(_Wire):
+    key: str
+    stage: str
+    numerics: str
+
+class StageMemoStore(_Wire):
+    key: str
+    stage: str
+    numerics: str
+    local: str
+    sha256: str
+    length: int
+    cost_ms: float
+    reason: str
+
+Request: TypeAlias = (
+    ChildEvents | ChildCall | ChildPoll | ChildCancel | ChildForget | GpuRelease | ModelPrefetch
+    | Publish | CheckpointItem | StageMemoLookup | StageMemoStore
+)
