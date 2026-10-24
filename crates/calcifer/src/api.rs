@@ -73,6 +73,18 @@ impl Api {
         })
     }
 
+    /// `down`: admission closes once the mutations in flight are done, then every stream and the
+    /// server end. Machines run on. What Calcifer still owes (`resume` takes it up) is answered.
+    pub async fn down(&self) -> Vec<String> {
+        let mut stopping = self.stopping.write().await;
+        *stopping = true;
+        let owed = self.calcifer.owed();
+        drop(stopping);
+        info!(owed = owed.len(), "down: stopping");
+        self.stop();
+        owed
+    }
+
     /// Ends every stream and the server.
     pub fn stop(&self) {
         self.stop.send_replace(true);
@@ -473,12 +485,7 @@ async fn cancel(
 /// Stops Calcifer. It never refuses and never cancels: machines keep what they accepted, and the
 /// next Calcifer resumes what is owed.
 async fn down(State(api): State<Arc<Api>>) -> Json<Down> {
-    let mut stopping = api.stopping.write().await;
-    *stopping = true;
-    let owed = api.calcifer.owed();
-    drop(stopping);
-    info!(owed = owed.len(), "down: stopping");
-    api.stop();
+    let owed = api.down().await;
     Json(Down {
         stopping: true,
         owed,

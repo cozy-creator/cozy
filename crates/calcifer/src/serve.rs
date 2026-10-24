@@ -149,6 +149,16 @@ pub async fn serve(loaded: &Loaded) -> Result<Stopped, Error> {
     let machines = Machines::start(calcifer.clone(), home.clone(), &loaded.user_home, &loaded.config);
     steps.done("machines");
     let api = Api::new(calcifer.clone(), machines.clone(), address.port(), &token);
+    // A service manager's stop (SIGTERM) is `down`, as graceful: the machine runs on.
+    #[cfg(unix)]
+    if let Ok(mut term) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+        let stopping = api.clone();
+        tokio::spawn(async move {
+            term.recv().await;
+            info!("SIGTERM: stopping as down does");
+            stopping.down().await;
+        });
+    }
     let app = api::router(api.clone()).into_make_service_with_connect_info::<SocketAddr>();
     let server = tokio::spawn(
         axum::serve(listener, app)

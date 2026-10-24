@@ -66,7 +66,9 @@ pub(super) fn uninstall(dir: &Path, name: &str) -> Result<bool> {
     if !path.exists() {
         return Ok(false);
     }
-    run(MANAGER, systemctl().args(["disable", &unit(name)]))?;
+    // An unlinked unit (a removal cut short after its disable) refuses `disable`: the file goes
+    // either way, and a link left to it would name nothing.
+    let _ = run(MANAGER, systemctl().args(["disable", &unit(name)]));
     if let Err(error) = fs::remove_file(&path)
         && error.kind() != io::ErrorKind::NotFound
     {
