@@ -273,7 +273,7 @@ impl Shared {
         }
         loop {
             let mut chunks = Vec::new();
-            match self.source.map(va, Kind::Torch, &mut chunks) {
+            match self.source.map(va, Kind::Torch, false, &mut chunks) {
                 Ok(()) => return Ok(chunks),
                 Err(e) => {
                     self.unmap(va, chunks, false, false);

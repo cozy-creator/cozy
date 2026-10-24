@@ -278,6 +278,8 @@ struct Books {
     reserve: u64,
     /// The driver's last reading; `None`: unread, and nothing grows.
     sample: Option<Sample>,
+    /// The reading the last decision saw: what grew outside the books since is the next one's.
+    decided: Option<Sample>,
     /// Device bytes no process of ours holds, as TensorD last sampled them (shown only), and
     /// whether that reading saw a new foreign process (consumed by the next decision).
     foreign: u64,
@@ -351,6 +353,7 @@ struct Waiting {
     fill: Option<String>,
     /// The derived entry kept for `fill`, read before the books were taken.
     entry: Option<std::fs::File>,
+    speculative: bool,
 }
 
 /// What to send and record once `books` dropped, and a backend nothing needs any more.
@@ -419,6 +422,15 @@ fn free(b: &Books) -> Option<u64> {
     let sample = b.sample?;
     let driver = (sample.free + (b.destroyed_total - sample.destroyed)).saturating_sub(b.created_total - sample.created);
     Some(driver.min(b.card.saturating_sub(b.created) + b.reserve))
+}
+
+/// What the device lost outside the books from reading `then` to `now` (a foreign process
+/// growing): the growth of total − free − ours, never below 0. Ours is what was created less what
+/// was destroyed, each counted at its reading.
+fn grown(then: Sample, now: Sample) -> u64 {
+    let ours = |s: Sample| i128::from(s.created) - i128::from(s.destroyed);
+    let outside = |s: Sample| -i128::from(s.free) - ours(s);
+    u64::try_from(outside(now) - outside(then)).unwrap_or(0)
 }
 
 /// What may be created now: free less the reserved pool.
@@ -651,7 +663,7 @@ impl Manager {
             match end.recv::<ToManager>() {
                 Ok(Some((message, _))) => {
                     let out = match message {
-                        ToManager::Ask { id: ask, bytes, kind, region, fill } => self.ask(id, Waiting { id: ask, bytes, kind, region, fill, entry: None }),
+                        ToManager::Ask { id: ask, bytes, kind, region, fill, speculative } => self.ask(id, Waiting { id: ask, bytes, kind, region, fill, entry: None, speculative }),
                         ToManager::Derive { key, bytes } => self.derive(id, key, bytes),
                         ToManager::Derived { key, entry } => {
                             if let Some(domain) = self.domain(id) {
@@ -1120,7 +1132,7 @@ impl Manager {
             for w in &e.waiting {
                 let sizes = sizes(w, granularity);
                 let hit = cached(b, &e.identity.domain, w.region, &sizes).and_then(|k| cache.iter().position(|c| *c == k));
-                asks.push(policy::Ask { executor: *id, bytes: sizes.iter().sum(), speculative: false, cached: hit });
+                asks.push(policy::Ask { executor: *id, bytes: sizes.iter().sum(), speculative: w.speculative, cached: hit });
             }
             let chunk = |(slot, l): (&u32, &Leased)| {
                 let w = e.table.word(*slot).filter(|w| w.seq == l.seq)?;
@@ -1143,7 +1155,7 @@ impl Manager {
         }
         let page_cache = cache.iter().map(|k| b.retained.get(k).map_or(0, |v| v.values().map(|p| p.len).sum())).collect();
         let host = b.sample.map(|s| s.host).unwrap_or_default();
-        let snapshot = policy::Snapshot { free, reserved, new_foreign: b.new_foreign, page_cache, executors, host };
+        let snapshot = policy::Snapshot { free, reserved, new_foreign: b.new_foreign, grown: 0, page_cache, executors, host };
         (snapshot, asks, cache)
     }
 
@@ -1154,7 +1166,9 @@ impl Manager {
         // Unread (no device yet, or the driver's read failed): nothing grows or is reclaimed; the
         // asks wait for the next read.
         let Some(free) = free(b) else { return false };
-        let (snapshot, asks, cache) = self.snapshot(b, free);
+        let (mut snapshot, asks, cache) = self.snapshot(b, free);
+        snapshot.grown = b.sample.zip(b.decided).map_or(0, |(now, then)| grown(then, now));
+        b.decided = b.sample;
         b.new_foreign = false;
         let decision = policy::decide(&snapshot, &asks);
         let (mut freed, mut asked) = (false, BTreeMap::<u64, Vec<u32>>::new());

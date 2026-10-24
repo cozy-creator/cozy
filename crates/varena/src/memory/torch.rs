@@ -147,12 +147,13 @@ impl Memory {
 
     /// The calling thread's blocks go to the request's arena until the guard drops.
     pub fn allocating(&self, request: &Request) -> Allocating {
-        Allocating { _route: self.inner.torch.get().map(|t| t.route(Owner::Request(request.id))) }
+        let idle = self.inner.state.lock().table.request(request.id).is_some_and(|r| r.idle);
+        Allocating { _route: self.inner.torch.get().map(|t| t.route(Owner::Request(request.id), idle)) }
     }
 
     /// The calling thread's blocks go to cache region `region`'s own arena (M2) until it drops.
     pub fn region_allocating(&self, region: u64) -> Allocating {
-        Allocating { _route: self.inner.torch.get().map(|t| t.route(Owner::Region(region))) }
+        Allocating { _route: self.inner.torch.get().map(|t| t.route(Owner::Region(region), false)) }
     }
 
     /// The region is gone: its spans leave as they come whole free; the record names survivors.
@@ -264,9 +265,9 @@ impl Source for Leased {
         u32::try_from(chunk.id >> 32).ok()
     }
 
-    fn map(&self, va: Va, _: Kind, into: &mut Vec<Chunk>) -> Result<()> {
+    fn map(&self, va: Va, _: Kind, speculative: bool, into: &mut Vec<Chunk>) -> Result<()> {
         let (mut tickets, mut off, mut failed) = (Vec::new(), 0, None);
-        for lease in self.agent.take(va.len, crate::lease::Kind::Torch, None)? {
+        for lease in self.agent.take(va.len, crate::lease::Kind::Torch, None, speculative)? {
             let len = lease.phys.len;
             let mapped = if failed.is_some() || off + len > va.len {
                 Err(Error::Internal(format!("a grant of {len} bytes past its {}-byte span", va.len)))
