@@ -18,4 +18,4 @@ class Reversed(msgspec.Struct):
 
 @app.entrypoint(accelerator=False)
 def reverse(payload: Text) -> Reversed:
-    return Reversed(text=payload.text[::-1])
+    return Reversed(text=payload.text)
