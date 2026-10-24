@@ -514,7 +514,11 @@ pub struct Frame {
     pub name: String,
     pub sha256: String,
     pub length: u64,
+    /// `load` and `invoke` telemetry: one of a shape this machine does not read is absent, never
+    /// the reply's failure.
+    #[serde(deserialize_with = "lenient")]
     pub facts: Option<LoadFacts>,
+    #[serde(deserialize_with = "lenient")]
     pub metrics: Option<Metrics>,
     /// `invoke`: varena's record of the request (`Stats`), kept whole; another frame's `memory`
     /// of another shape (an older Hello's list) reads as absent.
@@ -1956,7 +1960,8 @@ fn decode_frame(bytes: &[u8]) -> io::Result<Frame> {
     };
     let seq = fields.get("seq").and_then(Value::as_u64);
     let descriptor = fields.get("descriptor").and_then(Value::as_bool).unwrap_or(false);
-    serde_json::from_value(Value::Object(fields)).or_else(|error| match (event, seq) {
+    let reply = fields.get("reply").and_then(Value::as_str).unwrap_or_default().to_owned();
+    serde_path_to_error::deserialize(Value::Object(fields)).or_else(|error| match (event, seq) {
         (Some(Event::Request), Some(seq)) => Ok(Frame {
             event,
             seq,
@@ -1969,7 +1974,10 @@ fn decode_frame(bytes: &[u8]) -> io::Result<Frame> {
             malformed: error.to_string(),
             ..Frame::default()
         }),
-        _ => Err(io::Error::other(error)),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("executor_reply_malformed: the executor's `{reply}` reply: {error}"),
+        )),
     })
 }
 
