@@ -89,8 +89,8 @@ impl Command {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.executor", frozen, get_all, skip_from_py_object))]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.executor", frozen, eq, get_all, skip_from_py_object))]
 pub struct Start {
     /// The session's GPUs; empty runs on the CPU and never opens CUDA.
     #[serde(default)]
@@ -123,8 +123,8 @@ pub struct Start {
     pub memo: Option<MemoSettings>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.executor", frozen, get_all, skip_from_py_object))]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.executor", frozen, eq, get_all, skip_from_py_object))]
 pub struct Load {
     pub construction: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -146,14 +146,14 @@ pub struct Load {
     pub attention_pin: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.executor", frozen, get_all, skip_from_py_object))]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.executor", frozen, eq, get_all, skip_from_py_object))]
 pub struct Activate {
     pub construction: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.executor", frozen, get_all, skip_from_py_object))]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.executor", frozen, eq, get_all, skip_from_py_object))]
 pub struct PrepareRequest {
     pub request_id: String,
     #[serde(default)]
@@ -171,8 +171,8 @@ pub struct PrepareRequest {
     pub input_metadata: BTreeMap<String, InputMetadata>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.executor", frozen, get_all, skip_from_py_object))]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.executor", frozen, eq, get_all, skip_from_py_object))]
 pub struct Invoke {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tensorfs: Option<TensorFSOptions>,
@@ -215,8 +215,8 @@ pub struct Invoke {
     pub family: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.executor", frozen, get_all, skip_from_py_object))]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.executor", frozen, eq, get_all, skip_from_py_object))]
 pub struct Map {
     pub construction: String,
     #[serde(default)]
@@ -233,22 +233,22 @@ pub enum Level {
     Ram,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.executor", frozen, get_all, skip_from_py_object))]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.executor", frozen, eq, get_all, skip_from_py_object))]
 pub struct Unload {
     pub construction: String,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.executor", frozen, get_all, skip_from_py_object))]
+#[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.executor", frozen, eq, get_all, skip_from_py_object))]
 pub struct Probe {
     /// Collect cyclic garbage first: a cycle holding a device tensor is not a leak.
     #[serde(default)]
     pub collect: bool,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.executor", frozen, get_all, skip_from_py_object))]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.executor", frozen, eq, get_all, skip_from_py_object))]
 pub struct Fork {
     pub socket: PathBuf,
     pub root: PathBuf,
@@ -256,16 +256,16 @@ pub struct Fork {
     pub environment: BTreeMap<String, String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.executor", frozen, get_all, skip_from_py_object))]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.executor", frozen, eq, get_all, skip_from_py_object))]
 pub struct Bearer {
     #[serde(default)]
     pub actor: String,
     pub tensorfs: TensorFSOptions,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.executor", frozen, get_all, skip_from_py_object))]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.executor", frozen, eq, get_all, skip_from_py_object))]
 #[serde(default)]
 pub struct Adapter {
     pub model_id: String,
@@ -292,8 +292,8 @@ impl Default for Adapter {
 
 /// One model's construction: its class, where its weights are, and how to fill them. A
 /// weightless binding names only its release and an empty `model_class`.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.executor", frozen, get_all, skip_from_py_object))]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.executor", frozen, eq, get_all, skip_from_py_object))]
 #[serde(default)]
 pub struct Binding {
     pub application: String,
@@ -351,8 +351,8 @@ impl Default for Binding {
 }
 
 /// One model of a many-model construction (an entrypoint with several model slots).
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.executor", frozen, get_all, skip_from_py_object))]
+#[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.executor", frozen, eq, get_all, skip_from_py_object))]
 pub struct ModelLoad {
     #[serde(default)]
     pub binding: Binding,
@@ -360,8 +360,8 @@ pub struct ModelLoad {
 
 /// An executor's stage memo tiers (`memo: stage/1`): its in-memory tier (-1: its own default;
 /// 0: off) and the largest entry the machine keeps (0: that tier off).
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.executor", frozen, get_all, skip_from_py_object))]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.executor", frozen, eq, get_all, skip_from_py_object))]
 #[serde(default)]
 pub struct MemoSettings {
     pub process_bytes: i64,
@@ -374,8 +374,8 @@ impl Default for MemoSettings {
 }
 
 /// One constructed model slot of a session: its checkpoint and the components it uses.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.executor", frozen, get_all, skip_from_py_object))]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.executor", frozen, eq, get_all, skip_from_py_object))]
 pub struct Construction {
     /// `<fn>.models.<param>`
     pub path: String,
@@ -387,8 +387,8 @@ pub struct Construction {
 }
 
 /// One callable an attempt may call: its own package's, or another App's of its environment.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.executor", frozen, get_all, skip_from_py_object))]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.executor", frozen, eq, get_all, skip_from_py_object))]
 pub struct CallInterface {
     pub module: String,
     pub export: String,
@@ -405,8 +405,8 @@ pub struct CallInterface {
 }
 
 /// One file input's identity, before its bytes are granted.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.executor", frozen, get_all, skip_from_py_object))]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.executor", frozen, eq, get_all, skip_from_py_object))]
 pub struct InputMetadata {
     pub input_id: String,
     pub media_type: String,
@@ -417,8 +417,8 @@ pub struct InputMetadata {
 }
 
 /// One verified input file in the attempt's own spool.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.executor", frozen, get_all, skip_from_py_object))]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.executor", frozen, eq, get_all, skip_from_py_object))]
 pub struct InputFile {
     pub local: PathBuf,
     pub media_type: String,
@@ -717,8 +717,8 @@ impl Frame {
 // --------------------------------------------------------------------------- TensorD's answers
 
 /// TensorD's answer to one executor request, under its `seq`.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.executor", frozen, get_all, skip_from_py_object))]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.executor", frozen, eq, get_all, skip_from_py_object))]
 #[serde(default)]
 pub struct Answer {
     pub event: String,
@@ -811,8 +811,8 @@ impl Answer {
 
 /// A child's result byte, granted into the caller's spool: what the caller checks against the
 /// result's own record before it hands out a handle.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.executor", frozen, get_all, skip_from_py_object))]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.executor", frozen, eq, get_all, skip_from_py_object))]
 pub struct ByteGrant {
     pub output_id: String,
     pub kind: String,
@@ -825,8 +825,8 @@ pub struct ByteGrant {
 }
 
 /// A managed call's newest progress: its sequence and the child's progress frame.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.executor", frozen, get_all, skip_from_py_object))]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.executor", frozen, eq, get_all, skip_from_py_object))]
 pub struct CallProgress {
     pub sequence: u64,
     pub payload: Json,
