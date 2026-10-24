@@ -119,6 +119,9 @@ impl Machine {
             };
             let _ = sent.send(answered);
         });
+        // The fetch judges its own exchanges by what they move: a preparation waiting here is
+        // not still.
+        let _asking = tensorfs::fetch::asking::begin();
         answer.recv().unwrap_or_else(|_| refuse(Code::TRANSFER_FAILED, "the fetch runtime ended"))
     }
 

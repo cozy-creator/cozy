@@ -829,9 +829,12 @@ pub fn convert(req: &Request, sink: &mut dyn Sink) -> Result<Imported> {
             parts,
         )?;
     }
+    let mut n = planned.len() as u64;
     for (file, component, plan) in &ggufs_planned {
         for o in &plan.tensors {
             stopped(req)?;
+            progress("converting", n, total);
+            n += 1;
             let mut readers: Vec<gguf::Ranges> = (o.parts.iter())
                 .map(|part| gguf::Ranges::new(&opened[*file], &part.ranges))
                 .collect();

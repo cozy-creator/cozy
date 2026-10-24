@@ -1040,6 +1040,8 @@ impl Publisher {
                     })
                 })
                 .collect();
+            // Each file is a fetch, judged by what it moves: this thread waits on them.
+            let _asking = tensorfs::fetch::asking::begin();
             handles
                 .into_iter()
                 .map(|handle| handle.join().unwrap_or_else(|_| Err(io_failure(io::Error::other("a package file download panicked")))))
