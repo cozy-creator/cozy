@@ -2599,7 +2599,7 @@ impl Pool {
         };
         executor.retain_until_exit(directory);
         executor.retain_until_exit(WakeOnExit(Arc::downgrade(engine)));
-        executor.activity = gpu_work(self.lane(start, plan.degree)?);
+        executor.activity = gpu_work(self.lane(start, plan.degree)?, executor.birth.clone());
         executor.keep_memo(self.memo.clone());
         if plan.degree > 0 {
             let exact = Exact::open(&executor.birth)?.ok_or_else(|| io::Error::other("executor exited before its start"))?;
@@ -3233,14 +3233,22 @@ fn unsettled(reply: &Frame, lost: &str) -> Refused {
 
 /// Whether `gpus` moved device memory since the last reading; None without GPUs or while NVML
 /// cannot tell.
-fn gpu_work(gpus: &[Device]) -> Option<crate::process::Activity> {
+/// The device memory traffic of `leader`'s group (its followers share its process group) on its
+/// GPUs: its own, never another process's on the card, which would let an idle executor's work
+/// keep a stuck call looking busy. Where the driver's per-process samples cannot name it (a
+/// container's pids), the card's traffic.
+fn gpu_work(gpus: &[Device], leader: Birth) -> Option<crate::process::Activity> {
     let opened = gpus.iter().map(|gpu| platform::gpu::Device::open(&gpu.entry).ok());
     let devices: Vec<_> = opened.collect::<Option<_>>().filter(|devices: &Vec<_>| !devices.is_empty())?;
-    let seen = Mutex::new(vec![0; devices.len()]);
+    let seen = Mutex::new(vec![(0, 0); devices.len()]);
     Some(Arc::new(move || {
+        let pids: Vec<u32> = std::iter::once(leader.pid).chain(platform::process::group_members(&leader).into_iter().map(|m| m.pid)).collect();
         let mut moved = false;
-        for (device, seen) in devices.iter().zip(seen.lock().unwrap().iter_mut()) {
-            moved |= device.moved_since(seen).ok()?;
+        for (device, (own, card)) in devices.iter().zip(seen.lock().unwrap().iter_mut()) {
+            moved |= match device.moved_by_since(&pids, own).ok()? {
+                Some(moved) => moved,
+                None => device.moved_since(card).ok()?,
+            };
         }
         Some(moved)
     }))

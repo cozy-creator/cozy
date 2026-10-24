@@ -238,6 +238,25 @@ impl Device {
         }))
     }
 
+    /// Whether the processes `pids` moved device memory in NVML's per-process samples after
+    /// `seen` (its timestamp, µs), which it advances. None where the samples cannot say: none of
+    /// their pids is a process here (a container's driver names the host's), so another
+    /// process's traffic cannot be told from theirs.
+    pub fn moved_by_since(&self, pids: &[u32], seen: &mut u64) -> Result<Option<bool>> {
+        let device = self.nvml.device_by_index(self.index).map_err(failed("open device"))?;
+        let samples = match device.process_utilization_stats(*seen) {
+            Err(NvmlError::NotFound) => return Ok(Some(false)),
+            samples => samples.map_err(failed("process utilization samples"))?,
+        };
+        if samples.iter().any(|s| s.mem_util > 0) && !samples.iter().any(|s| crate::process::Birth::of(s.pid).is_ok()) {
+            return Ok(None);
+        }
+        Ok(Some(samples.iter().fold(false, |moved, sample| {
+            *seen = (*seen).max(sample.timestamp);
+            moved || (pids.contains(&sample.pid) && sample.mem_util > 0)
+        })))
+    }
+
     /// Whether its compute mode admits one context at a time (exclusive-process) or none
     /// (prohibited): a second process holding a context locks every other out. A driver that
     /// does not say shares it.
