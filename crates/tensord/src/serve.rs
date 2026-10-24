@@ -19,6 +19,11 @@ pub fn main(args: impl IntoIterator<Item = std::ffi::OsString>) -> ExitCode {
         /// Windows: the readiness pipe a stable parent handed the service it started.
         #[arg(long, hide = true)]
         service_ready: Option<u64>,
+        /// What a machine `cozy machine enable` started (0.11.16 and older) was given: its update
+        /// execs this binary in its place with its own arguments. It means this computer's machine.
+        /// Upgrade safety only: remove once no machine runs 0.11.16 or older (tracker cl-646).
+        #[arg(long = "persistent", hide = true)]
+        _persistent: bool,
     }
     let serve = <Serve as clap::Parser>::parse_from(args);
     machine(serve.flags.lifetime(), serve.service_ready)
