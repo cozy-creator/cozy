@@ -13,7 +13,7 @@ same SKU and suites; any FAIL blocks the promotion. Design: tracker `design/ci-v
 | `varena` | the memory manager: cold load, co-residency, reload, 8/6/3 GiB caps, a real 8 GB card, host RAM (below) | its `skus` | | a varena or memory change |
 | `tensord` | the machine agent through `cozy`: generations, run and executor lifecycle, leases, multi-GPU, no re-execution, output delivery, cl-650 (building) | a cheap 2-GPU pod | | a TensorD or cozy change |
 | `tensorfs` | downloads as fast as the last pass (Hub and datacenter cache), nothing from the Hub again, resume after a cut; uploads of new weights, dedup of a re-upload, resume after a cut; a straggler re-asked, not waited out (below) | cpu | ~$0.3 · ~40 min | a TensorFS, download or upload change |
-| `hub` | the API contract (`api/openapi.yaml`): anonymous paths, then account, rental, package publish/yank/pin/un-yank and model upload/publish/yank/delete through `cozy` (below); the migration rehearsal before a deploy | cpu | ~$0.2 · ~30 min | any Hub release |
+| `hub` | the API contract (`api/openapi.yaml`): anonymous paths, then account, an admin rental on each provider (RunPod, vast), package publish/yank/pin/un-yank and model upload/publish/yank/delete through `cozy` (below); the migration rehearsal before a deploy | cpu | ~$0.2 · ~30 min | any Hub release |
 | `cli` | (building) | | | a CLI change |
 
 A rewrite picks every suite. Suites stack on one rental per SKU (`--suite runtime,packages` runs each cell once,
@@ -97,8 +97,9 @@ The runner signs in as the owner's account with its own device key: secret `COZY
   - `contract.py`: each path no verb reaches, called anonymously, answers as its contract says (200 with a body its
     schema admits, or 401 when bearer-only). This is the one place in release-gate that speaks HTTP to the Hub by
     hand: it is the contract test.
-  - Through `cozy`, on a throwaway `<account>/ci-hub-<R>`: whoami, credits, credits history, the rental catalog and
-    the rental itself; a package locked, published twice, run, yanked (the simple index marks it `data-yanked`),
+  - Through `cozy`, on a throwaway `<account>/ci-hub-<R>`: whoami, credits, credits history, the rental catalog, the
+    rental itself and an admin rental of `cpu` on each provider (`machine rent --provider runpod|vast`, ended and
+    checked gone: renters never pick one, th-254); a package locked, published twice, run, yanked (the simple index marks it `data-yanked`),
     resolved past, run by exact pin, and un-yanked; a model uploaded, published (listed), downloaded, yanked (listed
     yanked), downloaded by pin, un-yanked, deleted (gone). The package's releases are yanked and the model deleted.
   - Before a Hub deploy, the release agent also rehearses its migrations: dump prod (in-pod `pg_dump -Fc`, copied
