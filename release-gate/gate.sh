@@ -4,7 +4,7 @@
 # .github/workflows/release-gate.yaml on a runner signed in with `cozy login --key`.
 #   gate.sh <SKU> --suite name,... [--gpus N] [--out DIR] [--establish] [--publish] [--runtime F|URL] [--tensorfs F|URL]
 #           [--tensord BIN|URL] [--packages DIR] [--pins name@release,...] [--only cell,cell] [--before FILE]...
-#           [--cells FILE]... [--cli BIN] [--disk GB]
+#           [--cells FILE]... [--first pkg,...] [--cli BIN] [--disk GB]
 # --suite runs those suites (suites/<name>/: README.md says what each proves and costs); there is no default, the
 # release agent chooses. A suite's before.sh runs on the fresh pod before the candidate goes on, its cells.sh after it
 # and its check.py in analyze.py; the baseline is gate-<SKU>-<suites>.json.
@@ -25,7 +25,7 @@ if [ "${1:-}" != --copy ]; then
 fi
 HERE=$2; shift 2
 REPO=cozy-creator/cozy-creator TAG=release-gate-baselines
-SKU=$1; shift; CAND=() ONLY= EXTRA=() BEFORE=() CLI=cozy DISK=400 OUT= PKGS= ESTABLISH= PUBLISH= PINS= SUITES= K= CLIP= GPUS=
+SKU=$1; shift; CAND=() ONLY= EXTRA=() BEFORE=() CLI=cozy DISK=400 OUT= PKGS= ESTABLISH= PUBLISH= PINS= SUITES= K= CLIP= GPUS= FIRST=
 RT= TFS= BIN= RW= TW= TD=
 ver() { basename "${1%%#*}" | cut -d- -f2; }
 while [ $# -gt 0 ]; do
@@ -38,6 +38,7 @@ while [ $# -gt 0 ]; do
     --before) BEFORE+=("$2");;
     --suite) SUITES=$2;;
     --gpus) GPUS=$2;;
+    --first) FIRST=$2;;
     --cli) CLI=$2;;
     --disk) DISK=$2;;
     --packages) PKGS=$(cd "$2" && pwd);;
@@ -124,7 +125,7 @@ cell() {
   ! cut -f1 cells.tsv | grep -qx -- "$name" || return 0
   issue=$(jq -r --arg s "$SKU" --arg c "$name" '.[] | select((.sku == $s or .sku == "*") and ((.cells // []) | index($c))) | .issue' \
     "$HERE/known-failing.json" | head -1)
-  [ -z "$issue" ] || { log "$name: parked on $SKU ($issue), not run"; return 0; }
+  [ -z "$issue" ] || { log "$name: pending fix $issue, not run on $SKU"; return 0; }
   for p in "$@"; do [[ $p != prompt=* ]] || printf '%s\t%s\n' "$name" "${p#prompt=}" >> prompts.tsv; done  # quality.py
   "$CLI" run "$target" --on "$M" --json "$@" >"$name.ndjson" 2>"$name.err"
   local n; n=$(grep -o '"number":[0-9]*' "$name.ndjson" | head -1 | cut -d: -f2)

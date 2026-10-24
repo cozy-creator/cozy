@@ -204,7 +204,7 @@ for name, c in summary.items():
         (fails if c[k] > limit else notes).append(line)
 
 for k in (json.load(open(KNOWN_FAILING)) if os.path.exists(KNOWN_FAILING) else []):
-    if k['sku'] == sku:
+    if k['sku'] in (sku, '*'):
         notes.append(f"known failing, not run: {k['cell']} ({k['issue']}: {k['what']})")
 # The host: a slow driver makes every first pass slow and must read as the host, not the code (lead 10-23).
 for leg in ('cuda_init', 'measure_device'):
