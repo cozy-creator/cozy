@@ -95,6 +95,9 @@ pub struct Chunk {
     pub pins: u32,
     /// A reclaim request is out for it.
     pub asked: bool,
+    /// Asked back across the stall look's looks and still held: its own executor's ask never
+    /// counts on it (its return waits on that process's own progress, a cycle of one).
+    pub overdue: bool,
     pub advice: Advice,
 }
 
@@ -300,6 +303,9 @@ fn coming(s: &Snapshot, asker: Option<u64>, cyclic: &BTreeSet<u64>) -> (u64, u64
     let (mut bytes, mut later, mut on) = (0, 0, BTreeSet::new());
     for e in &s.executors {
         for c in &e.chunks {
+            if c.asked && c.overdue && asker == Some(e.id) && c.state == State::Mapped {
+                continue;
+            }
             match c.state {
                 State::Granted if asker.is_some_and(|a| a != e.id) => later += c.bytes,
                 State::Revoking | State::Released | State::Refused => bytes += c.bytes,
