@@ -62,12 +62,14 @@ user_services() {
   export DBUS_SESSION_BUS_ADDRESS=unix:path=$XDG_RUNTIME_DIR/bus
 }
 
-# Candidates go on through `cozy machine update local`, the path a person takes for a dev build.
+# Candidates go on through `cozy machine update local`, the path a person takes for a dev build, in the
+# spelling of the installed cozy (0.11.16 renamed --runtime-wheel/--tensorfs-wheel to --runtime/--tensorfs).
 candidates() {
-  local args=()
+  local args=() rt=--runtime tfs=--tensorfs
+  if cozy machine update --help | grep -q -- --runtime-wheel; then rt=--runtime-wheel tfs=--tensorfs-wheel; fi
   [ -z "$CAND_COZY" ] || args+=(--tensord "$CAND_COZY")
-  [ -z "$CAND_TFS" ] || args+=(--tensorfs-wheel "$CAND_TFS")
-  [ -z "$CAND_RT" ] || args+=(--runtime-wheel "$CAND_RT")
+  [ -z "$CAND_TFS" ] || args+=("$tfs" "$CAND_TFS")
+  [ -z "$CAND_RT" ] || args+=("$rt" "$CAND_RT")
   [ ${#args[@]} -gt 0 ] || return 0
   cozy --json machine update local "${args[@]}" -y | tee "$OUT/update.json" || fail "cozy machine update local refused the candidates"
   if [ -n "$CAND_COZY" ]; then

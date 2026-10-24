@@ -1,13 +1,16 @@
 name: e2e
 # CI v2 (tracker/design/ci-v2.md): cozy as a person runs it, on GitHub's runners, for the suites the change
-# selects (ci/affected, ci/suites.toml). `cli`: install, up, the local machine, real BiRefNet on the CPU, a
-# second executor, down, uninstall (Linux; macOS and Windows when selected). `mps`: real inference on the
-# macOS runner's Apple GPU. The GPU suites run in the release gate, not here. `e2e` always reports.
+# selects (ci/affected, ci/suites.toml). `cli`: install, up, the local machine, a weightless request and real
+# BiRefNet on the CPU, a second executor, down, uninstall (Linux; macOS and Windows when selected). `imports`:
+# every published first-party package release installs and imports on the candidate set. `mps`: real
+# inference on the macOS runner's Apple GPU. The GPU suites run in the release gate, not here. `e2e` always
+# reports.
 #   Here: this repo's pull requests. Other repos and the release gate call it:
 #     uses: cozy-creator/cozy-creator/.github/workflows/e2e.yaml@master
 #     with: {repo: cozy-runtime, ref: <head sha>, base: <base sha>}     # or select: "<tokens>" instead of base
-# Candidates are built from the change and go on through `cozy machine update local`; the rest is the
-# release a person would get from https://tensorhub.com/install.sh.
+# The candidate set (TensorD, TensorFS, the Runtime) is built from the change and the other repos' master
+# (stack_ref, runtime_ref) and goes on through `cozy machine update local`; the rest is the release a person
+# would get from https://tensorhub.com/install.sh.
 on:
   pull_request:
   workflow_call:
@@ -32,6 +35,14 @@ on:
         description: The cozy-creator commit whose ci/ and e2e/ run
         type: string
         default: master
+      stack_ref:
+        description: The cozy-creator commit the candidate TensorD and TensorFS come from (the change's own, if cozy-creator's)
+        type: string
+        default: master
+      runtime_ref:
+        description: The cozy-runtime commit the candidate Runtime comes from (the change's own, if cozy-runtime's)
+        type: string
+        default: master
   workflow_dispatch:
     inputs:
       repo:
@@ -47,6 +58,12 @@ on:
         type: string
         default: cli
       creator_ref:
+        type: string
+        default: master
+      stack_ref:
+        type: string
+        default: master
+      runtime_ref:
         type: string
         default: master
 
@@ -128,12 +145,49 @@ jobs:
           repo: ${{ needs.affected.outputs.repo }}
           ref: ${{ needs.affected.outputs.ref }}
           build: ${{ env.BUILD }}
+          stack_ref: ${{ inputs.stack_ref || 'master' }}
+          runtime_ref: ${{ inputs.runtime_ref || 'master' }}
       - name: cli suite
         run: bash .creator/e2e/cli/run.sh --out "$RUNNER_TEMP/e2e" $CANDIDATES
       - if: always()
         uses: actions/upload-artifact@v4
         with:
           name: e2e-cli-${{ matrix.os }}
+          path: ${{ runner.temp }}/e2e
+          retention-days: 14
+
+  imports:
+    needs: affected
+    if: contains(fromJSON(needs.affected.outputs.selection).suites, 'imports')
+    runs-on: ubuntu-24.04
+    # Hang bound, not a work budget.
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    env:
+      BUILD: ${{ join(fromJSON(needs.affected.outputs.selection).build, ' ') }}
+    steps:
+      # Every release's environment holds torch: room for them.
+      - run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL; df -h /
+      - uses: actions/checkout@v5
+        with:
+          repository: cozy-creator/cozy-creator
+          ref: ${{ needs.affected.outputs.creator }}
+          path: .creator
+      - uses: ./.creator/e2e/candidates
+        with:
+          repo: ${{ needs.affected.outputs.repo }}
+          ref: ${{ needs.affected.outputs.ref }}
+          build: ${{ env.BUILD }}
+          stack_ref: ${{ inputs.stack_ref || 'master' }}
+          runtime_ref: ${{ inputs.runtime_ref || 'master' }}
+      - name: imports suite
+        run: bash .creator/e2e/imports/run.sh --out "$RUNNER_TEMP/e2e" $CANDIDATES
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-imports
           path: ${{ runner.temp }}/e2e
           retention-days: 14
 
@@ -158,6 +212,8 @@ jobs:
           repo: ${{ needs.affected.outputs.repo }}
           ref: ${{ needs.affected.outputs.ref }}
           build: ${{ env.BUILD }}
+          stack_ref: ${{ inputs.stack_ref || 'master' }}
+          runtime_ref: ${{ inputs.runtime_ref || 'master' }}
       - name: mps suite
         run: bash .creator/e2e/mps/run.sh --out "$RUNNER_TEMP/e2e" $CANDIDATES
       - if: always()
@@ -169,7 +225,7 @@ jobs:
 
   e2e:
     if: always()
-    needs: [affected, cli, mps]
+    needs: [affected, cli, imports, mps]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
