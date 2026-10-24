@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# cozy, each call logged for e2e/coverage.py: `gate.sh --cli e2e/bin/cozy` with COZY_E2E_LOG naming the log
+# (a location) and COZY_E2E_BIN the binary (default: the next cozy on PATH).
+printf '%s\x1f' "$@" >> "${COZY_E2E_LOG:?}"; printf '\x1e' >> "$COZY_E2E_LOG"
+exec "${COZY_E2E_BIN:-cozy}" "$@"

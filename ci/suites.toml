@@ -4,6 +4,7 @@
 # `unmapped` (everything). Globs: `*` stays inside one directory, `**` spans directories.
 # Tokens:
 #   cli, imports, mps, gpu, gpu-datacenter   suites
+#   cli-release                             cozy's signed-in commands (e2e/release/run.sh): a release only, with the CI key
 #   varena                                  the memory manager's own suite (release-gate/suites/varena)
 #   pkg:<name>                              a package's cells; pkg:* every package
 #   os:macos, os:windows                    the cli suite on that OS too (Linux always). A PR takes them only from a
@@ -18,7 +19,7 @@
 # is Linux-only. It joins `everything`, `platform` and the BiRefNet/SDXL extras when both land.
 
 everything = ["cli", "imports", "gpu", "gpu-datacenter", "varena", "pkg:*"]
-release = ["everything", "os:macos", "os:windows"]
+release = ["everything", "os:macos", "os:windows", "cli-release"]
 
 [cozy-creator]
 unmapped = ["everything", "build:cozy", "build:tensorfs"]

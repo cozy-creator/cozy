@@ -1,0 +1,185 @@
+# Every cozy command and flag, and the e2e step that tests it (e2e/coverage.py checks both ways against the
+# binary under test, and that every entry of the run's tiers was exercised). `test` is the command itself.
+#   pr       every PR's cli suite (e2e/cli/run.sh, e2e/cli/commands.sh): a fresh GitHub runner, CPU, signed out
+#   release  the release's cli-release suite (e2e/release/run.sh): signed in with the CI key, one cheap rental,
+#            a throwaway fidika/ci-e2e-<run> package and model
+#   gate     the release gate's GPU pod (release-gate/cells/cli.sh, the stress cells)
+#   manual   a person does it, on a path named here      none   not tested: why
+#   pending  its tier's test exists or is planned, but no run requires it yet: why
+# A new command or flag fails `coverage.py check` until it has a line here and its test runs.
+
+[global]
+"--json" = "pr: every step reads the JSON answer"
+"--tensorhub" = "pr: hubs, a command sent to a hub by name"
+"--yes" = "pr: candidates (machine update -y)"
+
+[completion]
+test = "pr: completion, each shell's script loads and completes cozy's verbs"
+
+[credits]
+test = "release: credits, the account's billing"
+["credits history"]
+test = "release: credits history, the recent moves (--json: every page)"
+["credits buy"]
+test = "release: credits buy, a checkout is created and never paid"
+"--no-browser" = "release: credits buy"
+"--no-wait" = "release: credits buy"
+
+[doctor]
+test = "pr: doctor, healthy, then a stuck Calcifer it restarts"
+"--on" = "pr: doctor --on local"
+
+[hub]
+test = "pr: hubs"
+["hub list"]
+test = "pr: hubs"
+["hub add"]
+test = "pr: hubs"
+["hub use"]
+test = "pr: hubs"
+["hub remove"]
+test = "pr: hubs"
+
+[login]
+test = "manual: a person types the emailed code (release-gate/enroll-ci-key.sh)"
+"--export" = "manual: release-gate/enroll-ci-key.sh mints the CI key with it"
+"--key" = "release: sign-in, the runner loads the CI key"
+[logout]
+test = "pr: signed out, logout says so (signed in, it revokes the CI key: none)"
+"--everywhere" = "none: revokes every other key of the account (Paul's own); needs a separate test account"
+[whoami]
+test = "pr: signed out, whoami says so (release: signed in as fidika)"
+
+[status]
+test = "pr: status, Calcifer and the local machine"
+
+[update]
+test = "pr: update, to the previous release and back to the newest"
+
+["machine list"]
+test = "pr: machines"
+["machine show"]
+test = "pr: machines"
+["machine logs"]
+test = "pr: machine logs, the machine's and Calcifer's"
+"--follow" = "pr: machine logs, it keeps printing"
+"--lines" = "pr: machine logs"
+"--since" = "pr: machine logs"
+["machine update"]
+test = "pr: candidates"
+"--runtime" = "pr: candidates"
+"--tensorfs" = "pr: candidates"
+"--tensord" = "pr: candidates"
+"--gpu-memory-limit" = "gate: stress, the 8/6/3 GiB caps"
+["machine add"]
+test = "pr: an added machine, this runner's own machine by its address"
+"--fingerprint" = "pr: an added machine"
+["machine authorize"]
+test = "pr: an added machine, a new controller's key"
+["machine end"]
+test = "pr: an added machine, removed"
+"--force" = "release: rental, ended with a run still going"
+["machine rent"]
+test = "release: rental"
+"--disk-gb" = "release: rental, its disk"
+"--gpus" = "release: rental, more GPUs than the SKU has is refused before buying"
+["machine keepalive"]
+test = "release: rental, keepalive moves its idle deadline"
+
+["package search"]
+test = "pr: packages"
+"--limit" = "pr: packages"
+["package info"]
+test = "pr: packages"
+["package install"]
+test = "pr: packages"
+"--on" = "pr: packages"
+["package list"]
+test = "pr: packages"
+"--on" = "pr: packages"
+["package remove"]
+test = "pr: packages"
+"--on" = "pr: packages"
+["package lock"]
+test = "release: throwaway package, locked"
+"--upgrade-package" = "release: throwaway package, locked"
+"--root" = "manual: first-party releases only (packages' task publish), never a throwaway at the root"
+["package publish"]
+test = "release: throwaway package, published"
+"--root" = "manual: first-party releases only (packages' task publish), never a throwaway at the root"
+["package yank"]
+test = "release: throwaway package, yanked"
+"--undo" = "release: throwaway package, un-yanked"
+
+["model search"]
+test = "pr: models"
+"--family" = "pr: models"
+"--limit" = "pr: models"
+["model info"]
+test = "pr: models"
+["model list"]
+test = "pr: models"
+"--on" = "pr: models"
+["model download"]
+test = "pr: models"
+"--lane" = "pr: models"
+"--on" = "pr: models"
+"--variant" = "pr: models"
+["model family"]
+test = "release: throwaway model, family set and cleared"
+"--clear" = "release: throwaway model, family set and cleared"
+["model upload"]
+test = "release: throwaway model, uploaded from a file and from a run's output"
+"--on" = "release: throwaway model"
+"--source-profile" = "none: needs a reviewed TensorFS profile for a small provider model, and none exists"
+["model publish"]
+test = "release: throwaway model, published"
+"--release" = "release: throwaway model"
+"--commit" = "release: throwaway model"
+["model yank"]
+test = "release: throwaway model, yanked and un-yanked"
+"--release" = "release: throwaway model"
+"--undo" = "release: throwaway model"
+["model delete"]
+test = "release: throwaway model, deleted"
+["model quantize"]
+test = "gate: cli cells, the throwaway model's int8 lane"
+"--format" = "gate: cli cells"
+"--recipe" = "gate: cli cells"
+"--package" = "gate: cli cells"
+"--on" = "gate: cli cells"
+
+[run]
+test = "pr: a weightless request; BiRefNet on the CPU"
+"--input" = "pr: a YAML request, then inline inputs over it"
+"--asset" = "pr: BiRefNet on the CPU"
+"--asset-fidelity" = "pr: run flags"
+"--describe" = "pr: run flags, the contract and no run"
+"--warm" = "pr: run flags, each warm level and off"
+"--out" = "pr: BiRefNet on the CPU"
+"--on" = "pr: BiRefNet on the CPU"
+"--lane" = "pr: run flags"
+"--gpus" = "gate: cli cells"
+"--attention-kernel" = "gate: cli cells"
+"--lora" = "gate: cli cells"
+["run show"]
+test = "pr: a run followed, a snapshot, a cancel"
+"--once" = "pr: a run followed, a snapshot, a cancel"
+["run list"]
+test = "pr: run list filters"
+"--state" = "pr: run list filters"
+"--package" = "pr: run list filters"
+"--on" = "pr: run list filters"
+"--limit" = "pr: run list filters"
+["run cancel"]
+test = "pr: a run followed, a snapshot, a cancel"
+["run play"]
+test = "pr: run play, its link serves the output, then expires"
+"--output" = "pr: run play"
+"--expires" = "pr: run play"
+
+# Hidden (`hide = true`, in no --help): probed in the binary; `coverage.py --source` finds any not listed here.
+[hidden]
+"machine rent --provider" = "pending: release tier, one cheapest-CPU rental per provider, ended and checked gone (release-gate/suites/hub); Hub-admin only; its live proof waits for the CI key or a cozy release that carries it"
+"machine rent --image-digest" = "pending: release tier, a Hub admin's gated worker-image bake; waits for the CI key"
+"model migrate-headers" = "none: dev builds only (cargo feature migrate), never in a release"

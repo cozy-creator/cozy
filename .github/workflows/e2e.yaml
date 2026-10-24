@@ -198,12 +198,58 @@ jobs:
       - name: cli suite
         env:
           PINS: ${{ inputs.pins }}
+          GH_TOKEN: ${{ github.token }}
         # BiRefNet: a pin, the change's packages, or packages master (the set's own).
         run: bash .creator/e2e/cli/run.sh --out "$RUNNER_TEMP/e2e" $CANDIDATES ${PINS:+--pins "$PINS"} $(case " $CANDIDATES " in (*" --packages "*) ;; (*) echo ${PACKAGES_MASTER:+--packages "$PACKAGES_MASTER"} ;; esac)
       - if: always()
         uses: actions/upload-artifact@v4
         with:
           name: e2e-cli-${{ matrix.os }}
+          path: ${{ runner.temp }}/e2e
+          retention-days: 14
+
+  # cozy's signed-in commands, with the CI key: only where the release-gate environment admits the ref (master,
+  # release branches), so a release (`--tokens release`) or a dispatch selects it, never a pull request.
+  cli-release:
+    needs: affected
+    if: contains(fromJSON(needs.affected.outputs.selection).suites, 'cli-release')
+    runs-on: ubuntu-24.04
+    environment: release-gate
+    # Hang bound, not a work budget.
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    env:
+      BUILD: ${{ join(fromJSON(needs.affected.outputs.selection).build, ' ') }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          repository: cozy-creator/cozy-creator
+          ref: ${{ needs.affected.outputs.creator }}
+          path: .creator
+      - uses: ./.creator/e2e/candidates
+        with:
+          repo: ${{ needs.affected.outputs.repo }}
+          ref: ${{ needs.affected.outputs.ref }}
+          build: ${{ env.BUILD }}
+          stack_ref: ${{ inputs.stack_ref || 'master' }}
+          runtime_ref: ${{ inputs.runtime_ref || 'master' }}
+          tensord: ${{ inputs.tensord }}
+          tensorfs: ${{ inputs.tensorfs }}
+          runtime: ${{ inputs.runtime }}
+      - name: cli-release suite
+        env:
+          KEY: ${{ secrets.COZY_CI_DEVICE_KEY }}
+        run: |
+          [ -n "$KEY" ] || { echo "::error::the release-gate environment has no COZY_CI_DEVICE_KEY (release-gate/README.md)"; exit 1; }
+          umask 077; printf '%s' "$KEY" > "$RUNNER_TEMP/key.json"
+          code=0; bash .creator/e2e/release/run.sh --out "$RUNNER_TEMP/e2e" --key "$RUNNER_TEMP/key.json" $CANDIDATES || code=$?
+          rm -f "$RUNNER_TEMP/key.json"; exit $code
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-cli-release
           path: ${{ runner.temp }}/e2e
           retention-days: 14
 
@@ -286,7 +332,7 @@ jobs:
 
   e2e:
     if: always()
-    needs: [affected, cli, imports, mps]
+    needs: [affected, cli, cli-release, imports, mps]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
