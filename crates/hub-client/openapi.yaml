@@ -2259,7 +2259,7 @@ components:
       properties:
         digest: {type: string}
         length: {type: integer, format: int64}
-        path: {type: string}
+        path: {type: string, description: 'A PackageReleasePath, a directory one followed by the file''s name.'}
     PackageFileGrant:
       type: object
       required: [digest, length, path, present]
@@ -2329,6 +2329,14 @@ components:
       properties:
         files: {type: array, items: {$ref: '#/components/schemas/PackageFileGrant'}}
         publication_id: {type: string}
+    PackageReleasePath:
+      type: string
+      description: |
+        Where each file of a release is declared: pyproject.toml and uv.lock at the root,
+        Runtime describe's interface at metadata/package-interface.json, and under the three
+        directories the project wheel, the source archive (.tar.gz) and each git dependency's
+        wheel, by file name.
+      enum: [pyproject.toml, uv.lock, metadata/package-interface.json, artifacts/project/, artifacts/source/, artifacts/dependencies/]
     PackageReleaseSummary:
       type: object
       required: [release, package_interface_digest, package_interface_length, created_at]

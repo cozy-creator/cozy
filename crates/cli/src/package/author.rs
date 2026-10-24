@@ -18,7 +18,7 @@ use protocol::{
     error::{Error, Kind},
 };
 use futures_util::{StreamExt as _, TryStreamExt as _};
-use hub_client::types;
+use hub_client::types::{self, PackageReleasePath as At};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
@@ -684,22 +684,26 @@ pub async fn publish(ctx: &Context, root: bool) -> Result<ExitCode, Error> {
 
     let wheel = carried::single(&dist, ".whl")?;
     let sdist = carried::single(&dist, ".tar.gz")?;
-    let named = |dir: &str, local: &Path| {
+    // Where each file is declared: the Hub's PackageReleasePath.
+    let named = |dir: At, local: &Path| {
         format!(
-            "{dir}/{}",
+            "{dir}{}",
             local.file_name().unwrap_or_default().to_string_lossy()
         )
     };
     let mut files = vec![
-        File::new(named("artifacts/project", &wheel), wheel.clone())?,
-        File::new(named("artifacts/source", &sdist), sdist.clone())?,
-        File::new("metadata/package-interface.json".into(), interface_path)?,
+        File::new(named(At::ArtifactsProject, &wheel), wheel.clone())?,
+        File::new(named(At::ArtifactsSource, &sdist), sdist.clone())?,
+        File::new(At::MetadataPackageInterfaceJson.to_string(), interface_path)?,
     ];
-    for document in ["pyproject.toml", "uv.lock"] {
-        files.push(File::new(document.into(), stage.src.join(document))?);
+    for (at, document) in [
+        (At::PyprojectToml, "pyproject.toml"),
+        (At::UvLock, "uv.lock"),
+    ] {
+        files.push(File::new(at.to_string(), stage.src.join(document))?);
     }
     for local in git_wheels {
-        files.push(File::new(named("artifacts/dependencies", &local), local)?);
+        files.push(File::new(named(At::ArtifactsDependencies, &local), local)?);
     }
 
     let declaration = types::PackageReleaseDeclaration {
