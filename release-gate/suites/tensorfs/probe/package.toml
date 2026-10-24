@@ -1,0 +1,2 @@
+[application]
+object = "ci_tfs_probe:app"

@@ -1,0 +1,17 @@
+[build-system]
+requires = ["uv_build>=0.12.7,<0.13"]
+build-backend = "uv_build"
+
+[project]
+name = "ci-tfs-probe"
+version = "0.1.0"
+description = "The tensorfs suite's probe: the machine's disk, written and read cold"
+requires-python = ">=3.12"
+dependencies = ["cozy-runtime>=0.30", "msgspec>=0.19", "tensorfs>=0.13"]
+
+[project.entry-points."cozy.application"]
+default = "ci_tfs_probe:app"
+
+[tool.uv.build-backend]
+module-name = "ci_tfs_probe"
+module-root = ""
