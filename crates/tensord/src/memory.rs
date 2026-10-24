@@ -70,6 +70,28 @@ impl Hosting for Hosted {
     fn free(&self) -> Option<u64> {
         self.device.as_ref()?.free().ok()
     }
+
+    fn derive(&self, domain: &str, key: &str, bytes: u64) -> Option<std::fs::File> {
+        match self.derived.create(domain, key, bytes) {
+            Ok(entry) => entry,
+            Err(error) => {
+                self.peers.notes.note(serde_json::json!({"event": "derived_unkept", "key": key, "bytes": bytes, "why": error.to_string()}));
+                None
+            }
+        }
+    }
+
+    fn derived(&self, domain: &str, key: &str) {
+        self.derived.written(domain, key);
+    }
+
+    fn read_derived(&self, domain: &str, key: &str) -> Option<std::fs::File> {
+        self.derived.open(domain, key)
+    }
+
+    fn forget_derived(&self, domain: &str, key: &str) {
+        self.derived.forget(domain, key);
+    }
 }
 
 impl Gpu {
