@@ -12,7 +12,9 @@ same SKU and suites; any FAIL blocks the promotion. Design: tracker `design/ci-v
 | `packages` | the packages `--pins` (or `--only`) names, plus the SDXL smoke | rtx-4090, rtx-5090 | ~$1–3 · 15–30 min | a package bump |
 | `varena` | the memory manager: cold load, co-residency, reload, 8/6/3 GiB caps, a real 8 GB card, host RAM (below) | its `skus` | | a varena or memory change |
 | `tensord` | the machine agent through `cozy`: generations, run and executor lifecycle, leases, multi-GPU, no re-execution, output delivery, cl-650 (building) | a cheap 2-GPU pod | | a TensorD or cozy change |
-| `tensorfs`, `hub`, `cli` | (building) | | | a TensorFS, Hub or CLI change |
+| `tensorfs` | downloads as fast as the last pass (Hub and datacenter cache), nothing from the Hub again, resume after a cut; uploads of new weights, dedup of a re-upload, resume after a cut; a straggler re-asked, not waited out (below) | cpu | ~$0.3 · ~40 min | a TensorFS, download or upload change |
+| `hub` | the API contract (`api/openapi.yaml`): anonymous paths, then account, rental, package publish/yank/pin/un-yank and model upload/publish/yank/delete through `cozy` (below); the migration rehearsal before a deploy | cpu | ~$0.2 · ~30 min | any Hub release |
+| `cli` | (building) | | | a CLI change |
 
 A rewrite picks every suite. Suites stack on one rental per SKU (`--suite runtime,packages` runs each cell once,
 against `gate-<SKU>-runtime-packages.json`). A suite is `suites/<name>/`: `cells.sh` (sourced in gate.sh: `cell`,
