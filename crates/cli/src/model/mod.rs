@@ -127,7 +127,7 @@ pub(crate) struct Upload {
 #[derive(clap::Args, Debug)]
 #[command(group(ArgGroup::new("lane").required(true).args(["int8", "fp8", "nvfp4", "w4a8", "svdq_nvfp4", "recipe"])))]
 pub(crate) struct Quantize {
-    /// org/name[@release] or org/name#sha256:….
+    /// org/name[@release-or-tag] (main after an upload; none: its default) or org/name#sha256:….
     model: String,
     /// Where it goes: org/name[@tag], the tag whose tree takes the variant (main); default: the
     /// model's own.

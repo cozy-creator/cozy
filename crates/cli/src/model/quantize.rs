@@ -5,13 +5,16 @@
 //! provenance in its header, and returns its checkpoint reference.
 use std::process::ExitCode;
 
-use hub_client::types::{ModelCard, ModelCatalogRelease};
+use hub_client::types::ModelCatalogRelease;
 use protocol::calcifer::{Run, Status};
 use protocol::config::Hub;
 use protocol::error::{Error, Kind};
+use tensorfs::Endpoint;
+use tensorfs::format::{Header, ObjectRef, Tree};
+use tensorfs::precision::Profile;
 
-use super::Quantize;
 use super::refs::{self, ModelRef, Repo};
+use super::{Quantize, releases};
 use crate::Context;
 use crate::context::hub_answer;
 use crate::output::{self, Record};
@@ -20,59 +23,91 @@ use crate::run::interface::{Interface, Recipe, RECIPES};
 /// A 16-bit lane: original weights a 4-bit lane may be written from.
 const ORIGINAL: [&str; 3] = ["bf16", "fp16", "f32"];
 
-/// A 4-bit lane is written only from original weights (owner, 2026-10-22): from a release holding
-/// none, such as an ingested Q4_K GGUF or a 4-bit checkpoint, it would stack two rounds of 4-bit
-/// error. Refused, naming the newest release that holds them.
-fn original_weights(repo: &Repo, card: &ModelCard, source: &ModelCatalogRelease, lane: &str) -> Result<(), Error> {
-    let original = |r: &ModelCatalogRelease| r.lanes.iter().any(|l| l.precision.as_deref().is_some_and(|p| ORIGINAL.contains(&p)));
-    if !matches!(lane, "nvfp4" | "w4a8" | "svdq-nvfp4") || original(source) {
+/// The checkpoint a quantize reads: spelled for the run, the components every variant holds, its
+/// repository, and the release it is (a public tag), if one.
+struct Source {
+    spelled: String,
+    components: Vec<String>,
+    repo: Repo,
+    release: Option<String>,
+}
+
+/// A 4-bit lane is written only from original weights (owner, 2026-10-22): from a checkpoint
+/// holding none, such as an ingested Q4_K GGUF or a 4-bit checkpoint, it would stack two rounds of
+/// 4-bit error. Refused, naming the newest release that holds them.
+async fn original_weights(ctx: &Context, hub: &Hub, source: &str, repo: &Repo, held: &[Variant], lane: &str) -> Result<(), Error> {
+    if !matches!(lane, "nvfp4" | "w4a8" | "svdq-nvfp4") || held.iter().any(|v| ORIGINAL.contains(&v.precision.as_str())) {
         return Ok(());
     }
-    let held: Vec<String> = source.lanes.iter()
-        .map(|l| format!("{} ({})", l.lane, l.precision.as_deref().filter(|p| !p.is_empty()).unwrap_or("encoded"))).collect();
+    let each: Vec<String> = (held.iter())
+        .map(|v| format!("{} ({})", v.path, if v.precision.is_empty() { "encoded" } else { &v.precision })).collect();
     let error = Error::new(Kind::Usage, "model_quantize_source_quantized", format!(
-        "{repo}@{} holds no original weights ({}): a {lane} lane from them stacks two rounds of 4-bit error",
-        source.release, held.join(", ")));
-    let releases = card.releases.iter().filter(|r| r.yanked != Some(true) && original(r));
+        "{source} holds no original weights ({}): a {lane} lane from them stacks two rounds of 4-bit error", each.join(", ")));
+    let card = hub_answer(ctx.hub_client(hub)?.get_model(&repo.org, &repo.name).await).ok();
+    let original = |r: &&ModelCatalogRelease| r.yanked != Some(true)
+        && r.lanes.iter().any(|l| l.precision.as_deref().is_some_and(|p| ORIGINAL.contains(&p)));
+    let releases = card.iter().flat_map(|c| c.releases.iter().filter(original));
     Err(match tensorfs::format::newest_by(releases, |r| r.release.as_str()) {
         Some(release) => error.next(format!("cozy model quantize {repo}@{} --{lane}", release.release)),
         None => error.remedy(format!("upload the original weights (cozy model upload <path> {repo}) and quantize those")),
     })
 }
 
-/// The checkpoint to quantize spelled for the run, the components it carries and its repository.
-/// A Hub model is its release (the newest available when none is named): the quantizer's slot
-/// selects its variant by the one rule, as any run's does; the components are every variant's.
-async fn checkpoint(ctx: &Context, hub: &Hub, model: &ModelRef, lane: &str) -> Result<(String, Vec<String>, Repo), Error> {
-    let client = ctx.hub_client(hub)?;
-    match model {
-        ModelRef::Checkpoint { repo, manifest } => {
-            let resolved = hub_answer(client.resolve_model(None, &format!("{repo}@{manifest}")).await)?;
-            Ok((model.to_string(), resolved.components.unwrap_or_default(), repo.clone()))
-        }
-        ModelRef::Hub { repo, release } => {
-            let card = hub_answer(client.get_model(&repo.org, &repo.name).await)?;
-            let found = match release {
-                Some(want) => card.releases.iter().find(|r| &r.release == want),
-                None => {
-                    let live = card.releases.iter().filter(|r| r.yanked != Some(true) && r.yanked_at.as_deref().is_none_or(str::is_empty));
-                    tensorfs::format::newest_by(live, |r| r.release.as_str())
-                }
-            };
-            let found = found.ok_or_else(|| {
-                Error::new(Kind::NotFound, "model_release_not_found", format!("{repo} has no release {}", release.as_deref().unwrap_or("available")))
-                    .next(format!("cozy model info {repo}"))
-            })?;
-            original_weights(repo, &card, found, lane)?;
-            let mut each = found.lanes.iter().map(|l| l.components.clone().unwrap_or_default());
-            let first = each.next().ok_or_else(|| {
-                Error::new(Kind::NotFound, "model_lane_not_found", format!("{repo}@{} has no variant", found.release))
-            })?;
-            let components = each.fold(first, |held, next| held.into_iter().filter(|c| next.contains(c)).collect());
-            Ok((format!("{repo}@{}", found.release), components, repo.clone()))
-        }
-        ModelRef::Local(_) | ModelRef::Provider(_) => Err(not_on_hub(model)),
+/// A variant as its header says: its path, precision lane (`bf16`, `int8`, …) and components.
+struct Variant {
+    path: String,
+    precision: String,
+    components: Vec<String>,
+}
+
+/// Each variant of `commit`, by its header.
+async fn variants(endpoint: &Endpoint, commit: &ObjectRef) -> tensorfs::Result<Vec<Variant>> {
+    let tree = Tree::from_json(&endpoint.document(commit).await?)?;
+    let mut held = vec![];
+    for (path, header) in tree.variants() {
+        let header = Header::from_cbor(&endpoint.document(header).await?)?;
+        let components = header.components().iter().map(|c| c.name.clone()).collect();
+        held.push(Variant { path: path.to_owned(), precision: Profile::of(&header).family, components });
     }
+    Ok(held)
+}
+
+/// The checkpoint to quantize, by TensorFS's one rule, the one a run's `model.<slot>=org/name@x`
+/// takes on its machine: `@x` a release or any tag its owner reads (`main` after an upload), none
+/// the repo's default, `#sha256:…` a commit or a variant header. Its variants' headers say what
+/// it holds.
+async fn checkpoint(ctx: &Context, hub: &Hub, model: &ModelRef, lane: &str) -> Result<Source, Error> {
+    let (repo, revision) = match model {
+        ModelRef::Hub { repo, release } => (repo, release.as_deref()),
+        ModelRef::Checkpoint { repo, manifest } => (repo, Some(manifest.as_str())),
+        ModelRef::Local(_) | ModelRef::Provider(_) => return Err(not_on_hub(model)),
+    };
+    let (name, endpoint) = (repo.to_string(), releases::endpoint(ctx, hub).await?);
+    let absent = |what: String| Error::new(Kind::NotFound, "model_revision_not_found", what).next(format!("cozy model info {repo}"));
+    let doc = (endpoint.repo(&name).await.map_err(releases::failed)?).map(|(doc, _)| doc)
+        .ok_or_else(|| absent(format!("{repo} has no commits")))?;
+    let (commit, tag) = match revision {
+        None => doc.default_tag().map(|t| (t.commit.clone(), Some(t)))
+            .ok_or_else(|| absent(format!("{repo} has no release and no main")))?,
+        Some(revision) => match endpoint.commit(&name, revision).await {
+            Ok((commit, through)) => (commit, through.and_then(|t| doc.tag(&t))),
+            Err(f) if f.kind == tensorfs::Kind::NotFound => return Err(absent(format!("{repo} has no release or tag {revision}"))),
+            Err(f) => return Err(releases::failed(f)),
+        },
+    };
+    let held = variants(&endpoint, &commit).await.map_err(releases::failed)?;
+    let spelled = match (model, tag) {
+        (ModelRef::Hub { .. }, Some(tag)) => format!("{repo}@{}", tag.name),
+        _ => model.to_string(),
+    };
+    original_weights(ctx, hub, &spelled, repo, &held, lane).await?;
+    let mut each = held.into_iter().map(|v| v.components);
+    let first = each.next().ok_or_else(|| {
+        Error::new(Kind::NotFound, "model_lane_not_found", format!("{spelled} has no variant"))
+    })?;
+    let components = each.fold(first, |held, next| held.into_iter().filter(|c| next.contains(c)).collect());
+    let release = tag.filter(|t| t.public && matches!(model, ModelRef::Hub { .. })).map(|t| t.name.clone());
+    Ok(Source { spelled, components, repo: repo.clone(), release })
 }
 
 fn not_on_hub(model: &ModelRef) -> Error {
@@ -158,21 +193,21 @@ pub(crate) async fn quantize(ctx: &Context, args: Quantize) -> Result<ExitCode, 
     let hub = ctx.hub()?;
     let card = crate::run::resolve(ctx, &hub, &package, release.as_deref()).await?.card;
     let lane = lane(&args, &card.interface, &package)?;
-    let (source, components, repo) = checkpoint(ctx, &hub, &model, &lane).await?;
-    let found = recipes(&card.interface, &lane, args.recipe.as_deref(), &components);
+    let source = checkpoint(ctx, &hub, &model, &lane).await?;
+    let found = recipes(&card.interface, &lane, args.recipe.as_deref(), &source.components);
     if found.is_empty() {
         let what = args.recipe.as_deref().unwrap_or(&lane);
         return Err(Error::new(Kind::NotFound, "model_quantizer_not_found", format!(
-            "{package}@{} has no {what} recipe for this model ({})", card.release, components.join(", ")))
+            "{package}@{} has no {what} recipe for this model ({})", card.release, source.components.join(", ")))
             .remedy(declared(&card.interface)));
     }
     // The variant goes onto the tag's tree (main unless named): publishing the tag releases all.
-    let destination = destination.unwrap_or_else(|| format!("{repo}@main"));
-    let mut terms = vec![source.clone(), destination.clone(), format!("lane={lane}"),
+    let destination = destination.unwrap_or_else(|| format!("{}@main", source.repo));
+    let mut terms = vec![source.spelled.clone(), destination.clone(), format!("lane={lane}"),
         format!("package={package}"), format!("release={}", card.release)];
     terms.extend(args.recipe.iter().map(|name| format!("recipe={name}")));
     // A calibration reads the original weights, never an encoded lane: the run takes 16 bits.
-    let calibrated = calibration(&card.interface, &found, &source);
+    let calibrated = calibration(&card.interface, &found, &source.spelled);
     let bits = (!calibrated.is_empty()).then_some("16");
     terms.extend(calibrated);
     let run = crate::run::call(ctx, &package, Some(&card.release), RECIPES, terms, bits, &args.placement, args.detach).await?;
@@ -188,8 +223,7 @@ pub(crate) async fn quantize(ctx: &Context, args: Quantize) -> Result<ExitCode, 
                 // The release it was made from moves to the commit the machine wrote, which
                 // holds its variant too: exactly that one, wherever its tag moves next.
                 let into = destination.split_once('@').map_or(destination.as_str(), |(into, _)| into);
-                let pinned = source.split_once('@').map(|(_, rest)| rest.split('/').next().unwrap_or(rest));
-                let release = pinned.filter(|_| into == repo.to_string()).unwrap_or("<version>");
+                let release = source.release.as_deref().filter(|_| into == source.repo.to_string()).unwrap_or("<version>");
                 output::next(ctx, &[&format!("cozy model publish {model} --release {release} --commit {tree}")]);
             }
             Some(WrittenCheckpoint::Header(header)) => Record::new().field("checkpoint header", header).print(ctx),
