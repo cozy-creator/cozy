@@ -316,6 +316,7 @@ impl Agent {
     /// this process in retention).
     pub fn landed(&self, ticket: Ticket) -> Result<()> {
         self.table.set_landed(ticket.slot)?;
+        self.table.progressed();
         self.end.send(&ToManager::Answered, None)
     }
 

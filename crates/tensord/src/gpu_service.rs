@@ -3231,25 +3231,36 @@ fn unsettled(reply: &Frame, lost: &str) -> Refused {
     Refused { code, detail }
 }
 
-/// Whether `gpus` moved device memory since the last reading; None without GPUs or while NVML
-/// cannot tell.
-/// The device memory traffic of `leader`'s group (its followers share its process group) on its
-/// GPUs: its own, never another process's on the card, which would let an idle executor's work
-/// keep a stuck call looking busy. Where the driver's per-process samples cannot name it (a
-/// container's pids), the card's traffic.
+/// The GPU work of `leader`'s group (its followers share its process group) on its GPUs: its
+/// own, never another process's on the card, which would let an idle executor's work keep a stuck
+/// call looking busy. Two readings: its device-memory traffic (NVML's per-process samples; where
+/// they cannot name it, a container's pids, the card's), and its GPU work seen complete in its
+/// lease tables (varena's fills landing: a forward paging its weights in from the page cache moves
+/// no disk byte and no memory-utilization sample).
 fn gpu_work(gpus: &[Device], leader: Birth) -> Option<crate::process::Activity> {
     let opened = gpus.iter().map(|gpu| platform::gpu::Device::open(&gpu.entry).ok());
-    let devices: Vec<_> = opened.collect::<Option<_>>().filter(|devices: &Vec<_>| !devices.is_empty())?;
-    let seen = Mutex::new(vec![(0, 0); devices.len()]);
+    let devices: Vec<_> = opened.collect::<Option<Vec<_>>>().unwrap_or_default();
+    let managers: Vec<_> = gpus.iter().filter_map(|gpu| gpu.memory.clone()).collect();
+    if devices.is_empty() && managers.is_empty() {
+        return None;
+    }
+    let seen = Mutex::new((vec![(0, 0); devices.len()], BTreeMap::<u32, u64>::new()));
     Some(Arc::new(move || {
         let pids: Vec<u32> = std::iter::once(leader.pid).chain(platform::process::group_members(&leader).into_iter().map(|m| m.pid)).collect();
+        let mut seen = seen.lock().unwrap();
         let mut moved = false;
-        for (device, (own, card)) in devices.iter().zip(seen.lock().unwrap().iter_mut()) {
+        for (device, (own, card)) in devices.iter().zip(seen.0.iter_mut()) {
             moved |= match device.moved_by_since(&pids, own).ok()? {
                 Some(moved) => moved,
                 None => device.moved_since(card).ok()?,
             };
         }
+        let mut progress = BTreeMap::new();
+        for e in managers.iter().flat_map(|gpu| gpu.manager.holdings().executors).filter(|e| pids.contains(&e.pid)) {
+            *progress.entry(e.pid).or_insert(0) += e.progress;
+        }
+        moved |= progress.iter().any(|(pid, now)| seen.1.get(pid).is_none_or(|was| now > was));
+        seen.1 = progress;
         Some(moved)
     }))
 }

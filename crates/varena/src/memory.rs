@@ -1188,9 +1188,11 @@ impl Inner {
         Ok(())
     }
 
-    fn poll_releases(&self, st: &mut State) -> bool {
+    /// Its pins' releases and their completed events: (a page must wake its waiters, some of its
+    /// GPU work completed).
+    fn poll_releases(&self, st: &mut State) -> (bool, bool) {
         let released: Vec<Release> = self.releases.try_iter().collect();
-        let mut wake = false;
+        let (mut wake, mut done) = (false, false);
         for r in released {
             st.pins.remove(&r.pin);
             if r.event != Event::DONE {
@@ -1222,10 +1224,11 @@ impl Inner {
                     q.pop_front();
                 }
                 self.completed(st, event, key);
+                done = true;
             }
         }
         st.events.retain(|_, q| !q.is_empty());
-        wake
+        (wake, done)
     }
 
     /// `key`'s pending `event` completed: it leaves the page's releases (retired unless it is
@@ -1291,10 +1294,10 @@ impl Inner {
     }
 
     fn drain(&self, st: &mut State) {
-        let wake = self.poll_releases(st);
+        let (wake, done) = self.poll_releases(st);
         #[cfg(unix)]
         if let Some(agent) = self.lease.get() {
-            if wake {
+            if wake || done {
                 agent.progressed();
             }
             // Events still pending: its GPU work is running, never a stall.

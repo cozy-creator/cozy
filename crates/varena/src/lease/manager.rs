@@ -138,6 +138,9 @@ pub struct ExecutorHolding {
     pub bytes: u64,
     /// Of `bytes`, what its fills acked landed: what its exit would keep in the page cache.
     pub landed: u64,
+    /// Its GPU work seen complete (its table's counter: fills landing, copies, kernels): a call
+    /// paging its weights in moves it though no disk byte nor device-memory sample shows.
+    pub progress: u64,
 }
 
 /// PSI `some` (§12): the share of wall time in which at least one allocation waited.
@@ -509,6 +512,7 @@ impl Manager {
                 chunks: e.leased.len(),
                 bytes: e.leased.values().map(|l| l.phys.len).sum(),
                 landed: e.leased.values().filter(|l| l.landed && l.region.is_some()).map(|l| l.phys.len).sum(),
+                progress: e.table.progress(),
             })
             .collect();
         let (now, spans) = (self.now(), b.waits.iter().copied().collect::<Vec<_>>());
