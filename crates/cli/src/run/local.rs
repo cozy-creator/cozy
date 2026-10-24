@@ -33,12 +33,51 @@ struct Installed {
     machine: Option<String>,
 }
 
-pub(super) async fn run(
-    ctx: &Context,
-    path: &Path,
-    function: Option<String>,
-    args: RunArgs,
-) -> Result<ExitCode, Error> {
+/// Local code made callable: installed on its machine, or its interface kept from an earlier
+/// install of this exact source.
+pub(crate) struct Prepared {
+    local: Local,
+    installed: Installed,
+    on: On,
+}
+
+impl Prepared {
+    /// `local/<name>`.
+    pub(crate) fn package(&self) -> &str {
+        &self.local.package
+    }
+
+    pub(crate) fn interface(&self) -> &Interface {
+        &self.installed.interface
+    }
+
+    /// The source manifest's digest: this exact code.
+    pub(crate) fn source(&self) -> &str {
+        &self.local.source.manifest
+    }
+
+    /// Calls `function`. The call goes where the code was installed, with its files once more:
+    /// a machine that dropped them meanwhile is sent only what it lacks, and installs them in
+    /// the call.
+    pub(super) async fn call(&self, ctx: &Context, function: &str, args: RunArgs) -> Result<Run, Error> {
+        let code = super::Code {
+            package: &self.local.package,
+            interface: &self.installed.interface,
+            release: None,
+            source: spec::Source::Local {
+                source: &self.local.source,
+                installation: self.installed.installation.as_deref(),
+            },
+            files: &self.local.inputs,
+        };
+        let on = self.installed.machine.clone().map_or_else(|| self.on.clone(), On::Machine);
+        super::call_code(ctx, code, function, on, args).await
+    }
+}
+
+/// The code at `path` made callable `on` its machine. A warm set names the machine's
+/// installation, which only an install answers.
+pub(crate) async fn prepare(ctx: &Context, path: &Path, on: On, warm: bool) -> Result<Prepared, Error> {
     if !path.exists() {
         return Err(Error::new(
             Kind::NotFound,
@@ -47,10 +86,8 @@ pub(super) async fn run(
         ));
     }
     let hub = ctx.hub()?;
-    let on = args.placement.on();
     let local = crate::package::local::source(ctx, path, &on).await?;
-    // A warm set names the machine's installation, which only an install answers.
-    let installed = match kept(&ctx.home, &local).filter(|_| args.warm.is_none()) {
+    let installed = match kept(&ctx.home, &local).filter(|_| !warm) {
         Some(interface) => Installed {
             interface,
             installation: None,
@@ -58,39 +95,37 @@ pub(super) async fn run(
         },
         None => install(ctx, &hub.origin, on.clone(), &local).await?,
     };
+    Ok(Prepared { local, installed, on })
+}
+
+pub(super) async fn run(
+    ctx: &Context,
+    path: &Path,
+    function: Option<String>,
+    args: RunArgs,
+) -> Result<ExitCode, Error> {
+    let prepared = prepare(ctx, path, args.placement.on(), args.warm.is_some()).await?;
+    let (package, interface) = (prepared.package(), prepared.interface());
     let script = path.extension().is_some_and(|e| e == "py");
     // A script's one callable runs bare, a recipe too: local code is its author's to run.
-    let callables: Vec<&str> = (installed.interface.callables.iter()).filter(|c| !c.internal).map(|c| c.name.as_str()).collect();
+    let callables: Vec<&str> = (interface.callables.iter()).filter(|c| !c.internal).map(|c| c.name.as_str()).collect();
     let function = match (function, callables.as_slice()) {
         (Some(function), _) => function,
         (None, [only]) if script => (*only).to_owned(),
         (None, _) => {
-            super::unnamed(&local.package, None, &installed.interface, &args)?;
-            super::functions_of(ctx, &local.package, ("local", ""), None, &installed.interface);
+            super::unnamed(package, None, interface, &args)?;
+            super::functions_of(ctx, package, ("local", ""), None, interface);
             return Ok(ExitCode::SUCCESS);
         }
     };
     if args.describe {
-        let callable = super::callable(&local.package, &installed.interface, &function)?;
-        let target = format!("{}/{}", local.package, callable.name);
-        let contract = describe::contract(&target, &installed.interface, callable);
+        let callable = super::callable(package, interface, &function)?;
+        let target = format!("{package}/{}", callable.name);
+        let contract = describe::contract(&target, interface, callable);
         anstream::print!("{contract}");
         return Ok(ExitCode::SUCCESS);
     }
-    let code = super::Code {
-        package: &local.package,
-        interface: &installed.interface,
-        release: None,
-        source: spec::Source::Local {
-            source: &local.source,
-            installation: installed.installation.as_deref(),
-        },
-        files: &local.inputs,
-    };
-    // The call goes where the code was installed, with its files once more: a machine that
-    // dropped them meanwhile is sent only what it lacks, and installs them in the call.
-    let on = installed.machine.map_or(on, On::Machine);
-    let run = super::call_code(ctx, code, &function, on, args).await?;
+    let run = prepared.call(ctx, &function, args).await?;
     Ok(super::exit_code(&run))
 }
 

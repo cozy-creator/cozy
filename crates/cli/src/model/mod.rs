@@ -151,8 +151,8 @@ pub(crate) struct Quantize {
     /// Run the package's recipe of this name: any lane's (`drafter_head` writes a drafter).
     #[arg(long, value_name = "NAME")]
     recipe: Option<String>,
-    /// The package (org/name[@release]) whose recipe writes the lane. Required: packages that
-    /// serve the same model can each declare one.
+    /// The package whose recipe writes the lane: org/name[@release], or ./dir for one not yet
+    /// published. Required: packages that serve the same model can each declare one.
     #[arg(long)]
     package: Option<String>,
     #[command(flatten)]

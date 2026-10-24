@@ -24,11 +24,17 @@ pub enum Target {
     Script(PathBuf),
 }
 
+/// Whether `raw` spells a path on this computer (`./dir`), never a package name.
+pub(crate) fn local_path(raw: &str) -> bool {
+    let raw = raw.trim();
+    ["./", "../", "/", "~/"].iter().any(|p| raw.starts_with(p)) || raw == "."
+}
+
 impl Target {
     /// Reads a target. `cwd` decides whether a spelling names a local file or directory.
     pub fn parse(raw: &str, cwd: &Path) -> Result<Self, Error> {
         let raw = raw.trim();
-        let explicit = ["./", "../", "/", "~/"].iter().any(|p| raw.starts_with(p)) || raw == ".";
+        let explicit = local_path(raw);
         if raw.ends_with(".py") && (explicit || cwd.join(raw).is_file()) {
             return Ok(Target::Script(PathBuf::from(raw)));
         }
