@@ -1,13 +1,16 @@
 name: e2e
 # CI v2 (tracker/design/ci-v2.md): cozy as a person runs it, on GitHub's runners, for the suites the change
-# selects (ci/affected, ci/suites.toml). `cli`: install, up, the local machine, real BiRefNet on the CPU, a
-# second executor, down, uninstall (Linux; macOS and Windows when selected). `mps`: real inference on the
-# macOS runner's Apple GPU. The GPU suites run in the release gate, not here. `e2e` always reports.
+# selects (ci/affected, ci/suites.toml). `cli`: install, up, the local machine, a weightless request and real
+# BiRefNet on the CPU, a second executor, down, uninstall (Linux; macOS and Windows when selected). `imports`:
+# every published first-party package release installs and imports on the candidate set. `mps`: real
+# inference on the macOS runner's Apple GPU. The GPU suites run in the release gate, not here. `e2e` always
+# reports.
 #   Here: this repo's pull requests. Other repos and the release gate call it:
 #     uses: cozy-creator/cozy-creator/.github/workflows/e2e.yaml@master
 #     with: {repo: cozy-runtime, ref: <head sha>, base: <base sha>}     # or select: "<tokens>" instead of base
-# Candidates are built from the change and go on through `cozy machine update local`; the rest is the
-# release a person would get from https://tensorhub.com/install.sh.
+# The candidate set (TensorD, TensorFS, the Runtime) is built from the change and the other repos' master
+# (stack_ref, runtime_ref) and goes on through `cozy machine update local`; the rest is the release a person
+# would get from https://tensorhub.com/install.sh.
 on:
   pull_request:
   workflow_call:
@@ -32,6 +35,30 @@ on:
         description: The cozy-creator commit whose ci/ and e2e/ run
         type: string
         default: master
+      stack_ref:
+        description: The cozy-creator commit the candidate TensorD and TensorFS come from (the change's own, if cozy-creator's)
+        type: string
+        default: master
+      runtime_ref:
+        description: The cozy-runtime commit the candidate Runtime comes from (the change's own, if cozy-runtime's)
+        type: string
+        default: master
+      tensord:
+        description: A cozy release to take as TensorD instead of building it (Linux)
+        type: string
+        default: ''
+      tensorfs:
+        description: A TensorFS release (PyPI) to take instead of building it (Linux)
+        type: string
+        default: ''
+      runtime:
+        description: A cozy-runtime release (PyPI) to take instead of building it (Linux)
+        type: string
+        default: ''
+      pins:
+        description: Package releases the imports suite takes instead of the latest unyanked (name@release,...)
+        type: string
+        default: ''
   workflow_dispatch:
     inputs:
       repo:
@@ -49,9 +76,32 @@ on:
       creator_ref:
         type: string
         default: master
+      stack_ref:
+        type: string
+        default: master
+      runtime_ref:
+        type: string
+        default: master
+      tensord:
+        type: string
+        default: ''
+      tensorfs:
+        type: string
+        default: ''
+      runtime:
+        type: string
+        default: ''
+      pins:
+        type: string
+        default: ''
 
 permissions:
   contents: read
+
+# A new push to a pull request cancels its superseded run; dispatches and release calls each run.
+concurrency:
+  group: e2e-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   affected:
@@ -128,12 +178,60 @@ jobs:
           repo: ${{ needs.affected.outputs.repo }}
           ref: ${{ needs.affected.outputs.ref }}
           build: ${{ env.BUILD }}
+          stack_ref: ${{ inputs.stack_ref || 'master' }}
+          runtime_ref: ${{ inputs.runtime_ref || 'master' }}
+          tensord: ${{ inputs.tensord }}
+          tensorfs: ${{ inputs.tensorfs }}
+          runtime: ${{ inputs.runtime }}
       - name: cli suite
-        run: bash .creator/e2e/cli/run.sh --out "$RUNNER_TEMP/e2e" $CANDIDATES
+        env:
+          PINS: ${{ inputs.pins }}
+        # BiRefNet: a pin, the change's packages, or packages master (the set's own).
+        run: bash .creator/e2e/cli/run.sh --out "$RUNNER_TEMP/e2e" $CANDIDATES ${PINS:+--pins "$PINS"} $(case " $CANDIDATES " in *" --packages "*) ;; *) echo ${PACKAGES_MASTER:+--packages "$PACKAGES_MASTER"} ;; esac)
       - if: always()
         uses: actions/upload-artifact@v4
         with:
           name: e2e-cli-${{ matrix.os }}
+          path: ${{ runner.temp }}/e2e
+          retention-days: 14
+
+  imports:
+    needs: affected
+    if: contains(fromJSON(needs.affected.outputs.selection).suites, 'imports')
+    runs-on: ubuntu-24.04
+    # Hang bound, not a work budget.
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    env:
+      BUILD: ${{ join(fromJSON(needs.affected.outputs.selection).build, ' ') }}
+    steps:
+      # Every release's environment holds torch: room for them.
+      - run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL; df -h /
+      - uses: actions/checkout@v5
+        with:
+          repository: cozy-creator/cozy-creator
+          ref: ${{ needs.affected.outputs.creator }}
+          path: .creator
+      - uses: ./.creator/e2e/candidates
+        with:
+          repo: ${{ needs.affected.outputs.repo }}
+          ref: ${{ needs.affected.outputs.ref }}
+          build: ${{ env.BUILD }}
+          stack_ref: ${{ inputs.stack_ref || 'master' }}
+          runtime_ref: ${{ inputs.runtime_ref || 'master' }}
+          tensord: ${{ inputs.tensord }}
+          tensorfs: ${{ inputs.tensorfs }}
+          runtime: ${{ inputs.runtime }}
+      - name: imports suite
+        env:
+          PINS: ${{ inputs.pins }}
+        run: bash .creator/e2e/imports/run.sh --out "$RUNNER_TEMP/e2e" $CANDIDATES ${PINS:+--pins "$PINS"}
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-imports
           path: ${{ runner.temp }}/e2e
           retention-days: 14
 
@@ -158,6 +256,11 @@ jobs:
           repo: ${{ needs.affected.outputs.repo }}
           ref: ${{ needs.affected.outputs.ref }}
           build: ${{ env.BUILD }}
+          stack_ref: ${{ inputs.stack_ref || 'master' }}
+          runtime_ref: ${{ inputs.runtime_ref || 'master' }}
+          tensord: ${{ inputs.tensord }}
+          tensorfs: ${{ inputs.tensorfs }}
+          runtime: ${{ inputs.runtime }}
       - name: mps suite
         run: bash .creator/e2e/mps/run.sh --out "$RUNNER_TEMP/e2e" $CANDIDATES
       - if: always()
@@ -169,7 +272,7 @@ jobs:
 
   e2e:
     if: always()
-    needs: [affected, cli, mps]
+    needs: [affected, cli, imports, mps]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:

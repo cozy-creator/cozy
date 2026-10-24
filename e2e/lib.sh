@@ -7,9 +7,10 @@
 #   --tensorfs-wheel FILE a candidate TensorFS wheel for the local machine
 #   --runtime-wheel FILE  a candidate cozy-runtime wheel for the local machine
 #   --packages DIR        a packages checkout: its package directories run instead of the published releases
+#   --pins N@R,...        package releases to take instead of the latest unyanked ones (gated candidates)
 
 set -euo pipefail
-OUT='' CAND_COZY='' CAND_TFS='' CAND_RT='' PACKAGES=''
+OUT='' CAND_COZY='' CAND_TFS='' CAND_RT='' PACKAGES='' PINS=''
 COZY=$HOME/.cozy/bin/cozy
 [ "${RUNNER_OS:-}" != Windows ] || COZY=$HOME/.cozy/bin/cozy.exe
 
@@ -21,6 +22,7 @@ parse() {
       --tensorfs-wheel) CAND_TFS=$2 ;;
       --runtime-wheel) CAND_RT=$2 ;;
       --packages) PACKAGES=$2 ;;
+      --pins) PINS=$2 ;;
       *) echo "unknown argument $1" >&2; exit 2 ;;
     esac
     shift 2
@@ -62,33 +64,95 @@ user_services() {
   export DBUS_SESSION_BUS_ADDRESS=unix:path=$XDG_RUNTIME_DIR/bus
 }
 
-# Candidates go on through `cozy machine update local`, the path a person takes for a dev build.
+# Candidates go on through `cozy machine update local`, the path a person takes for a dev build, in the
+# spelling of the installed cozy (0.11.16 renamed --runtime-wheel/--tensorfs-wheel to --runtime/--tensorfs).
 candidates() {
-  local args=()
+  local args=() rt=--runtime tfs=--tensorfs
+  if cozy machine update --help | grep -- --runtime-wheel > /dev/null; then rt=--runtime-wheel tfs=--tensorfs-wheel; fi
   [ -z "$CAND_COZY" ] || args+=(--tensord "$CAND_COZY")
-  [ -z "$CAND_TFS" ] || args+=(--tensorfs-wheel "$CAND_TFS")
-  [ -z "$CAND_RT" ] || args+=(--runtime-wheel "$CAND_RT")
+  [ -z "$CAND_TFS" ] || args+=("$tfs" "$CAND_TFS")
+  [ -z "$CAND_RT" ] || args+=("$rt" "$CAND_RT")
   [ ${#args[@]} -gt 0 ] || return 0
   cozy --json machine update local "${args[@]}" -y | tee "$OUT/update.json" || fail "cozy machine update local refused the candidates"
   if [ -n "$CAND_COZY" ]; then
     want=$("$CAND_COZY" --version)
     [ "$(cozy --version)" = "$want" ] || fail "cozy is $(cozy --version), not the candidate $want"
+    # The installer's Calcifer keeps running until restarted (`cozy update` does that for a person): the
+    # candidate's Calcifer is the one that starts this computer's machine from here on.
+    cozy --json down > "$OUT/down-candidate.json" || check "cozy down failed"
+    cozy --json up > "$OUT/up-candidate.json" || fail "the candidate's cozy up failed"
+    grep -q "\"version\": *\"${want#cozy }\"" "$OUT/up-candidate.json" || check "Calcifer is not the candidate ${want#cozy }"
   fi
   machine_ready
 }
 
+# Whether this computer's cozy has `cozy machine <verb>`.
+has_verb() { cozy machine --help | grep -E "^ +$1 " > /dev/null; }
+
 # The local machine ends, as its idle exit ends it: the holder of its root's lock. The next use starts it.
+# A cozy before cl-646 disables it instead (machine_ready enables it again).
 machine_stop() {
-  local pid
-  pid=$(grep -o '"pid": *[0-9]*' "$HOME/.cozy/machine/var/lib/cozy/machine/agent.lock.holder" | grep -o '[0-9]*$') || return 1
+  if has_verb disable; then cozy --json machine disable > "$OUT/disable.json"; return; fi
+  local holder pid
+  holder=$(find "$HOME/.cozy/machine" -name agent.lock.holder 2> /dev/null | head -1)
+  find "$HOME/.cozy/machine" -name 'agent.lock*' > "$OUT/locks.txt" 2>&1 || true
+  [ -n "$holder" ] || return 1
+  cp "$holder" "$OUT/agent.lock.holder"
+  pid=$(grep -o '"pid": *[0-9]*' "$holder" | grep -o '[0-9]*$') || return 1
   if [ "$RUNNER_OS" = Windows ]; then taskkill //F //T //PID "$pid"; else kill "$pid"; fi
-  for _ in $(seq 60); do kill -0 "$pid" 2>/dev/null || return 0; sleep 1; done
+  # Gone, or a zombie its parent has not reaped yet (kill -0 still finds one).
+  for _ in $(seq 60); do
+    if [ "$RUNNER_OS" = Windows ]; then kill -0 "$pid" 2> /dev/null || return 0
+    else case $(ps -o stat= -p "$pid" 2> /dev/null || true) in '' | Z*) return 0 ;; esac; fi
+    sleep 1
+  done
+  ps -o pid,stat,args -p "$pid" > "$OUT/stop.txt" 2>&1 || true
   return 1
 }
 
+# The process holding the local machine's root (on Windows its service, whose parent is TensorD's own).
+machine_pid() { grep -o '"pid": *[0-9]*' "$HOME/.cozy/machine/var/lib/cozy/machine/agent.lock.holder" | grep -o '[0-9]*$'; }
+parent_of() {
+  if [ "$RUNNER_OS" = Windows ]; then
+    powershell -NoProfile -c "(Get-CimInstance Win32_Process -Filter 'ProcessId=$1').ParentProcessId" | tr -d '\r '
+  else
+    ps -o ppid= -p "$1" | tr -d ' '
+  fi
+}
+# Whether process $1 is gone, a zombie not: one answers kill -0 until its parent reaps it.
+gone() {
+  if [ "$RUNNER_OS" = Windows ]; then ! tasklist //FI "PID eq $1" | grep -q " $1 "; else ! kill -0 "$1" 2>/dev/null; fi
+}
+
+# cl-646: the local machine Calcifer started, ended, is reaped by Calcifer (gone, no zombie), and the next
+# `machine show local` starts another. One the installer's `cozy-machine` service still runs is ended
+# first, until the machine is the one Calcifer started.
+machine_reaped() {
+  local calcifer pid top='' i
+  calcifer=$(cozy --json status | grep -o '"pid": *[0-9]*' | head -1 | grep -o '[0-9]*$')
+  for i in 1 2 3; do
+    machine_ready
+    pid=$(machine_pid) || { check "no process holds the local machine's root"; return; }
+    top=$pid
+    [ "$RUNNER_OS" != Windows ] || top=$(parent_of "$pid")
+    [ "$(parent_of "$top")" = "$calcifer" ] && break
+    echo "the local machine (pid $top) is $(parent_of "$top")'s, not Calcifer's ($calcifer): ending it"
+    machine_stop || true
+  done
+  [ "$(parent_of "$top")" = "$calcifer" ] || { check "Calcifer (pid $calcifer) never started the local machine"; return; }
+  if [ "$RUNNER_OS" = Windows ]; then taskkill //F //T //PID "$top"; else kill "$top"; fi
+  for i in $(seq 30); do gone "$top" && break; sleep 1; done
+  gone "$top" || check "Calcifer left the local machine it started (pid $top) behind: state $(ps -o stat= -p "$top" 2>/dev/null)"
+  machine_ready
+  [ "$(machine_pid)" != "$pid" ] || check "the next machine show local did not start another machine"
+  echo "the local machine Calcifer started (pid $top) was reaped; the next one is pid $(machine_pid)"
+}
+
 # The local machine is up and reports itself (`machine show local` starts it); its record lands in
-# $OUT/machine.json.
+# $OUT/machine.json. A cozy before cl-646 (#1883; the installer's release until one carries it) makes its
+# machine with `cozy machine enable`; a later one starts it on first use.
 machine_ready() {
+  if has_verb enable; then cozy --json machine enable > "$OUT/enable.json" || check "cozy machine enable failed"; fi
   for _ in $(seq 120); do
     cozy --json machine show local > "$OUT/machine.json" 2>/dev/null && grep -q '"state": *"ready"' "$OUT/machine.json" && return 0
     sleep 5
@@ -149,7 +213,13 @@ picture() {
   echo "$file"
 }
 
-# The BiRefNet target: the published release, or the packages checkout's directory.
-birefnet() { if [ -n "$PACKAGES" ]; then echo "./$PACKAGES/birefnet/remove_background"; else echo birefnet/remove_background; fi; }
+# The BiRefNet target: a pinned release, the packages checkout's directory, or the published release.
+birefnet() {
+  local pin
+  pin=$(tr ',' '\n' <<< "$PINS" | sed -n 's/^birefnet@//p' | head -1)
+  if [ -n "$pin" ]; then echo "birefnet/remove_background@$pin"
+  elif [ -n "$PACKAGES" ]; then echo "./$PACKAGES/birefnet/remove_background"
+  else echo birefnet/remove_background; fi
+}
 
 echo "::group::start"

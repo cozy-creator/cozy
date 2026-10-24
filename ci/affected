@@ -8,7 +8,7 @@ repo: cozy-creator | cozy-runtime | packages | tensorhub. Run it inside a checko
 both revisions (fetch-depth 0). The change is `git diff <base>...<head>`: a PR passes its base and head,
 the release gate the last release tag and the candidate. Rules: ci/suites.toml, beside this file.
 
-Prints one token per line: suites (cli, mps, gpu, gpu-datacenter, varena), os:<name>, build:<artifact>,
+Prints one token per line: suites (cli, imports, mps, gpu, gpu-datacenter, varena), os:<name>, build:<artifact>,
 pkg:<name> (pkg:* = every package). Nothing printed = nothing to run. --json prints
 {"suites", "os", "build", "cells", "why"}; "os" always holds linux; "why" names a path behind each token.
 --tokens takes a selection already made (the release gate's, a dispatch's) and prints it the same way.
@@ -69,6 +69,11 @@ def crates(revs: list[str]) -> tuple[dict[str, str], dict[str, set[str]]]:
     return dirs, {n: d & names for n, d in deps.items()}
 
 
+def expand(token: str) -> list[str]:
+    """A token, with `everything` and `release` spelled out (suites.toml)."""
+    return [t for g in RULES[token] for t in expand(g)] if token in ("everything", "release") else [token]
+
+
 def dependents(name: str, deps: dict[str, set[str]]) -> set[str]:
     """`name` and every crate that depends on it, directly or not."""
     found, frontier = {name}, [name]
@@ -91,7 +96,7 @@ def select(repo: str, base: str, head: str) -> dict[str, list[str]]:
 
     def take(tokens: list[str], path: str, dir_: str = "") -> None:
         for token in tokens:
-            for t in RULES["everything"] if token == "everything" else [token]:
+            for t in expand(token):
                 why.setdefault(t.replace("{dir}", dir_), path)
 
     for path in paths:
@@ -131,7 +136,7 @@ def main() -> None:
     args = [a for a in sys.argv[1:] if a != "--json"]
     if len(args) == 2 and args[0] == "--tokens":
         given = args[1].replace(",", " ").split()
-        result = grouped({t: "given" for g in given for t in (RULES["everything"] if g == "everything" else [g])})
+        result = grouped({t: "given" for g in given for t in expand(g)})
     elif len(args) == 3 and isinstance(RULES.get(args[0]), dict):
         result = select(*args)
     else:
