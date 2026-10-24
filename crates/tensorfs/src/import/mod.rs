@@ -392,10 +392,10 @@ fn gguf_documents(
 }
 
 /// The model's files: every non-weight file of the source, byte-exact at its path, except a
-/// converted folder's `config.json` (the foreign layout's); each table's reference (its index,
-/// the produced components' configs and the asset folders) where the source has none; the
-/// tables' inline files. With each reference that filled some, and the paths, and the library
-/// versions the references record.
+/// converted folder's `config.json` (the foreign layout's, unless its table keeps it); each
+/// table's reference (its index, the produced components' configs and the asset folders) where
+/// the source has none; the tables' inline files. With each reference that filled some, and the
+/// paths, and the library versions the references record.
 type Documents = (BTreeMap<String, Vec<u8>>, Vec<(String, Vec<String>)>, Versions);
 
 fn documents(
@@ -406,9 +406,8 @@ fn documents(
     area: &Path,
 ) -> Result<Documents> {
     let tables = tables();
-    let converted: Vec<&str> = recognized
-        .claims
-        .iter()
+    let converted: Vec<&str> = (recognized.claims.iter())
+        .filter(|c| !tables[c.table].keep_config)
         .map(|c| set.groups[c.group].folder.as_str())
         .collect();
     let raw: Vec<usize> = recognized
