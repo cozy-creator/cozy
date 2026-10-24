@@ -4,8 +4,8 @@
 //!   of its own (M2). Reclaimed only while unpinned, it is swapped to a RAM file or discarded, keeping its addresses.
 //!   Its next [`Region::pin`] maps it again there: `fresh` says it was discarded, and its owner recomputes it on its
 //!   own thread. There are no shrink callbacks.
-//! - A [`GraphRegion`] is a component's graphs on one device. It pins every weight chunk its graphs read and holds a
-//!   use of its pool for its life (L2). Its [`Word`] (R2-3) is acquired before each replay and released by an event
+//! - A [`GraphRegion`] holds a use of its capture pool, never weight pages. The caller prepares those with a binding
+//!   before capture/replay. Its [`Word`] (R2-3) covers only replay and output copies, released by an event
 //!   recorded after it, one per stream. A reclaim sets Dropping and waits for those events, so it is bounded by one
 //!   replay.
 //! - [`Memory::room`] is what a cut site sizes from: free, cold and warm bytes, and the streaming floor.
@@ -20,7 +20,7 @@ use parking_lot::Mutex;
 
 use crate::arena::{Ended, Evicted, Owner, PoolId};
 use crate::backend::Event;
-use crate::memory::{Allocating, Memory, Pin, Retained, SetId};
+use crate::memory::{Allocating, Memory, SetId};
 use crate::table::SLOTS;
 use crate::{Error, Result};
 
@@ -68,7 +68,7 @@ pub enum Reclaimed {
     Gone,
     Swapped(u64),
     Discarded(u64),
-    /// A graph region: Dropping, its replays completed, its pins gone.
+    /// A graph region: Dropping, its replays completed; its owner can discard the executable.
     Dropped,
 }
 
@@ -109,8 +109,8 @@ fn now_ns() -> u64 {
     }
 }
 
-/// A reclaim deferred by a pin runs here at the last unpin: never on the unpinning thread, which
-/// may hold the GIL while the eviction waits for the region's streams.
+/// Deferred cache reclaims and graph drops run here: never on the unpinning thread or the
+/// mechanism thread, which must keep serving Map/Revoke while a replay finishes.
 fn deferred() -> Option<&'static Sender<u64>> {
     static WORKER: OnceLock<Option<Sender<u64>>> = OnceLock::new();
     WORKER
@@ -118,14 +118,14 @@ fn deferred() -> Option<&'static Sender<u64>> {
             let (tx, rx) = mpsc::channel::<u64>();
             let spawned = std::thread::Builder::new().name("varena-reclaim".into()).spawn(move || {
                 while let Ok(id) = rx.recv() {
-                    let shared = match LIVE.lock().get(&id) {
-                        Some(Live::Cache(w)) => w.upgrade(),
-                        _ => None,
+                    let found = LIVE.lock().get(&id).and_then(Live::upgrade);
+                    let result = match found {
+                        Some(Found::Cache(sh)) => sh.reclaim(None),
+                        Some(Found::Graph(g)) => g.drop_now(),
+                        None => Ok(Reclaimed::Gone),
                     };
-                    if let Some(sh) = shared {
-                        if let Err(e) = sh.reclaim(None) {
-                            tracing::warn!("varena: reclaiming region {id} ({}): {e}", sh.owner);
-                        }
+                    if let Err(e) = result {
+                        tracing::warn!("varena: reclaiming region {id}: {e}");
                     }
                 }
             });
@@ -393,21 +393,17 @@ impl Word {
 struct Held {
     /// Per stream, the event recorded after its last released replay.
     events: HashMap<usize, Event>,
-    /// A replay whose completion is unknown (no event, no synchronize): its pins are never released.
+    /// A replay whose completion is unknown: its pool use is never released.
     lost: bool,
-    pins: Vec<Pin>,
-    bindings: Vec<Retained>,
 }
 
 struct Graph {
     id: u64,
     memory: Memory,
-    sets: Vec<SetId>,
-    retained: Vec<SetId>,
     pool: PoolId,
     word: Arc<Word>,
     held: Mutex<Held>,
-    /// Released once: its pins and its pool use.
+    /// Replays drained once; the pool use ends when the owner closes the region.
     dropped: AtomicBool,
     closed: AtomicBool,
     capture_ns: AtomicU64,
@@ -432,7 +428,7 @@ impl Graph {
                 }
                 Err(e) => {
                     h.lost = true;
-                    Err(e)
+                    Err(self.memory.lost_completion(e))
                 }
             }
         };
@@ -441,7 +437,7 @@ impl Graph {
         out
     }
 
-    /// Dropping, then every stream's last replay completed, then its weight pins go. Once.
+    /// Dropping, then every stream's last replay completed. Never on the mechanism thread.
     fn drop_now(&self) -> Result<Reclaimed> {
         self.word.drop_begin();
         while self.word.replays() > 0 {
@@ -452,15 +448,13 @@ impl Graph {
             return Ok(Reclaimed::Gone);
         }
         if h.lost {
-            return Err(Error::Internal(format!("graph region {}: a replay's completion is unknown, so its pins stay", self.id)));
+            return Err(self.memory.lost_completion(format!("graph region {}: a replay's completion is unknown, so its pool stays", self.id)));
         }
         while let Some((&stream, &event)) = h.events.iter().next() {
-            self.memory.finish_event(event)?;
+            self.memory.finish_event(event).map_err(|e| self.memory.lost_completion(e))?;
             h.events.remove(&stream);
             self.memory.retire_event(event);
         }
-        h.pins.clear();
-        h.bindings.clear();
         self.dropped.store(true, Ordering::Release);
         drop(h);
         if !self.closed.load(Ordering::Acquire) {
@@ -471,17 +465,13 @@ impl Graph {
 
     fn record(&self) -> Record {
         let dropped = self.dropped.load(Ordering::Acquire);
-        let mut slots = Vec::new();
-        if !dropped {
-            let sets: Vec<SetId> = self.sets.iter().chain(&self.retained).copied().collect();
-            slots = self.memory.lease_slots(&sets);
-            slots.extend(self.memory.torch_if().map_or_else(Vec::new, |t| t.slots(Owner::Pool(self.pool))));
-        }
+        let torch = self.memory.torch_if();
+        let owner = Owner::Pool(self.pool);
         Record {
             id: self.id,
             kind: Reclaimable::Graph,
-            bytes: if dropped { 0 } else { self.held.lock().pins.iter().map(|p| p.len).sum() },
-            slots,
+            bytes: if dropped { 0 } else { torch.as_ref().map_or(0, |t| t.mapped_by(owner)) },
+            slots: if dropped { Vec::new() } else { torch.as_ref().map_or_else(Vec::new, |t| t.slots(owner)) },
             cost_ns: self.capture_ns.load(Ordering::Acquire),
             last_use: self.last_use.load(Ordering::Acquire),
             next_use: None,
@@ -499,6 +489,7 @@ impl Graph {
         LIVE.lock().remove(&self.id);
         if let Err(e) = self.drop_now() {
             tracing::warn!("varena: dropping graph region {}: {e}", self.id);
+            return; // Unknown completion: keep the pool retained, never reuse it.
         }
         self.memory.region_facts(self.id, None);
         self.memory.pool_release(self.pool);
@@ -518,14 +509,6 @@ impl GraphRegion {
     /// The capture pool token every graph of the region captures into.
     pub fn pool(&self) -> PoolId {
         self.g.pool
-    }
-
-    pub fn sets(&self) -> &[SetId] {
-        &self.g.sets
-    }
-
-    pub fn retained(&self) -> &[SetId] {
-        &self.g.retained
     }
 
     /// Maps `expected` bytes into the pool before capture begins, making room now. A shape's first capture has none.
@@ -558,7 +541,7 @@ impl GraphRegion {
         self.g.word.dropping()
     }
 
-    /// Drops the graph's pins and its use of the pool.
+    /// Drains replay completion and releases its use of the pool.
     pub fn close(self) {
         self.g.end();
     }
@@ -608,24 +591,16 @@ impl Memory {
         Ok(Region { sh })
     }
 
-    /// A component's graph region on this device (§5): `pool` is the device's one capture pool
-    /// token. Every block of `sets` and `retained` is pinned (made resident now) for its life.
-    pub fn graph_region(&self, sets: &[SetId], retained: &[SetId], pool: PoolId) -> Result<GraphRegion> {
-        let mut held = Held::default();
-        for &set in sets.iter().chain(retained) {
-            let binding = self.retain(set, &self.blocks(set)?)?;
-            held.pins.extend(binding.prepare(0)?);
-            held.bindings.push(binding);
-        }
+    /// A capture pool's lifetime and replay/drop word. Weight residency belongs to the caller's
+    /// prepared binding, held only through capture/replay and consuming output copies.
+    pub fn graph_region(&self, pool: PoolId) -> Result<GraphRegion> {
         self.torch()?.pool_retain(pool);
         let g = Arc::new(Graph {
             id: IDS.fetch_add(1, Ordering::Relaxed),
             memory: self.clone(),
-            sets: sets.to_vec(),
-            retained: retained.to_vec(),
             pool,
             word: Arc::default(),
-            held: Mutex::new(held),
+            held: Mutex::default(),
             dropped: AtomicBool::new(false),
             closed: AtomicBool::new(false),
             capture_ns: AtomicU64::new(0),
@@ -683,13 +658,22 @@ impl Memory {
 
 /// The manager's Reclaim of region `id`, whole: a cache region is swapped (`swap`, when it spills)
 /// or discarded once unpinned, a graph region dropped. Region ids are the process's, so the agent's
-/// mechanism thread finds it by id alone.
+/// mechanism thread finds it by id alone. Graph waits run on the deferred reclaim worker.
 pub(crate) fn reclaim(id: u64, swap: bool) -> Result<Reclaimed> {
     // Bound first: the registry's lock is never held across a reclaim's wait.
     let found = LIVE.lock().get(&id).and_then(Live::upgrade);
     match found {
         Some(Found::Cache(sh)) => sh.reclaim(Some(swap)),
-        Some(Found::Graph(g)) => g.drop_now(),
+        Some(Found::Graph(g)) => {
+            if g.dropped.load(Ordering::Acquire) {
+                return Ok(Reclaimed::Gone);
+            }
+            if g.word.drop_begin() {
+                deferred().ok_or_else(|| Error::Internal("graph reclaim worker unavailable".into()))?
+                    .send(id).map_err(|_| Error::Internal("graph reclaim worker stopped".into()))?;
+            }
+            Ok(Reclaimed::Busy)
+        }
         None => Ok(Reclaimed::Gone),
     }
 }

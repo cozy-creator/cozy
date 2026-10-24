@@ -292,8 +292,8 @@ impl PyMemory {
     /// the device's one capture pool token.
     #[pyo3(signature = (pool, sets = Vec::new(), retained = Vec::new()))]
     fn graph_region(&self, py: Python<'_>, pool: (u64, u64), sets: Vec<u32>, retained: Vec<u32>) -> PyResult<PyGraphRegion> {
-        let (sets, retained): (Vec<SetId>, Vec<SetId>) = (sets.into_iter().map(SetId).collect(), retained.into_iter().map(SetId).collect());
-        let graph = detached(py, &self.gpu.uuid, || self.memory().graph_region(&sets, &retained, varena::PoolId(pool.0, pool.1)))?;
+        let _ = (sets, retained); // Older Runtime keywords; weight leases belong to Binding.
+        let graph = detached(py, &self.gpu.uuid, || self.memory().graph_region(varena::PoolId(pool.0, pool.1)))?;
         Ok(PyGraphRegion { graph: Mutex::new(Some(graph)), gpu: self.gpu.uuid.clone() })
     }
 
@@ -677,7 +677,7 @@ impl PyGraphRegion {
         self.with(py, |g| Ok(g.dropping()))
     }
 
-    /// Drops its graphs' pins and its use of the pool.
+    /// Drains its graphs and releases its use of the pool.
     fn close(&self, py: Python<'_>) -> PyResult<()> {
         let Some(graph) = lock(&self.graph).take() else { return Ok(()) };
         done(py, &self.gpu, || graph.close())
