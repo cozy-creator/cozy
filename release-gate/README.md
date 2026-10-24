@@ -12,7 +12,9 @@ same SKU and suites; any FAIL blocks the promotion. Design: tracker `design/ci-v
 | `packages` | the packages `--pins` (or `--only`) names, plus the SDXL smoke | rtx-4090, rtx-5090 | ~$1–3 · 15–30 min | a package bump |
 | `varena` | the memory manager: cold load, co-residency, reload, 8/6/3 GiB caps, a real 8 GB card, host RAM (below) | its `skus` | | a varena or memory change |
 | `tensord` | the machine agent through `cozy`: generations, run and executor lifecycle, leases, multi-GPU, no re-execution, output delivery, cl-650 (building) | a cheap 2-GPU pod | | a TensorD or cozy change |
-| `tensorfs`, `hub`, `cli` | (building) | | | a TensorFS, Hub or CLI change |
+| `tensorfs` | downloads as fast as the last pass (Hub and datacenter cache), nothing from the Hub again, resume after a cut; uploads of new weights, dedup of a re-upload, resume after a cut; a straggler re-asked, not waited out (below) | cpu | ~$0.3 · ~40 min | a TensorFS, download or upload change |
+| `hub` | the API contract (`api/openapi.yaml`): anonymous paths, then account, rental, package publish/yank/pin/un-yank and model upload/publish/yank/delete through `cozy` (below); the migration rehearsal before a deploy | cpu | ~$0.2 · ~30 min | any Hub release |
+| `cli` | (building) | | | a CLI change |
 
 A rewrite picks every suite. Suites stack on one rental per SKU (`--suite runtime,packages` runs each cell once,
 against `gate-<SKU>-runtime-packages.json`). A suite is `suites/<name>/`: `cells.sh` (sourced in gate.sh: `cell`,
@@ -78,6 +80,31 @@ The runner signs in as the owner's account with its own device key: secret `COZY
   `check.py` holds each load and refill to a share of the machine's measured ceiling (`ceiling.py`), checks caps,
   alternation and host RAM; `analyze.py`, time and peak VRAM. Selected by `varena` (varena, TensorFS, TensorD, the
   Runtime); a SKU new to it needs `-f suites=varena -f skus=<sku> -f establish=true` once.
+- **tensorfs** (`suites/tensorfs`, one `cpu` rental, ~$0.3, ~40 min, `-f suites=tensorfs`): pick it for a TensorFS or
+  download/upload path change. It shows TensorFS moves weights as fast as before and dedups:
+  - `probe` (on the rental): the machine's disk, written and read cold (the varena method); an executor never dials
+    (cr-012), so there is no network ceiling, and downloads are held against the last pass.
+  - `model download` of a large many-object model cold (Hub and datacenter-cache times are separate baselines), again
+    (nothing from the Hub), and cut part-way then resumed (only the rest comes).
+  - `model upload` of new random weights from the gate's host to a throwaway `<account>/ci-tfs-<R>` (the time
+    includes staging from the host: run it from a runner), the same folder to a second tag (dedup: the same tree, a
+    tenth of the time), and new weights cut part-way then resumed. The model is deleted after.
+  - `straggler` (on the gate's host, where a client may dial): `tfs download` of BiRefNet clean and through
+    `straggler.py`, which drips its first objects as a slow storage GET does. A straggler must be re-asked, not
+    waited out (at most 1.5x clean + 20 s).
+- **hub** (`suites/hub`, one `cpu` rental, ~$0.2, ~30 min, `-f suites=hub`): pick it for any Hub release. It shows the
+  API contract (tensorhub `api/openapi.yaml` at `$HUB_REF`, read with `gh`) holds as cozy uses it:
+  - `contract.py`: each path no verb reaches, called anonymously, answers as its contract says (200 with a body its
+    schema admits, or 401 when bearer-only). This is the one place in release-gate that speaks HTTP to the Hub by
+    hand: it is the contract test.
+  - Through `cozy`, on a throwaway `<account>/ci-hub-<R>`: whoami, credits, credits history, the rental catalog and
+    the rental itself; a package locked, published twice, run, yanked (the simple index marks it `data-yanked`),
+    resolved past, run by exact pin, and un-yanked; a model uploaded, published (listed), downloaded, yanked (listed
+    yanked), downloaded by pin, un-yanked, deleted (gone). The package's releases are yanked and the model deleted.
+  - Before a Hub deploy, the release agent also rehearses its migrations: dump prod (in-pod `pg_dump -Fc`, copied
+    in sha256-checked chunks, a full `pg_restore -f /dev/null`), restore it into a scratch Postgres, start the
+    candidate image against it (it migrates on start) and wait for `/healthz` 204. Record the dump and the result
+    with the gate.
 - **Quality** (`quality.py`, every gate): CLIP prompt adherence of every render against its prompt (floor 0.25), and
   the gate's median CLIP-IQA sharpness against the last passed gates. Never a same-seed pixel diff.
 - **Checks:** `analyze.py` runs every `check(gate) -> (fails, notes)` in `CHECKS` (quality, lm, swap, and a suite's).
