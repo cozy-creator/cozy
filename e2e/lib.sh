@@ -75,6 +75,11 @@ candidates() {
   if [ -n "$CAND_COZY" ]; then
     want=$("$CAND_COZY" --version)
     [ "$(cozy --version)" = "$want" ] || fail "cozy is $(cozy --version), not the candidate $want"
+    # The installer's Calcifer keeps running until restarted (`cozy update` does that for a person): the
+    # candidate's Calcifer is the one that starts this computer's machine from here on.
+    cozy --json down > "$OUT/down-candidate.json" || check "cozy down failed"
+    cozy --json up > "$OUT/up-candidate.json" || fail "the candidate's cozy up failed"
+    grep -q "\"version\": *\"${want#cozy }\"" "$OUT/up-candidate.json" || check "Calcifer is not the candidate ${want#cozy }"
   fi
   machine_ready
 }
