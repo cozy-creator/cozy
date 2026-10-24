@@ -286,6 +286,25 @@ pub fn status_fields(status: &MachineStatus) -> Vec<(String, String)> {
         let limit = crate::output::bytes(first.memory_limit_bytes);
         fields.push(("gpu memory limit".into(), format!("{limit} of {}", cards.join(", "))));
     }
+    // TensorD's books of each GPU: what is free, its own context, each executor's leased pages by
+    // package, the page cache, and other apps' bytes.
+    for gpu in &status.gpus {
+        let Some(m) = &gpu.memory else { continue };
+        let b = crate::output::bytes;
+        let leased: Vec<String> = m.processes.iter().map(|p| match p.package.as_str() {
+            "" => format!("pid {} {}", p.pid, b(p.bytes)),
+            package => format!("{package} {}", b(p.bytes)),
+        }).collect();
+        let mut cell = format!("{} free of {} · TensorD context {} · leased {}", b(m.free_bytes), b(m.capacity_bytes), b(m.context_bytes), b(m.allocated_bytes));
+        if !leased.is_empty() {
+            cell += &format!(" ({})", leased.join(", "));
+        }
+        cell += &format!(" · page cache {}", b(m.page_cache_bytes));
+        if m.foreign_bytes > 0 {
+            cell += &format!(" · other apps {}", b(m.foreign_bytes));
+        }
+        fields.push((format!("GPU {} memory", gpu.index), cell));
+    }
     if status.disk_total_bytes > 0 {
         fields.push((
             "disk free".into(),

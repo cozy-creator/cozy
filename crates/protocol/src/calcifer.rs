@@ -627,7 +627,7 @@ pub struct LiveRun {
     pub run: Option<Run>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Gpu {
     pub index: u32,
     pub name: String,
@@ -641,6 +641,9 @@ pub struct Gpu {
     /// The most of `memory_bytes` the machine uses; 0: all of it.
     #[serde(default, skip_serializing_if = "unlimited")]
     pub memory_limit_bytes: u64,
+    /// TensorD's page accounting on it, as its last Status frame held it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<crate::machine::GpuMemory>,
 }
 
 fn unlimited(bytes: &u64) -> bool {

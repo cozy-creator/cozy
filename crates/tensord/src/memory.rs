@@ -230,6 +230,8 @@ pub fn row<'a>(entry: &str, inventory: &'a [receipt::Gpu]) -> Option<&'a receipt
 pub struct Tenant {
     pub plan: String,
     pub generation: String,
+    /// Its package, `name@version`, for display.
+    pub package: String,
     pub start: usize,
     pub exact: Exact,
 }

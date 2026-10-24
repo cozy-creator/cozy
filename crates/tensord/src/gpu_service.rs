@@ -796,13 +796,16 @@ impl Pool {
         let accounting = |device: &Device| {
             let held = device.memory.as_ref()?.manager.holdings();
             let uuid = memory::row(&device.entry, &self.config.inventory)?.device_uuid.clone();
-            let processes = held.executors.into_iter().map(|e| protocol::machine::ProcessMemory { pid: e.pid, executor: e.executor, chunks: e.chunks as u64, bytes: e.bytes }).collect();
+            let tenants = self.tenants.lock().unwrap_or_else(|e| e.into_inner());
+            let package = |pid: u32| tenants.get(&pid).map(|t| t.package.clone()).unwrap_or_default();
+            let processes = held.executors.into_iter().map(|e| protocol::machine::ProcessMemory { pid: e.pid, package: package(e.pid), executor: e.executor, chunks: e.chunks as u64, bytes: e.bytes }).collect();
             Some((uuid, protocol::machine::GpuMemory {
                 capacity_bytes: held.capacity,
                 free_bytes: held.free,
                 foreign_bytes: held.foreign,
                 created_bytes: held.created,
                 created_chunks: held.created_chunks as u64,
+                context_bytes: held.context,
                 allocated_bytes: held.allocated,
                 page_cache_bytes: held.page_cache,
                 page_cache_chunks: held.page_cache_chunks as u64,
@@ -2552,7 +2555,8 @@ impl Pool {
         executor.keep_memo(self.memo.clone());
         if plan.degree > 0 {
             let exact = Exact::open(&executor.birth)?.ok_or_else(|| io::Error::other("executor exited before its start"))?;
-            let tenant = Tenant { plan: plan.construction.clone(), generation: plan.generation.clone(), start, exact };
+            let package = format!("{}@{}", held.record.package, held.record.version);
+            let tenant = Tenant { plan: plan.construction.clone(), generation: plan.generation.clone(), package, start, exact };
             self.tenants.lock().unwrap().insert(executor.birth.pid, tenant);
             self.leaders.lock().unwrap().insert(executor.birth.pid,
                 (executor.birth.clone(), plan.construction.clone(), start));
@@ -2624,6 +2628,7 @@ impl Pool {
                 leader: session.executor.birth.clone(),
                 plan: construction.clone(),
                 generation: plan.generation.clone(),
+                package: format!("{}@{}", held.record.package, held.record.version),
                 start,
             }),
             host: self.host.as_deref(),
@@ -3598,6 +3603,7 @@ struct Formation {
     leader: Birth,
     plan: String,
     generation: String,
+    package: String,
     start: usize,
 }
 
@@ -3611,7 +3617,7 @@ impl Formation {
             .filter_map(|birth| Exact::open(birth).ok().flatten())
             .collect();
         let tenant = |follower: &Exact| -> io::Result<(u32, Tenant)> {
-            let tenant = Tenant { plan: self.plan.clone(), generation: self.generation.clone(), start: self.start, exact: follower.try_clone()? };
+            let tenant = Tenant { plan: self.plan.clone(), generation: self.generation.clone(), package: self.package.clone(), start: self.start, exact: follower.try_clone()? };
             Ok((follower.birth().pid, tenant))
         };
         self.tenants.register(followers.iter().map(tenant).collect::<io::Result<Vec<_>>>()?);
