@@ -829,6 +829,10 @@ struct Inner {
     /// Asked back while in use: pinned in the table until idle, then given.
     #[cfg(unix)]
     declined: Mutex<HashSet<crate::lease::Ticket>>,
+    /// Leased pages a step holds (pinned here), pinned in the table too: the manager never asks
+    /// for one in use.
+    #[cfg(unix)]
+    stepped: Mutex<HashSet<crate::lease::Ticket>>,
     /// Leased pages filled whose bytes the manager has not heard landed yet: acked once their
     /// ready event completes (only landed bytes are retained).
     #[cfg(unix)]
@@ -939,6 +943,8 @@ impl Memory {
                 leased: Mutex::default(),
                 #[cfg(unix)]
                 declined: Mutex::default(),
+                #[cfg(unix)]
+                stepped: Mutex::default(),
                 #[cfg(unix)]
                 to_land: Mutex::default(),
                 _device: device,
@@ -2938,7 +2944,23 @@ impl Inner {
     #[cfg(unix)]
     fn advise(&self, st: &State, agent: &crate::lease::Agent) {
         use crate::lease::Advice;
-        for (ticket, key, _) in self.leased.lock().values() {
+        let leased = self.leased.lock();
+        // Step-held pages are pinned in the table while their pins here last (a pin on change
+        // only): the policy sees them in use and never asks for one to be declined.
+        let mut stepped = self.stepped.lock();
+        stepped.retain(|t| leased.values().any(|(x, ..)| x == t));
+        for (ticket, key, _) in leased.values() {
+            let held = st.table.page(*key).is_some_and(|p| !p.pins.is_empty());
+            if held && !stepped.contains(ticket) {
+                if agent.pin(*ticket).unwrap_or(false) {
+                    stepped.insert(*ticket);
+                }
+            } else if !held && stepped.remove(ticket) {
+                let _ = agent.unpin(*ticket);
+            }
+        }
+        drop(stepped);
+        for (ticket, key, _) in leased.values() {
             let at = st.table.distance(*key).map(|(step, pass, block)| u64::from(step) << 40 | u64::from(pass) << 20 | u64::from(block));
             let advice = match (st.table.class(*key), at) {
                 (Some(Class::P), _) => Advice::Step { at: 0 },
