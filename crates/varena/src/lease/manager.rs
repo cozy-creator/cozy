@@ -26,6 +26,7 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex};
+use platform::contain::host_memory;
 use platform::handles::Peer;
 use platform::memory::{Signal, Waitable};
 use platform::process::Exact;
@@ -174,12 +175,14 @@ pub enum Peak {
     Host { key: String, bytes: u64 },
 }
 
-/// The driver's free bytes, and the bytes created and destroyed before that read.
+/// The driver's free bytes, and the bytes created and destroyed before that read; the host's
+/// memory beside it (what a swap to RAM may take).
 #[derive(Clone, Copy, Debug)]
 struct Sample {
     free: u64,
     created: u64,
     destroyed: u64,
+    host: policy::Host,
 }
 
 /// Opens the GPU's backend (TensorD's CUDA context), at the first ask.
@@ -691,7 +694,9 @@ impl Manager {
         };
         let free = self.hosting.free().or_else(|| device?.backend.free().ok())?;
         let destroyed = self.books.lock().destroyed_total;
-        Some(Sample { free, created, destroyed })
+        let available = u64::try_from(host_memory::read().available).unwrap_or(0);
+        let host = policy::Host { available, total: host_memory::limit().unwrap_or(0), ..policy::Host::default() };
+        Some(Sample { free, created, destroyed, host })
     }
 
     /// TensorD's reading of device bytes no process of ours holds (shown only: the driver's free
@@ -1055,7 +1060,8 @@ impl Manager {
             executors.push(policy::Executor { id: *id, chunks: e.leased.iter().filter_map(chunk).collect(), regions, graphs, waits_on });
         }
         let page_cache = cache.iter().map(|k| b.retained.get(k).map_or(0, |v| v.values().map(|p| p.len).sum())).collect();
-        let snapshot = policy::Snapshot { free, reserved, new_foreign: b.new_foreign, page_cache, executors, host: policy::Host::default() };
+        let host = b.sample.map(|s| s.host).unwrap_or_default();
+        let snapshot = policy::Snapshot { free, reserved, new_foreign: b.new_foreign, page_cache, executors, host };
         (snapshot, asks, cache)
     }
 

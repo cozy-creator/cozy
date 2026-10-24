@@ -1,8 +1,8 @@
 //! The mechanism under [`crate::Memory`], in the shape of CUDA's VMM: reserve address space,
 //! create shareable physical pages, map them (read-only once filled), export and import them,
 //! fill them through TensorFS's `io::read` on a copy stream, and order consumers on events.
-//! [`HostBackend`] is the same mechanism over host pages (a memfd, an `shm_open` object, a
-//! pagefile section): CPU and MPS executors and the CPU tests use it; [`crate::CudaBackend`] is CUDA's.
+//! [`HostBackend`] is the same mechanism over host pages (a memfd or a spill file, an `shm_open`
+//! object, a pagefile section): CPU and MPS executors and the CPU tests use it; [`crate::CudaBackend`] is CUDA's.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering::AcqRel, Ordering::Acquire};
@@ -125,6 +125,9 @@ pub trait Backend: Send + Sync {
     fn map(&self, va: Va, offset: u64, page: &Physical, access: Access) -> Result<()>;
     /// Changes the access of a mapped range (filled pages become read-only).
     fn protect(&self, va: Va, offset: u64, len: u64, access: Access) -> Result<()>;
+    /// The `len` bytes at `at` are written (a fill landed, a transform ran): a spilling host
+    /// device starts their writeback.
+    fn landed(&self, _at: u64, _len: u64) {}
     fn unmap(&self, va: Va, offset: u64, len: u64) -> Result<()>;
     /// A handle another process can import (a POSIX fd, a WIN32 handle).
     fn export(&self, page: &Physical) -> Result<Owned>;
@@ -181,12 +184,16 @@ pub trait Backend: Send + Sync {
     }
 }
 
-/// Pages in host memory (a memfd, an `shm_open` object or a pagefile section each), mapped into
-/// a reserved range. Its export maps read-only, its capacity a given limit. Fills are synchronous, so its events
-/// are always complete.
+/// Pages in host memory (a memfd or a spill file, an `shm_open` object or a pagefile section
+/// each), mapped into a reserved range. Its export maps read-only, its capacity a given limit.
+/// Fills are synchronous, so its events are always complete.
 pub struct HostBackend {
     limit: u64,
     headroom: u64,
+    /// Linux: pages are unlinked files here, which the kernel writes back and drops under
+    /// pressure. Elsewhere the OS pages host memory itself (pagefile sections, macOS's swap).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    spill: Option<std::path::PathBuf>,
     pages: Mutex<Pages>,
 }
 
@@ -195,6 +202,8 @@ struct Pages {
     next: u64,
     /// id → (handle, bytes it counts against the limit: 0 for an imported page).
     live: HashMap<u64, (Owned, u64)>,
+    /// Mapped address → (page id, its length).
+    at: std::collections::BTreeMap<u64, (u64, u64)>,
 }
 
 impl Pages {
@@ -217,7 +226,13 @@ impl HostBackend {
 
     /// A host device that keeps `headroom` free, as a card's driver does.
     pub fn with_headroom(limit: u64, headroom: u64) -> HostBackend {
-        HostBackend { limit, headroom, pages: Mutex::new(Pages::default()) }
+        HostBackend { limit, headroom, spill: None, pages: Mutex::new(Pages::default()) }
+    }
+
+    /// An executor's host device: its pages are never the OOM killer's (a shortfall drops clean
+    /// pages, writes dirty ones back to `dir`, or refuses a create as a card does).
+    pub fn spilling(limit: u64, dir: std::path::PathBuf) -> HostBackend {
+        HostBackend { spill: Some(dir), ..HostBackend::new(limit) }
     }
 }
 
@@ -272,6 +287,14 @@ impl Backend for HostBackend {
             // As a card answers.
             return Err(Error::Device { op: "create", code: OUT_OF_MEMORY, name: "out of memory".into() });
         }
+        #[cfg(target_os = "linux")]
+        if let Some(dir) = &self.spill {
+            let page = memory::spill_page(dir, len).map_err(page_err).map_err(|e| match e {
+                Error::Device { code: libc::ENOSPC | libc::EDQUOT, name, .. } => Error::Device { op: "create", code: OUT_OF_MEMORY, name },
+                e => e,
+            })?;
+            return Ok(pages.insert(page, len, len));
+        }
         let page = memory::page(len).map_err(page_err)?;
         // A holder's ftruncate must never SIGBUS another mapper (a lease's adopter).
         #[cfg(target_os = "linux")]
@@ -290,7 +313,10 @@ impl Backend for HostBackend {
         if offset.saturating_add(page.len) > va.len {
             return Err(Error::Invalid("map outside the reservation".into()));
         }
-        memory::map_page(va.base + offset, handle, page.len, access == Access::ReadWrite).map_err(page_err)
+        memory::map_page(va.base + offset, handle, page.len, access == Access::ReadWrite).map_err(page_err)?;
+        drop(pages);
+        self.pages.lock().at.insert(va.base + offset, (page.id, page.len));
+        Ok(())
     }
 
     fn protect(&self, va: Va, offset: u64, len: u64, access: Access) -> Result<()> {
@@ -298,7 +324,31 @@ impl Backend for HostBackend {
     }
 
     fn unmap(&self, va: Va, offset: u64, len: u64) -> Result<()> {
-        memory::unmap_page(va.base + offset, len).map_err(page_err)
+        let at = va.base + offset;
+        memory::unmap_page(at, len).map_err(page_err)?;
+        let mut pages = self.pages.lock();
+        let gone: Vec<u64> = pages.at.range(at..at.saturating_add(len)).map(|(a, _)| *a).collect();
+        for a in gone {
+            pages.at.remove(&a);
+        }
+        Ok(())
+    }
+
+    fn landed(&self, at: u64, len: u64) {
+        #[cfg(target_os = "linux")]
+        if self.spill.is_some() {
+            let pages = self.pages.lock();
+            let end = at.saturating_add(len);
+            for (_, (id, len)) in pages.at.range(..end).rev().take_while(|(a, (_, n))| *a + n > at) {
+                if let Some((handle, _)) = pages.live.get(id) {
+                    if let Err(error) = memory::write_back(handle, *len) {
+                        tracing::debug!("varena: {error}");
+                    }
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (at, len);
     }
 
     fn export(&self, page: &Physical) -> Result<Owned> {
