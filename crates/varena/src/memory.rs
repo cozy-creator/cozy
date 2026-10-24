@@ -148,6 +148,7 @@ impl Drop for Retained {
 
 /// Where a bound block's bytes came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.varena", frozen, eq, eq_int, skip_from_py_object))]
 pub enum Origin {
     /// Already mapped and filled.
     Hit,
@@ -157,8 +158,21 @@ pub enum Origin {
     Store,
 }
 
+#[cfg(feature = "python")]
+#[pyo3::pymethods]
+impl Origin {
+    fn __str__(&self) -> &'static str {
+        match self {
+            Origin::Hit => "hit",
+            Origin::Kept => "kept",
+            Origin::Store => "store",
+        }
+    }
+}
+
 /// One bind: the page-reference trace the gate computes Belady MIN from.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.varena", frozen, get_all, skip_from_py_object))]
 pub struct Ref {
     pub step: u32,
     pub set: String,
@@ -171,6 +185,7 @@ pub struct Ref {
 
 /// Bytes filled from one source and the time the fills took, summed.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.varena", frozen, get_all, skip_from_py_object))]
 pub struct Fills {
     pub bytes: u64,
     pub ns: u64,
@@ -178,6 +193,7 @@ pub struct Fills {
 
 /// Bytes moved, by source: fill time over bytes against the measured ceiling gives the %.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.varena", frozen, get_all, skip_from_py_object))]
 pub struct Moved {
     /// Leased pages adopted from the manager's retention (no copy; `ns` is the ask, import and map).
     pub kept: Fills,
@@ -190,6 +206,7 @@ pub struct Moved {
 
 /// One step of a request.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.varena", frozen, get_all, skip_from_py_object))]
 pub struct StepStats {
     /// The free bytes at its start: the manager's figure, or the standalone budget's.
     pub capacity: u64,
@@ -199,6 +216,7 @@ pub struct StepStats {
 
 /// One request's record (the design's §5 bar).
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.varena", frozen, get_all, skip_from_py_object))]
 pub struct Stats {
     pub request: String,
     /// Every fill since the previous request ended (loads included) and during this one.
@@ -228,6 +246,7 @@ pub struct Stats {
 
 /// One `make_room` that had to take bytes: what asked, how many bytes, what it took.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.varena", frozen, get_all, skip_from_py_object))]
 pub struct MakeRoom {
     /// The request's plan step then.
     pub step: u32,

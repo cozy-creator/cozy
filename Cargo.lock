@@ -3739,7 +3739,7 @@ dependencies = [
 
 [[package]]
 name = "tensorfs-py"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "async-trait",
  "base64",
@@ -4259,6 +4259,7 @@ dependencies = [
  "libc",
  "parking_lot",
  "platform",
+ "pyo3",
  "serde",
  "serde_json",
  "sha2",

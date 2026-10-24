@@ -118,6 +118,7 @@ pub trait Source: Send + Sync {
 
 /// A block of a request's arena still live at the request's end.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.varena", frozen, get_all, skip_from_py_object))]
 pub struct Outlived {
     pub ptr: u64,
     pub bytes: u64,
@@ -126,6 +127,7 @@ pub struct Outlived {
 
 /// An arena's record at its end.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.varena", frozen, get_all, skip_from_py_object))]
 pub struct Ended {
     pub allocated: u64,
     pub peak: u64,

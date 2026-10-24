@@ -1,12 +1,16 @@
 //! The lease socket's messages (varena-leases §11): handles and doorbells only; every state the
 //! two sides share is in the table. One stream per executor and GPU; each side serializes its own
 //! sends.
+//!
+//! Peers of other versions talk (never stricter than needed): an unknown kind is skipped, extra
+//! fields are ignored, and every field added after protocol 2 takes `#[serde(default)]`. Only a
+//! load-bearing kind this side cannot read ends the connection.
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::os::{self, Owned, Stream};
-use crate::Result;
+use crate::{Error, Result};
 
 /// A weights region a grant fills: its set's fingerprint and region index.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -20,14 +24,16 @@ pub struct Region {
 pub enum Refusal {
     /// The peer is no executor TensorD registered (yet: a follower may redial once it is).
     NotRegistered,
-    /// No compatible manager (another protocol, or a re-attach it does not serve): standalone.
-    Incompatible,
     /// No room can come for the ask.
     NothingRevocable,
     /// The manager failed serving the ask (its backend would not open, a chunk would not export).
     Failed,
     /// Nobody serves this GPU's leases (no listener): never sent, an agent's own finding.
     Absent,
+    /// No compatible manager (another protocol, or a re-attach it does not serve): standalone.
+    /// A code this side does not know reads as this.
+    #[serde(other)]
+    Incompatible,
 }
 
 /// What an ask is for: a weights page is one chunk sized to it (§3, never split, retainable or
@@ -94,6 +100,23 @@ pub enum ToAgent {
     Reclaim { region: u64, swap: bool },
 }
 
+/// A side's messages: their kinds as the wire tags them.
+pub trait Message: Serialize + serde::de::DeserializeOwned {
+    const KINDS: &'static [&'static str];
+    /// Kinds whose loss breaks the session: one that cannot be read ends the connection.
+    const LOAD_BEARING: &'static [&'static str];
+}
+
+impl Message for ToManager {
+    const KINDS: &'static [&'static str] = &["Hello", "Ask", "Answered", "Region", "RegionGone", "Measured"];
+    const LOAD_BEARING: &'static [&'static str] = &["Hello", "Ask"];
+}
+
+impl Message for ToAgent {
+    const KINDS: &'static [&'static str] = &["Welcome", "Grant", "Refuse", "Revoke", "Reclaim"];
+    const LOAD_BEARING: &'static [&'static str] = &["Welcome", "Grant", "Refuse"];
+}
+
 /// One side's end: sends serialized, receives on one thread.
 pub struct End {
     stream: Stream,
@@ -111,10 +134,25 @@ impl End {
         os::send(&self.stream, &(bytes, handle))
     }
 
-    /// The next message; `None` once the peer closed.
-    pub fn recv<T: serde::de::DeserializeOwned>(&self) -> Result<Option<(T, Option<Owned>)>> {
-        let Some((bytes, handle)) = os::recv(&self.stream)? else { return Ok(None) };
-        Ok(Some((os::decode(&bytes)?, handle)))
+    /// The next message this side can read; `None` once the peer closed. A kind it does not
+    /// know, or a known one it cannot read that nothing depends on, is skipped with a warning
+    /// (its handle closed).
+    pub fn recv<T: Message>(&self) -> Result<Option<(T, Option<Owned>)>> {
+        loop {
+            let Some((bytes, handle)) = os::recv(&self.stream)? else { return Ok(None) };
+            let frame: serde_json::Value = os::decode(&bytes)?;
+            let kind = match &frame {
+                serde_json::Value::String(kind) => kind.clone(),
+                serde_json::Value::Object(m) if m.len() == 1 => m.keys().next().cloned().unwrap_or_default(),
+                _ => return Err(Error::Invalid("a lease message with no kind".into())),
+            };
+            match serde_json::from_value::<T>(frame) {
+                Ok(m) => return Ok(Some((m, handle))),
+                Err(e) if T::LOAD_BEARING.contains(&kind.as_str()) => return Err(Error::Invalid(format!("lease {kind}: {e}"))),
+                Err(e) if T::KINDS.contains(&kind.as_str()) => tracing::warn!("lease: skipping a {kind} this side cannot read: {e}"),
+                Err(_) => tracing::warn!("lease: skipping a {kind}, a kind this side does not know (a peer of another version)"),
+            }
+        }
     }
 
     pub fn stream(&self) -> &Stream {
