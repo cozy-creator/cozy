@@ -27,7 +27,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::atomic::Ordering::{AcqRel, Acquire, Release, SeqCst};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, OnceLock, Weak};
 use std::thread::ThreadId;
 use std::time::Duration;
 
@@ -59,9 +59,34 @@ const ANY: usize = usize::MAX;
 pub const FLOAT: u64 = 64 << 20;
 /// The poller's cadence while epochs are outstanding: it doubles to the longest while nothing lands.
 const NAP: Duration = Duration::from_micros(50);
-/// The lease stall rule's window (three looks of 500 ms): a wait on this process's own idle
-/// spans that sees no epoch land this long gives up.
+/// The lease stall rule's window (three looks of 500 ms): with no capture open, a wait on this
+/// process's own idle spans that sees no epoch land this long gives up.
 const STALL: Duration = Duration::from_millis(1500);
+
+/// The host's lock a blocking wait must not hold (Python's GIL, when torch allocates holding
+/// it: an idle capture's thread needs it to end its capture): give it up, returning a token
+/// (0: nothing given up), and take it back. Set once by the host.
+static BLOCKING: OnceLock<(fn() -> usize, fn(usize))> = OnceLock::new();
+
+/// The host's hooks for [`BLOCKING`].
+pub fn on_blocking(release: fn() -> usize, reacquire: fn(usize)) {
+    let _ = BLOCKING.set((release, reacquire));
+}
+
+/// The host's lock, given up until this drops.
+struct Unblocked(usize);
+
+fn unblocked() -> Unblocked {
+    Unblocked(BLOCKING.get().map_or(0, |(release, _)| release()))
+}
+
+impl Drop for Unblocked {
+    fn drop(&mut self) {
+        if let Some((_, reacquire)) = BLOCKING.get() {
+            reacquire(self.0);
+        }
+    }
+}
 const NAP_MAX: Duration = Duration::from_millis(2);
 
 /// torch's `MempoolId_t`.
@@ -1324,30 +1349,33 @@ impl Shared {
             }
             let va = self.reserve(new)?;
             let mut chunks = Vec::new();
-            match self.source.map(va, if a.pool() { Kind::Pool } else { Kind::Torch }, &mut chunks) {
-                Ok(()) => {
-                    self.mapped.fetch_add(va.len, AcqRel);
-                    let mut st = a.st.lock();
-                    self.install(a, &mut st, va.base, chunks, Some(self.clock(stream)), t);
-                    if let Some(ptr) = self.carve(a, &mut st, size, stream) {
-                        return Ok(ptr);
-                    }
+            // The source may wait (the manager, this process's own idle spans): never holding
+            // the host's lock.
+            let unblocked = unblocked();
+            if let Err(e) = self.source.map(va, if a.pool() { Kind::Pool } else { Kind::Torch }, &mut chunks) {
+                self.unmap(va, chunks, true, false);
+                let retry = matches!(e, Error::Exhausted(_)) && self.give_back();
+                drop(unblocked);
+                if !retry {
+                    return Err(e);
                 }
-                Err(e) => {
-                    self.unmap(va, chunks, true, false);
-                    if !(matches!(e, Error::Exhausted(_)) && self.give_back()) {
-                        return Err(e);
-                    }
-                }
+                continue;
+            }
+            drop(unblocked);
+            self.mapped.fetch_add(va.len, AcqRel);
+            let mut st = a.st.lock();
+            self.install(a, &mut st, va.base, chunks, Some(self.clock(stream)), t);
+            if let Some(ptr) = self.carve(a, &mut st, size, stream) {
+                return Ok(ptr);
             }
         }
     }
 
     /// The source is short: this process's idle spans go back to it. Pending ones are waited for
-    /// (the poller, a Rust thread, sees them land) while the poller progresses; false when none
-    /// is left to give, or when [`STALL`] passed with none landing (a capture another thread
-    /// holds open stops the epochs, and that thread may need what this one holds: no wait on
-    /// this process itself).
+    /// (the poller, a Rust thread, sees them land). An open capture holds the epochs back only
+    /// until it ends, which it does unaided (a capture never waits on memory, and the waiter
+    /// holds no host lock): idle work yields. False when none is left to give, or when
+    /// [`STALL`] passed with no capture open and none landing.
     fn give_back(&self) -> bool {
         loop {
             let seen = *self.progress.0.lock();
@@ -1363,7 +1391,7 @@ impl Shared {
             self.kick();
             let mut p = self.progress.0.lock();
             while *p == seen {
-                if self.progress.1.wait_for(&mut p, STALL).timed_out() && *p == seen {
+                if self.progress.1.wait_for(&mut p, STALL).timed_out() && *p == seen && self.captures.load(SeqCst) == 0 {
                     return false;
                 }
             }
