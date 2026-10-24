@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use crate::device_executor::{DeviceCommand, Line};
+use crate::device_executor::{self, Command, Line};
 use protocol::machine::TensorFSOptions;
 use tensorfs::{
     err::{refuse, Code},
@@ -157,7 +157,7 @@ fn pooled(pool: &Pool, ca_der: Option<&[u8]>) -> Result<reqwest::Client, Refusal
 
 /// One signer's newest ordinary bearer at one Hub: every read under its owner's access presents
 /// the one held when it is sent, and each executor given it for a request hears of each newer
-/// one (`DeviceCommand::Bearer`). In memory only, for the life of the process.
+/// one (`Command::Bearer`). In memory only, for the life of the process.
 pub struct Bearer {
     actor: String,
     held: Mutex<(String, i64)>,
@@ -205,10 +205,10 @@ impl Bearer {
     fn forward(&self) {
         let (token, expires_unix_ms) = self.held();
         self.lines.lock().unwrap().retain(|(line, endpoint)| {
-            line.send(&DeviceCommand::Bearer {
+            line.send(&Command::Bearer(device_executor::Bearer {
                 actor: self.actor.clone(),
                 tensorfs: TensorFSOptions { endpoint: endpoint.clone(), token: token.clone(), expires_unix_ms, ..Default::default() },
-            })
+            }))
         });
     }
 }

@@ -243,7 +243,7 @@ pub fn checkpoint(engine: &Engine, generation: &Generation, id: &str, frame: &Fr
     };
     match record() {
         Ok(sequence) => { let mut answer = Answer::ok(frame.seq); answer.sequence = sequence; answer }
-        Err(error) => Answer::refused(frame.seq,
+        Err(error) => crate::device_executor::refused(frame.seq,
             if error.kind() == io::ErrorKind::InvalidInput { "output_undeclared" } else { "checkpoint_refused" },
             error.to_string()),
     }

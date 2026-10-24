@@ -7,8 +7,9 @@ use platform::process::{Birth, Exact};
 use crate::{
     catalog::HeldGeneration,
     device_executor::{
-        self, channel_lost, Answer, Binding, Cancellation, Construction, DeviceCommand,
-        DeviceExecutor, ExecutorConfig, Forked, Frame, Kind, ModelLoad, Services,
+        self, channel_lost, Activate, Answer, Binding, Cancellation, Command, Construction,
+        DeviceExecutor, ExecutorConfig, Forked, Frame, Invoke, Kind, Load, Map, ModelLoad,
+        InputFile, InputMetadata, PrepareRequest, Services, Start,
     },
     execution::Engine,
     gpu_allocation::Claims,
@@ -1176,10 +1177,10 @@ impl Pool {
             return Ok("its executor ended");
         };
         let reply = session.executor.command(
-            &DeviceCommand::Map {
+            &Command::Map(Map {
                 construction: plan.construction.clone(),
-                level: if level == Level::Gpu { "gpu" } else { "ram" },
-            },
+                level: if level == Level::Gpu { protocol::executor::Level::Gpu } else { protocol::executor::Level::Ram },
+            }),
             &mut device_executor::Baseline,
         );
         if reply.as_ref().is_ok_and(|reply| reply.ok) {
@@ -2224,7 +2225,7 @@ impl Pool {
             executor.retain_until_exit(directory);
             let interface = self.interface_file(&executor, held)?;
             let reply = executor.command(
-                &DeviceCommand::Start {
+                &Command::Start(Start {
                     devices: self.lane_devices(0, self.devices.len().min(1) as u32)?,
                     application: held.record.application.clone(),
                     call_interfaces: crate::calls::call_interfaces(held, &interface),
@@ -2235,7 +2236,7 @@ impl Pool {
                     leases: None,
                     memory_protocol: device_executor::memory_protocol(None),
                     memo: executor.memo_settings(),
-                },
+                }),
                 &mut device_executor::Baseline,
             )?;
             if !reply.ok {
@@ -2623,7 +2624,7 @@ impl Pool {
             let interface_path = self.interface_file(&session.executor, held)?;
             let starting = Instant::now();
             // An executor speaking leases dials each GPU's manager; any other runs standalone.
-            let standalone = session.executor.hello.contract() == device_executor::Contract::Standalone;
+            let standalone = device_executor::contract(&session.executor.hello) == device_executor::Contract::Standalone;
             if standalone {
                 self.standalone(&session.executor);
             }
@@ -2633,7 +2634,7 @@ impl Pool {
             // follower that dials its lease listener meanwhile waits for its registration.
             let forming = self.tenants.forming(&session.executor.birth, ranks.saturating_sub(1) as usize);
             let started = command_ok(session.executor.command(
-                &DeviceCommand::Start {
+                &Command::Start(Start {
                     devices: lane.clone(),
                     application: held.record.application.clone(),
                     package_interface: interface_path.clone(),
@@ -2644,7 +2645,7 @@ impl Pool {
                     leases,
                     memory_protocol: device_executor::memory_protocol(leases),
                     memo: session.executor.memo_settings(),
-                },
+                }),
                 &mut callbacks,
             )?)?;
             session.launch.start_ms = starting.elapsed().as_secs_f64() * 1e3;
@@ -2671,20 +2672,20 @@ impl Pool {
             let actor = engine.get(id).ok().and_then(|record| record.submission).map(|s| s.actor).unwrap_or_default();
             let load = match plan.slots.first() {
                 // A call that constructs nothing: its weightless construction.
-                None => DeviceCommand::Load {
+                None => Command::Load(Box::new(Load {
                     tensorfs: calls.and_then(|calls| calls.tensorfs(id, session.executor.line())),
                     actor: actor.clone(),
                     construction: construction.clone(),
                     devices: lane.clone(),
                     sequence_parallel_degree: ranks,
-                    binding: Box::new(Binding {
+                    binding: Binding {
                         application: held.record.application.clone(),
                         package_interface: interface_path.to_string_lossy().into_owned(),
                         ..Binding::default()
-                    }),
+                    },
                     models: vec![],
                     attention_pin: String::new(),
-                },
+                })),
                 Some(first) => {
                     let store = self.store.root().to_string_lossy().into_owned();
                     let homes = self.homes(&plan, gpus);
@@ -2701,20 +2702,20 @@ impl Pool {
                         1 => vec![],
                         _ => plan.slots.iter().map(load).collect(),
                     };
-                    DeviceCommand::Load {
+                    Command::Load(Box::new(Load {
                         tensorfs: calls.and_then(|calls| calls.tensorfs(id, session.executor.line())),
                         actor,
                         construction: construction.clone(),
                         devices: lane.clone(),
                         sequence_parallel_degree: ranks,
-                        binding: Box::new(first.binding),
+                        binding: first.binding,
                         models,
                         // The request it loads for names a kernel: its build is imported first.
                         attention_pin: match load_only {
                             true => String::new(),
                             false => engine.get(id)?.invocation.attention_kernel,
                         },
-                    }
+                    }))
                 }
             };
             let started = std::time::Instant::now();
@@ -2728,9 +2729,9 @@ impl Pool {
                 &session.launch,
             )?;
             command_ok(session.executor.command(
-                &DeviceCommand::Activate {
+                &Command::Activate(Activate {
                     construction: construction.clone(),
-                },
+                }),
                 &mut callbacks,
             )?)?;
             session.loaded = true;
@@ -2740,7 +2741,7 @@ impl Pool {
         }
         let record = engine.get(id)?;
         let prepared = session.executor.command(
-            &DeviceCommand::PrepareRequest {
+            &Command::PrepareRequest(PrepareRequest {
                 request_id: id.into(),
                 construction: construction.clone(),
                 entrypoint: plan.entrypoint.clone(),
@@ -2751,9 +2752,15 @@ impl Pool {
                     .invocation
                     .inputs
                     .iter()
-                    .map(|i| (i.input_id.clone(), serde_json::json!({"input_id":i.input_id,"media_type":i.media_type,"digest":i.digest,"length":i.length,"order":i.order})))
+                    .map(|i| (i.input_id.clone(), InputMetadata {
+                        input_id: i.input_id.clone(),
+                        media_type: i.media_type.clone(),
+                        digest: i.digest.clone(),
+                        length: i.length,
+                        order: i.order.into(),
+                    }))
                     .collect(),
-            },
+            }),
             &mut callbacks,
         );
         // A retained executor that went away while idle: PrepareRequest enters no handler,
@@ -2855,8 +2862,8 @@ impl Pool {
         let first = !session.invoked;
         session.invoked = true;
         let reply = session.executor.command(
-            &DeviceCommand::Invoke {
-                tensorfs: calls.and_then(|calls| calls.tensorfs(id, session.executor.line())).map(Box::new),
+            &Command::Invoke(Box::new(Invoke {
+                tensorfs: calls.and_then(|calls| calls.tensorfs(id, session.executor.line())),
                 destination: calls.map(|calls| calls.destination(id)).unwrap_or_default(),
                 actor: record.submission.as_ref().map(|submission| submission.actor.clone()).unwrap_or_default(),
                 operation,
@@ -2873,7 +2880,7 @@ impl Pool {
                 trees: inputs.trees,
                 sources: plan.sources.iter().map(|s| (s.parameter.clone(), s.manifest.clone())).collect(),
                 weights,
-            },
+            })),
             &mut callbacks,
         );
         session.executor.waits = None;
@@ -3280,7 +3287,7 @@ pub const TREE_MEDIA: &str = "application/vnd.cozy.tree-manifest";
 /// A call's inputs in its spool: file inputs by field path as read-only copies, and input
 /// trees by reference (`Tree` fields) as read-only directories with their manifest digest.
 pub(crate) struct Staged {
-    pub inputs: BTreeMap<String, serde_json::Value>,
+    pub inputs: BTreeMap<String, InputFile>,
     pub trees: BTreeMap<String, (PathBuf, String)>,
 }
 
@@ -3324,7 +3331,13 @@ pub(crate) fn stage_inputs(
         copy_held(cas, identity, &input.digest, input.length, &local)?;
         staged.inputs.insert(
             input.input_id.clone(),
-            serde_json::json!({"local":local,"media_type":input.media_type,"digest":input.digest,"length":input.length,"order":input.order,"file_state":null}),
+            InputFile {
+                local,
+                media_type: input.media_type.clone(),
+                digest: input.digest.clone(),
+                length: input.length,
+                order: input.order.into(),
+            },
         );
     }
     if let Some(identity) = identity {

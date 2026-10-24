@@ -106,7 +106,7 @@ code is still not sandboxed.
 | `gpu_service.rs` | Executor pool (degree 0, 1 or n): published package/model mapping, executor retention, request callbacks; GPU groups (a degree-K plan on the first K GPUs, one memory decision per GPU), one call slot per GPU and one-GPU replicas and multi-slot plans | `Pool`, `GpuConfig`, `Plan`, `PlanSlot`, `PlanSource`, `ModelGrant` | B2 (admission, grants), E (spawn/fencing), D1 (published mapping), I (groups, slots) |
 | `memory/` | Each GPU's varena ledger and eventfd, TensorD's row in it, `fits`, reaps, stalls and freed wakes on an NVML watch thread (`gpu`); a call's memory measurements (`call`) | `GpuLedger`, `CallMemory` | xs-046 B4 |
 | `deposits.rs` | Sealed host layouts executors deposit, granted to the next executor of the same weights | `Deposits` | xs-046 B4 |
-| `device_executor.rs` | Typed control seam to the Runtime device executor, per-request output encoding | `DeviceExecutor`, `ExecutorConfig`, `DeviceCommand`, `Frame`, `Answer` | E |
+| `device_executor.rs` | Control seam to the Runtime device executor (its wire types are `protocol::executor`), per-request output encoding | `DeviceExecutor`, `ExecutorConfig`, `Services` | E |
 | `launch_identity.rs` | Runtime trampoline command, the executor environment seal, optional UID/GID | `LaunchIdentity`, `Seal`, `trampoline` | E |
 | `process.rs` | Exact process births, kill (scope and group), the progress meter and watch (leader plus process-group members), reaping (`reap_group`) | `Exact`, `Pace`, `Watching`, `Reaped` | E, I |
 | `scope.rs` | Each executor's own scope (cgroup-v2, else an inherited token): kill, count, end; sweep of unclaimed and earlier runs' scopes | `Scope` | E |

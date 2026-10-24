@@ -7,7 +7,7 @@
 //! its finished calls answered.
 use crate::{
     catalog::HeldGeneration,
-    device_executor::{Answer, CallInterface, Frame, Kind},
+    device_executor::{Answer, ByteGrant, CallInterface, CallProgress, Frame, Kind},
     execution::Engine,
     journal::{Execution, Failure, InputFile, State},
     launch_identity::LaunchIdentity,
@@ -149,7 +149,7 @@ struct ChildCall {
     recorded: bool,
     request: String,
     /// The answered result and grants, once the child succeeded (materialized once).
-    settled: Option<(String, Vec<Value>)>,
+    settled: Option<(String, Vec<ByteGrant>)>,
     progress: (u64, Option<String>),
 }
 
@@ -382,7 +382,7 @@ impl Calls {
                 fields.insert("call_request".into(), call.request.clone().into());
                 fields.insert("call_attempt".into(), record.attempt.into());
             }
-            answer.progress = Some(json!({"sequence": call.progress.0, "payload": payload}));
+            answer.progress = Some(CallProgress { sequence: call.progress.0, payload });
         }
         match record.state {
             State::Completed => {
@@ -409,14 +409,9 @@ impl Calls {
                             .map_err(|e| ("child_result_unavailable", e.to_string()))?;
                     }
                     for row in &settled.1 {
-                        let digest = row["digest"].as_str().unwrap_or_default();
-                        let length = row["length"].as_u64().unwrap_or_default();
                         received.insert(
-                            digest.into(),
-                            Received {
-                                length,
-                                media_type: row["media_type"].as_str().unwrap_or_default().into(),
-                            },
+                            row.digest.clone(),
+                            Received { length: row.length, media_type: row.media_type.clone() },
                         );
                     }
                     call.settled = Some(settled);
@@ -505,7 +500,7 @@ impl Calls {
             _ => return Ok((Answer::unavailable(frame.seq), None)),
         };
         Ok((
-            answered.unwrap_or_else(|(code, detail)| Answer::refused(frame.seq, code, detail)),
+            answered.unwrap_or_else(|(code, detail)| crate::device_executor::refused(frame.seq, code, detail)),
             None,
         ))
     }
@@ -798,7 +793,7 @@ fn receive(
     spool: &Path,
     directory: &Path,
     identity: Option<LaunchIdentity>,
-) -> io::Result<(String, Vec<Value>, Held)> {
+) -> io::Result<(String, Vec<ByteGrant>, Held)> {
     fn leaves(value: &Value, path: &mut Vec<String>, found: &mut Vec<String>) {
         match value {
             Value::Object(fields) if fields.contains_key("asset_ref") => found.push(path.join(".")),
@@ -891,23 +886,30 @@ fn receive(
             node["asset_ref"] = digest.clone().into();
             node["digest"] = digest.clone().into();
             node["size_bytes"] = content.into();
-            grants.push(json!({"output_id": output_id, "kind": "tree", "digest": digest, "local": tree,
-                "length": artifact.length, "content_bytes": content, "media_type": binding.media_type}));
+            grants.push(ByteGrant {
+                output_id: output_id.clone(),
+                kind: "tree".into(),
+                digest,
+                local: tree,
+                length: artifact.length,
+                content_bytes: content,
+                media_type: binding.media_type.clone(),
+            });
             continue;
         }
         node["asset_ref"] = digest.clone().into();
         node["digest"] = digest.clone().into();
         node["size_bytes"] = artifact.length.into();
         node["media_type"] = binding.media_type.clone().into();
-        grants.push(json!({
-            "output_id": output_id,
-            "kind": node["kind"],
-            "digest": digest,
-            "local": local,
-            "length": artifact.length,
-            "content_bytes": artifact.length,
-            "media_type": binding.media_type,
-        }));
+        grants.push(ByteGrant {
+            output_id: output_id.clone(),
+            kind: node["kind"].as_str().unwrap_or_default().into(),
+            digest,
+            local,
+            length: artifact.length,
+            content_bytes: artifact.length,
+            media_type: binding.media_type.clone(),
+        });
     }
     let exact = String::from_utf8(crate::boundary_json::exact(&value)).map_err(io::Error::other)?;
     Ok((exact, grants, held))

@@ -78,7 +78,7 @@ impl Memo {
     pub fn answer(&self, run: &str, spool: &Path, frame: &Frame) -> Answer {
         let mut answer = Answer::ok(frame.seq);
         if !key_ok(&frame.key) {
-            return Answer::refused(
+            return crate::device_executor::refused(
                 frame.seq,
                 "memo_key_invalid",
                 "a memo key is 16 to 128 letters and digits",
