@@ -323,7 +323,9 @@ jobs:
           RELEASE_COMMIT: "${{ github.sha }}"
         run: |
           # Write and read notes from a file to avoid quoting breaking things
-          echo "$ANNOUNCEMENT_BODY" > $RUNNER_TEMP/notes.txt
+          # HAND-EDITED: the signing workflow's rename (release.yml -> cozy-publish.yaml) was a hard cut; drop this line
+          # once no one runs cozy 0.11.17 or older.
+          { echo "**cozy update from 0.11.17 or older fails: reinstall with the install line** (\`curl -LsSf https://tensorhub.com/install.sh | sh\`, or \`irm https://tensorhub.com/install.ps1 | iex\` on Windows)."; echo; echo "$ANNOUNCEMENT_BODY"; } > $RUNNER_TEMP/notes.txt
 
           # HAND-EDITED: always a candidate (prerelease, never latest) until cozy-promote.yaml promotes it.
           gh release create "${{ needs.plan.outputs.tag }}" --target "$RELEASE_COMMIT" --prerelease --latest=false --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*

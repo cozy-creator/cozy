@@ -19,7 +19,8 @@ irm https://tensorhub.com/install.ps1 | iex
 ```
 
 Both put `cozy` in `~/.cozy/bin` and on your PATH for new terminals: open a new one, or run the line
-the installer prints. `cozy update` moves to the newest release.
+the installer prints. `cozy update` moves to the newest release. `cozy update` from 0.11.17 or older fails; reinstall
+with the install line.
 
 ## Use
 

@@ -9,8 +9,8 @@ cargo-dist-version = "0.33.0"
 # --latest=false` (every release is a candidate, CI v2); no homebrew job: cozy-promote.yaml pushes the formula the
 # release carries, with the tap's deploy key (secret HOMEBREW_TAP_DEPLOY_KEY), once a recorded gate passed it; and
 # the attestations job at cozy-attestations.yaml. After `dist generate` (or a dist upgrade), move release.yml to
-# cozy-publish.yaml and put them back. `cozy update` verifies a release's signer is cozy-publish.yaml (or the
-# release.yml that signed releases before it).
+# cozy-publish.yaml and put them back. `cozy update` verifies a release's signer is cozy-publish.yaml: renaming this
+# file again is a hard cut for every installed cozy.
 allow-dirty = ["ci"]
 ci = "github"
 installers = ["shell", "powershell", "homebrew"]
