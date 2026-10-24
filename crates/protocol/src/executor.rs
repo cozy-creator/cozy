@@ -866,7 +866,7 @@ mod python {
     use pyo3::{
         exceptions::PyValueError,
         prelude::*,
-        types::{PyDict, PyList},
+        types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple},
         IntoPyObjectExt,
     };
     use serde_json::Value;
@@ -898,6 +898,70 @@ mod python {
                 dict.into_any()
             }
         })
+    }
+
+    /// A Python value as JSON: a class of this module as its own wire JSON, a path as its text,
+    /// else dicts, lists and scalars.
+    fn json_of(value: &Bound<'_, PyAny>) -> PyResult<Value> {
+        let invalid = |what: &str| PyValueError::new_err(format!("{what} has no JSON form"));
+        Ok(if value.is_none() {
+            Value::Null
+        } else if let Ok(b) = value.cast::<PyBool>() {
+            Value::Bool(b.is_true())
+        } else if value.is_instance_of::<PyInt>() {
+            match value.extract::<i64>() {
+                Ok(i) => i.into(),
+                Err(_) => value.extract::<u64>()?.into(),
+            }
+        } else if value.is_instance_of::<PyFloat>() {
+            serde_json::Number::from_f64(value.extract::<f64>()?).map(Value::Number).ok_or_else(|| invalid("a non-finite float"))?
+        } else if let Ok(s) = value.cast::<PyString>() {
+            Value::String(s.to_cow()?.into_owned())
+        } else if let Ok(d) = value.cast::<PyDict>() {
+            let mut fields = serde_json::Map::new();
+            for (key, item) in d.iter() {
+                fields.insert(key.extract::<String>()?, json_of(&item)?);
+            }
+            Value::Object(fields)
+        } else if value.is_instance_of::<PyList>() || value.is_instance_of::<PyTuple>() {
+            Value::Array(value.try_iter()?.map(|item| json_of(&item?)).collect::<PyResult<_>>()?)
+        } else if value.hasattr("__fspath__")? {
+            Value::String(value.call_method0("__fspath__")?.extract::<String>()?)
+        } else if value.hasattr("json")? && value.get_type().module()?.to_cow()? == "tensorfs.executor" {
+            serde_json::from_str(&value.call_method0("json")?.extract::<String>()?).map_err(|e| PyValueError::new_err(e.to_string()))?
+        } else {
+            return Err(invalid(&value.get_type().name()?.to_cow()?));
+        })
+    }
+
+    /// `this` with `changes` in place of its fields, through serde: a change of the wrong shape is
+    /// refused by its path, and one naming no field of the record by its name.
+    fn replaced<T: Serialize + serde::de::DeserializeOwned>(this: &T, changes: Option<&Bound<'_, PyDict>>) -> PyResult<T> {
+        let error = |e: &dyn std::fmt::Display| PyValueError::new_err(e.to_string());
+        let Value::Object(mut fields) = serde_json::to_value(this).map_err(|e| error(&e))? else {
+            return Err(PyValueError::new_err("not a record"));
+        };
+        let mut given = vec![];
+        for (key, value) in changes.into_iter().flat_map(|d| d.iter()) {
+            let (key, value) = (key.extract::<String>()?, json_of(&value)?);
+            fields.insert(key.clone(), value.clone());
+            given.push((key, value));
+        }
+        let result: T = serde_path_to_error::deserialize(Value::Object(fields)).map_err(|e| error(&e))?;
+        let after = serde_json::to_value(&result).map_err(|e| error(&e))?;
+        // A field serde leaves out when empty reads back absent; any other change must read back.
+        let empty = |v: &Value| match v {
+            Value::Null => true,
+            Value::Bool(b) => !b,
+            Value::Number(n) => n.as_f64() == Some(0.0),
+            Value::String(s) => s.is_empty(),
+            Value::Array(a) => a.is_empty(),
+            Value::Object(o) => o.is_empty(),
+        };
+        if let Some((key, _)) = given.iter().find(|(key, value)| after.get(key).is_none() && !empty(value)) {
+            return Err(PyValueError::new_err(format!("no field `{key}`")));
+        }
+        Ok(result)
     }
 
     impl<'py> IntoPyObject<'py> for &Json {
@@ -943,6 +1007,11 @@ mod python {
                 fn json(&self) -> PyResult<String> {
                     serde_json::to_string(self).map_err(|e| PyValueError::new_err(e.to_string()))
                 }
+                /// A copy with `changes` in place of its fields (`msgspec.structs.replace`).
+                #[pyo3(signature = (**changes))]
+                fn replace(&self, changes: Option<&Bound<'_, PyDict>>) -> PyResult<Self> {
+                    replaced(self, changes)
+                }
             }
         )*};
     }
@@ -962,6 +1031,11 @@ mod python {
                 fn json(&self) -> PyResult<String> {
                     let wrap: fn($t) -> Command = $wrap;
                     serde_json::to_string(&wrap(self.clone())).map_err(|e| PyValueError::new_err(e.to_string()))
+                }
+                /// A copy with `changes` in place of its fields (`msgspec.structs.replace`).
+                #[pyo3(signature = (**changes))]
+                fn replace(&self, changes: Option<&Bound<'_, PyDict>>) -> PyResult<Self> {
+                    replaced(self, changes)
                 }
             }
         )*};
