@@ -64,7 +64,7 @@ pub(super) fn run(command: &mut Command, code: &str) -> Result<String, Error> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// A package project, as its pyproject.toml and package.toml say.
+/// A package project, as its pyproject.toml says.
 pub(super) struct Project {
     pub root: PathBuf,
     pub name: String,
@@ -95,7 +95,6 @@ impl Project {
                 .map_err(|e| refuse("project_file_invalid", format!("{file}: {e}")))
         };
         let pyproject = table("pyproject.toml")?;
-        let package = table("package.toml")?;
         let field = |path: &[&str]| -> Option<&toml::Value> {
             let (first, rest) = path.split_first()?;
             rest.iter()
@@ -110,29 +109,6 @@ impl Project {
                 "pyproject.toml's [project] needs a literal name and version",
             ));
         };
-        let object = package
-            .get("application")
-            .and_then(|a| a.get("object"))
-            .and_then(|o| o.as_str());
-        let entry = field(&["project", "entry-points", "cozy.application"])
-            .and_then(toml::Value::as_table)
-            .map(|points| {
-                points
-                    .values()
-                    .filter_map(toml::Value::as_str)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        if object.is_none() || entry != [object.unwrap_or_default()] {
-            return Err(refuse(
-                "application_mismatch",
-                format!(
-                    "package.toml's [application] object ({}) must be pyproject's one cozy.application entry point ({})",
-                    object.unwrap_or("absent"),
-                    entry.join(", ")
-                ),
-            ));
-        }
         let indexes = field(&["tool", "uv", "index"]).and_then(toml::Value::as_array);
         if indexes
             .into_iter()
@@ -719,7 +695,7 @@ pub async fn publish(ctx: &Context, root: bool) -> Result<ExitCode, Error> {
         File::new(named("artifacts/source", &sdist), sdist.clone())?,
         File::new("metadata/package-interface.json".into(), interface_path)?,
     ];
-    for document in ["package.toml", "pyproject.toml", "uv.lock"] {
+    for document in ["pyproject.toml", "uv.lock"] {
         files.push(File::new(document.into(), stage.src.join(document))?);
     }
     for local in git_wheels {

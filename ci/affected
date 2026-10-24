@@ -105,7 +105,7 @@ def select(repo: str, base: str, head: str) -> dict[str, list[str]]:
                 take(conf["crates"].get(crate, ["everything"]), path)
             continue
         top = path.split("/", 1)[0]
-        if package is not None and "/" in path and any(show(rev, f"{top}/package.toml") is not None for rev in (head, base)):
+        if package is not None and "/" in path and any("cozy.application" in (show(rev, f"{top}/pyproject.toml") or "") for rev in (head, base)):
             take(package["select"] + package.get("extra", {}).get(top, []), path, top)
             continue
         take(conf["unmapped"], path)

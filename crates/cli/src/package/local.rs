@@ -346,10 +346,6 @@ fn script(ctx: &Context, path: &Path) -> Result<PathBuf, Error> {
             toml::to_string(&pyproject).map_err(|e| refuse("script_metadata_invalid", e))?,
         ),
         (
-            "package.toml",
-            "[application]\nobject = \"cozy_script_entry:app\"\n".into(),
-        ),
-        (
             "cozy_script_entry.py",
             "from cozy_runtime.author import script_app\napp = script_app(\"cozy_script\")\n"
                 .into(),

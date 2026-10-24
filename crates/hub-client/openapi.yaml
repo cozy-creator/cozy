@@ -2380,11 +2380,10 @@ components:
         version: {type: string}
     PackageInstallPlan:
       type: object
-      required: [downloads, package_config, package_interface, pyproject, release, uv_lock]
+      required: [downloads, package_interface, pyproject, release, uv_lock]
       properties:
         python_version: {type: string}
         downloads: {type: array, items: {$ref: '#/components/schemas/PackageInstallFile'}}
-        package_config: {$ref: '#/components/schemas/ExactDocument'}
         package_interface: {$ref: '#/components/schemas/ExactDocument'}
         pyproject: {$ref: '#/components/schemas/ExactDocument'}
         release: {type: string}
