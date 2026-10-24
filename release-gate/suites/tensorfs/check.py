@@ -78,8 +78,11 @@ def check(gate):
     def done(name, cancelled=False):
         r = rows.get(name)
         status = ((r or {}).get('rec') or {}).get('status')
+        if r is None:
+            fails.append(f'tensorfs {name}: did not run')
+            return False
         if cancelled:
-            return r is not None
+            return True
         if status != 'completed':
             why = ((r or {}).get('rec') or {}).get('reason')
             fails.append(f'tensorfs {name}: run {(r or {}).get("run")} {status} {json.dumps(why)[:300] if why else ""}')

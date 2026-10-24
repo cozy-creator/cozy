@@ -62,7 +62,10 @@ else
   expect "hub contract document" FAIL "tensorhub-v2 api/openapi.yaml@$HUB_REF unreadable: $(tail -c 200 "$HB/openapi.err")"
 fi
 # account
-WHO=$("$CLI" --json whoami 2>"$HB/whoami.err" | python3 -c 'import json,sys; print(json.load(sys.stdin)["account"])' 2>/dev/null)
+WHO=; for _ in 1 2 3; do  # a dropped connection is asked again
+  WHO=$("$CLI" --json whoami 2>"$HB/whoami.err" | python3 -c 'import json,sys; print(json.load(sys.stdin)["account"])' 2>/dev/null) && [ -n "$WHO" ] && break
+  sleep 5
+done
 [ -n "$WHO" ] && expect "hub whoami" PASS "signed in as $WHO" || expect "hub whoami" FAIL "$(tail -c 200 "$HB/whoami.err")"
 hub_do credits ok credits
 hub_do credits-history ok credits history

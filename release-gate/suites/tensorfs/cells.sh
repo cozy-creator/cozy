@@ -83,7 +83,10 @@ tfs_step download-cold model download "$TFS_MODEL" --on "$M" -y
 tfs_step download-again model download "$TFS_MODEL" --on "$M" -y
 tfs_cut download-cut download 0.3 model download "$TFS_RESUME" --on "$M" -y
 tfs_step download-resume model download "$TFS_RESUME" --on "$M" -y
-WHO=$("$CLI" --json whoami 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["account"])')
+WHO=; for _ in 1 2 3; do  # a dropped connection is asked again
+  WHO=$("$CLI" --json whoami 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["account"])' 2>/dev/null) && [ -n "$WHO" ] && break
+  sleep 5
+done
 # Local paths go absolute: `cozy model upload ./folder` resolves them against Calcifer, not here (2026-10-24).
 if [ -n "$WHO" ] && tfs_weights "$T/up-a" "$TFS_UPLOAD_MB" && tfs_weights "$T/up-c" "$TFS_UPLOAD_MB"; then
   TFS_DEST=$WHO/ci-tfs-$R
