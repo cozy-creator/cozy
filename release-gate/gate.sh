@@ -103,6 +103,10 @@ R=$(( $(date +%s%N) / 1000 % 4000000000 ))
 M=
 end_it() {
   [ -n "$M" ] || return
+  # The machine's own logs leave with it: keep them for every gate (a poisoned executor is diagnosed from them).
+  timeout 300 "$CLI" machine logs "$M" memory -n 0 >machine-memory.log 2>&1
+  timeout 300 "$CLI" machine logs "$M" tensord -n 0 >machine-tensord.log 2>&1
+  timeout 120 "$CLI" logs calcifer >calcifer.log 2>&1
   "$CLI" machine end "$M" -y >end.log 2>&1
   for _ in $(seq 1 30); do timeout 30 "$CLI" machine list 2>/dev/null | grep -q "^$M " || { log "ended $M, gone"; M=; return; }; sleep 10; done
   log "WARNING $M still listed"
