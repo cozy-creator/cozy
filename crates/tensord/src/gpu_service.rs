@@ -651,7 +651,7 @@ pub struct Pool {
     memo: Arc<crate::memo::Memo>,
     /// The calls running on its GPUs, by request: the host rule reads them.
     running: memory::Running,
-    /// The derived-weights disk cache: entries TensorD keeps for the GPU page cache.
+    /// The derived-weights disk cache: entries TensorD keeps until it exits or a low disk drops them.
     derived: Arc<crate::derived::Derived>,
     // Drop session/resource custody before ending the actual spawning thread.
     launcher: crate::child_launcher::ChildLauncher,

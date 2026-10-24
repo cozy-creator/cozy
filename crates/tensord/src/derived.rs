@@ -2,9 +2,9 @@
 //! merged LoRA, a quantization from another source), kept on disk so a refill after a reclaim reads
 //! them through the page cache rather than deriving them again. Each entry is a file unlinked from
 //! birth (`O_TMPFILE`, else open and unlink at once; Windows `FILE_FLAG_DELETE_ON_CLOSE`), so its
-//! holders are its open descriptors: TensorD's while it keeps the entry, and each process it hands
-//! one to. The OS frees it at the last close, so a crash leaves nothing behind: no sweep, no TTL,
-//! no size cap. It is written nothing below the disk's reserve, and under it the cache goes first:
+//! holders are its open descriptors: TensorD's, which keeps the entry until it exits, and each
+//! process it hands one to. The OS frees it at the last close, so a crash leaves nothing behind: no
+//! sweep, no TTL, no size cap. It is written nothing below the disk's reserve, and under it the cache goes first:
 //! TensorD lets its own holders go, least recently used first. Entries live per trust domain
 //! (package generation and user) and are never shared across domains.
 use crate::reclaim::Disk;
@@ -81,10 +81,9 @@ impl Derived {
         entry.file.try_clone().ok()
     }
 
-    /// TensorD lets `key`'s entries go (its GPU page cache dropped the chunk): each is freed
-    /// once every process holding it closes it too.
-    pub fn forget(&self, domain: &str, key: &str) {
-        self.entries().retain(|(d, k, _), _| !(d == domain && k == key));
+    /// The GPU page cache dropped `key`'s chunk: its entry, now the only copy, counts as just used.
+    pub fn touch(&self, domain: &str, key: &str) {
+        self.entries().range_mut(Self::of(domain, key)).for_each(|(_, entry)| entry.used = Instant::now());
     }
 
     /// Lets TensorD's holders go, least recently used first, until `bytes` are let go (a low

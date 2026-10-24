@@ -118,8 +118,8 @@ pub trait Hosting: Send + Sync {
         None
     }
 
-    /// The page cache dropped the chunk it filled: the host lets its entry go (after the
-    /// manager's books dropped).
+    /// The page cache dropped the chunk it filled (after the manager's books dropped): the entry
+    /// is now its only copy.
     fn forget_derived(&self, _domain: &str, _key: &str) {}
 
     /// The device's free bytes now as the driver counts them, needing no CUDA context of
