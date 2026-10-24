@@ -40,10 +40,11 @@ const AGAIN: u32 = 3;
 pub(crate) enum Lock {
     /// Nobody holds the home; `stale`: a record names a Calcifer killed before it erased it.
     Free { stale: bool },
-    /// A Calcifer holds the home and its record names it.
+    /// A Calcifer holds the home and its record names it, alive.
     Held(Holder),
-    /// The home is held, but its record does not read as a Calcifer's.
-    Unreadable,
+    /// The home's lock is held, but by no live Calcifer its record names: a process another one
+    /// started keeps it open (a machine a previous Calcifer started, before cl-646's fix).
+    Captive,
 }
 
 /// One command's connection to Calcifer. Cheap to clone; clones share the connection.
@@ -98,10 +99,13 @@ impl Client {
     pub(crate) fn lock_state(&self) -> Lock {
         let free = self.lock_free();
         let raw = LockFile::new(self.0.home.calcifer_lock()).holder().ok().flatten();
+        let alive = |pid: u32| {
+            process::Birth::of(pid).and_then(|birth| birth.state()).is_ok_and(|s| s != process::State::Gone)
+        };
         match (free, raw.map(|raw| serde_json::from_slice::<Holder>(&raw))) {
             (true, record) => Lock::Free { stale: record.is_some() },
-            (false, Some(Ok(holder))) => Lock::Held(holder),
-            (false, _) => Lock::Unreadable,
+            (false, Some(Ok(holder))) if alive(holder.pid) => Lock::Held(holder),
+            (false, _) => Lock::Captive,
         }
     }
 

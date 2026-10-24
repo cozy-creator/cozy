@@ -161,13 +161,10 @@ async fn calcifer(ctx: &Context) -> Vec<Check> {
             }
             (false, "not running".to_owned())
         }
-        Lock::Unreadable => {
-            checks.push(Check::bad(
-                "lock record",
-                format!("{} is held but does not read as Calcifer's", ctx.home.calcifer_lock().display()),
-            ));
-            return checks;
-        }
+        Lock::Captive => match captive(ctx, &mut checks) {
+            Some(why) => (false, why),
+            None => return checks,
+        },
         Lock::Held(holder) => {
             checks.push(Check::ok(
                 "lock record",
@@ -176,6 +173,12 @@ async fn calcifer(ctx: &Context) -> Vec<Check> {
             if let Some(silence) = silence(ctx, &client, &holder).await {
                 if let Err(e) = end(holder.pid) {
                     checks.push(Check::bad("calcifer", format!("{silence}, and ending it failed: {e}")));
+                    return checks;
+                }
+                // A process it started may still hold its lock: that too must go before one starts.
+                if let Lock::Captive = client.lock_state()
+                    && captive(ctx, &mut checks).is_none()
+                {
                     return checks;
                 }
                 (false, silence)
@@ -199,6 +202,38 @@ async fn calcifer(ctx: &Context) -> Vec<Check> {
             return checks;
         }
     }
+    start(ctx, checks, why).await
+}
+
+/// This home's Calcifer lock held by no live Calcifer: the processes holding it that are not a
+/// Calcifer (a machine an earlier Calcifer started) are named and ended, with what they started:
+/// why, for the start that follows. `None` (and a problem said) when one could not be ended. A
+/// lock only a stopping Calcifer holds, or one this OS cannot name a holder of, is waited for.
+fn captive(ctx: &Context, checks: &mut Vec<Check>) -> Option<String> {
+    let lock = ctx.home.calcifer_lock();
+    let held: Vec<(u32, String)> = holders(&lock)
+        .into_iter()
+        .filter(|(pid, command)| *pid != std::process::id() && !command.contains(" calcifer"))
+        .collect();
+    let Some((pid, command)) = held.first().cloned() else {
+        checks.push(Check::ok("lock record", format!("{} is held by no live Calcifer", lock.display())));
+        return Some("a Calcifer was stopping".into());
+    };
+    checks.push(Check::ok(
+        "lock record",
+        format!("{} is held by pid {pid} ({command}), not a Calcifer", lock.display()),
+    ));
+    for (pid, _) in &held {
+        if let Err(e) = platform::process::end_tree(&platform::process::tree(*pid)) {
+            checks.push(Check::bad("calcifer", format!("pid {pid} holds Calcifer's lock, and ending it failed: {e}")));
+            return None;
+        }
+    }
+    Some(format!("pid {pid} ({command}), started by an earlier Calcifer, held its lock; ended it"))
+}
+
+/// Starts Calcifer (or waits for the one starting), said as what fixed `why`.
+async fn start(ctx: &Context, mut checks: Vec<Check>, why: String) -> Vec<Check> {
     match Client::connect(ctx).await.map(|fresh| fresh.holder()) {
         Ok(Some(holder)) => {
             let verb = if why == "not running" { "started" } else { "restarted" };
@@ -208,6 +243,33 @@ async fn calcifer(ctx: &Context) -> Vec<Check> {
         Err(e) => checks.push(Check::bad("calcifer", format!("{why}, and it does not start: {}", e.message))),
     }
     checks
+}
+
+/// The processes holding `path` open, each with its command line: Linux reads `/proc/*/fd`, macOS
+/// asks `lsof`. Windows' locks name no holder: none.
+fn holders(path: &Path) -> Vec<(u32, String)> {
+    let mut found = vec![];
+    #[cfg(target_os = "linux")]
+    for entry in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else { continue };
+        let open = std::fs::read_dir(entry.path().join("fd")).into_iter().flatten().flatten();
+        if open.filter_map(|fd| std::fs::read_link(fd.path()).ok()).any(|target| target == path) {
+            let command = std::fs::read(entry.path().join("cmdline")).unwrap_or_default();
+            let command = String::from_utf8_lossy(&command).replace('\0', " ").trim().to_owned();
+            found.push((pid, command));
+        }
+    }
+    #[cfg(target_os = "macos")]
+    if let Ok(out) = Command::new("lsof").arg("-t").arg("--").arg(path).stdin(Stdio::null()).output() {
+        for pid in String::from_utf8_lossy(&out.stdout).lines().filter_map(|l| l.trim().parse::<u32>().ok()) {
+            let command = Command::new("ps").args(["-o", "command=", "-p", &pid.to_string()]).output();
+            let command = command.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned()).unwrap_or_default();
+            found.push((pid, command));
+        }
+    }
+    #[cfg(windows)]
+    let _ = path;
+    found
 }
 
 /// `None` once the Calcifer `holder` names answers; else why it counts as stuck: its process made
