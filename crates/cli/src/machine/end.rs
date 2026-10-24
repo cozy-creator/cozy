@@ -284,9 +284,10 @@ pub async fn update(
             ("tensord", None) => built_version(&path).map_or(("dev", true.into()), |v| ("version", v.into())),
             _ => reports(member, &file),
         });
-        named.push(match &version {
-            Some(version) => format!("{member} {version}"),
-            None => format!("{member} {file} (dev)"),
+        named.push(match (&version, reports(member, &file)) {
+            (Some(version), _) => format!("{member} {version}"),
+            (None, (_, serde_json::Value::String(stamped))) if member != "tensord" => format!("{member} {stamped} (dev)"),
+            (None, _) => format!("{member} {file} (dev)"),
         });
         inputs.push(v1::InputFile {
             field: key.into(),
@@ -444,7 +445,100 @@ fn build(dir: &Path, distribution: &str) -> Result<PathBuf, Error> {
         .map(|entry| entry.path())
         .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with(&format!("{distribution}-")) && n.ends_with(".whl")))
         .max_by_key(|p| p.metadata().and_then(|m| m.modified()).ok());
-    newest.ok_or_else(|| failed(format!("the build left no {distribution} wheel in {}", out.display())))
+    let built = newest.ok_or_else(|| failed(format!("the build left no {distribution} wheel in {}", out.display())))?;
+    stamp(&built, &local_version(dir, &built)).map_err(|e| failed(format!("stamping {}: {e}", built.display())))
+}
+
+/// A dev build's PEP 440 local version: `dev.g<commit>`, `.dirty` with uncommitted changes; a tree
+/// git does not know is named by the built wheel's digest.
+fn local_version(dir: &Path, wheel: &Path) -> String {
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git").arg("-C").arg(dir).args(args).output().ok()?;
+        out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+    };
+    match git(&["rev-parse", "--short=12", "HEAD"]) {
+        Some(commit) => {
+            let dirty = git(&["status", "--porcelain", "--untracked-files=no"]).is_some_and(|s| !s.is_empty());
+            format!("dev.g{commit}{}", if dirty { ".dirty" } else { "" })
+        }
+        None => {
+            let digest = std::fs::read(wheel).map(|bytes| Digest::of(&bytes).to_string()).unwrap_or_default();
+            format!("dev.{}", digest.trim_start_matches("sha256:").get(..12).unwrap_or("0"))
+        }
+    }
+}
+
+/// `wheel` restamped with `local` as its version's local part (`0.31.0+dev.g<commit>`): its file
+/// name, `.dist-info` (and `.data`) folder, METADATA and RECORD, so the machine reports which
+/// build it runs. The original is removed.
+fn stamp(wheel: &Path, local: &str) -> std::io::Result<PathBuf> {
+    use base64::Engine as _;
+    use sha2::Digest as _;
+    use std::io::{Read as _, Write as _};
+    let invalid = |why: String| std::io::Error::new(std::io::ErrorKind::InvalidData, why);
+    let file = wheel.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+    let (distribution, rest) = file.strip_suffix(".whl").and_then(|s| s.split_once('-')).ok_or_else(|| invalid(format!("{file} is not a wheel name")))?;
+    let (version, tags) = rest.split_once('-').ok_or_else(|| invalid(format!("{file} is not a wheel name")))?;
+    let stamped = match version.contains('+') {
+        true => format!("{version}.{local}"),
+        false => format!("{version}+{local}"),
+    };
+    let (info, data) = (format!("{distribution}-{version}.dist-info/"), format!("{distribution}-{version}.data/"));
+    let new_info = format!("{distribution}-{stamped}.dist-info/");
+    let renamed = |name: &str| match (name.strip_prefix(&info), name.strip_prefix(&data)) {
+        (Some(rest), _) => format!("{new_info}{rest}"),
+        (_, Some(rest)) => format!("{distribution}-{stamped}.data/{rest}"),
+        _ => name.to_owned(),
+    };
+    let mut archive = zip::ZipArchive::new(std::fs::File::open(wheel)?).map_err(std::io::Error::other)?;
+    let mut read = |name: &str| -> std::io::Result<String> {
+        let mut text = String::new();
+        archive.by_name(name).map_err(|_| invalid(format!("{file} has no {name}")))?.read_to_string(&mut text)?;
+        Ok(text)
+    };
+    let (metadata, record) = (read(&format!("{info}METADATA"))?, read(&format!("{info}RECORD"))?);
+    // The header's Version line only, never one in the description below it.
+    let mut replaced = false;
+    let metadata: String = metadata
+        .split_inclusive('\n')
+        .map(|line| match !replaced && line.starts_with("Version:") {
+            true => {
+                replaced = true;
+                format!("Version: {stamped}\n")
+            }
+            false => line.to_owned(),
+        })
+        .collect();
+    let hash = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sha2::Sha256::digest(metadata.as_bytes()));
+    let record: String = record
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            let path = line.rsplitn(3, ',').nth(2).unwrap_or(line);
+            match path.strip_prefix(&info) {
+                Some("METADATA") => format!("{new_info}METADATA,sha256={hash},{}\n", metadata.len()),
+                Some("RECORD") => format!("{new_info}RECORD,,\n"),
+                _ => format!("{}{}\n", renamed(path), &line[path.len()..]),
+            }
+        })
+        .collect();
+    let out = wheel.with_file_name(format!("{distribution}-{stamped}-{tags}.whl"));
+    let mut writer = zip::ZipWriter::new(std::fs::File::create(&out)?);
+    for i in 0..archive.len() {
+        let entry = archive.by_index_raw(i).map_err(std::io::Error::other)?;
+        let name = entry.name().map_err(std::io::Error::other)?.into_owned();
+        if name != format!("{info}METADATA") && name != format!("{info}RECORD") {
+            writer.raw_copy_file_rename(entry, renamed(&name)).map_err(std::io::Error::other)?;
+        }
+    }
+    let options = zip::write::SimpleFileOptions::default();
+    writer.start_file(format!("{new_info}METADATA"), options).map_err(std::io::Error::other)?;
+    writer.write_all(metadata.as_bytes())?;
+    writer.start_file(format!("{new_info}RECORD"), options).map_err(std::io::Error::other)?;
+    writer.write_all(record.as_bytes())?;
+    writer.finish().map_err(std::io::Error::other)?;
+    std::fs::remove_file(wheel)?;
+    Ok(out)
 }
 
 /// The machine's three components after an update.
