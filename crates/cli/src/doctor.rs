@@ -137,7 +137,7 @@ pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
         record.print(ctx);
     }
     if !healthy {
-        output::next(ctx, &["cozy logs calcifer", "cozy machine logs local"]);
+        output::next(ctx, &["cozy machine logs local calcifer", "cozy machine logs local"]);
     }
     Ok(code)
 }

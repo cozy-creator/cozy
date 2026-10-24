@@ -101,7 +101,7 @@ impl Home {
         self.root.join("services")
     }
 
-    /// Tools cozy installed for this computer's own use (`cozy tools install`), never bundled.
+    /// Tools cozy fetched for this computer's own use on first need, never bundled.
     pub fn tools(&self) -> PathBuf {
         self.root.join("tools")
     }

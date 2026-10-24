@@ -25,12 +25,8 @@ pub struct Args {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Credit moves, newest first.
-    History {
-        /// Continue from this page's cursor.
-        #[arg(long)]
-        cursor: Option<String>,
-    },
+    /// Credit moves, newest first: the recent ones, or with `--json` every one.
+    History,
     /// Buy credit with a card.
     Buy {
         /// Dollars, such as 10 or 25.50.
@@ -48,7 +44,7 @@ pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
     let hub = ctx.hub()?;
     match args.command {
         None => balance(ctx, &hub).await,
-        Some(Command::History { cursor }) => history(ctx, &hub, cursor.as_deref()).await,
+        Some(Command::History) => history(ctx, &hub).await,
         Some(Command::Buy {
             usd,
             no_browser,
@@ -120,19 +116,25 @@ async fn balance(ctx: &Context, hub: &Hub) -> Result<ExitCode, Error> {
     Ok(ExitCode::SUCCESS)
 }
 
-async fn history(ctx: &Context, hub: &Hub, cursor: Option<&str>) -> Result<ExitCode, Error> {
+/// The newest page of moves on a terminal; with `--json`, every page.
+async fn history(ctx: &Context, hub: &Hub) -> Result<ExitCode, Error> {
     let client = ctx.hub_signed_in(hub)?;
-    let answer = client.list_balance_transactions(Some(CURRENCY), cursor, Some(50));
-    let page = hub_answer(answer.await)?;
-    let more = page
-        .next_cursor
-        .map(|c| format!("cozy credits history --cursor {c}"));
+    let (mut moves, mut cursor) = (vec![], None::<String>);
+    let more = loop {
+        let answer = client.list_balance_transactions(Some(CURRENCY), cursor.as_deref(), Some(50));
+        let page = hub_answer(answer.await)?;
+        moves.extend(page.data);
+        match (page.next_cursor, ctx.json) {
+            (Some(next), true) => cursor = Some(next),
+            (next, _) => break next.is_some(),
+        }
+    };
     if ctx.json {
-        output::json(&json!({ "hub": hub, "moves": page.data, "more": more }));
+        output::json(&json!({ "hub": hub, "moves": moves }));
         return Ok(ExitCode::SUCCESS);
     }
     let mut table = output::Table::new(ctx, ["WHEN", "TYPE", "AMOUNT", "SOURCE"]);
-    for m in &page.data {
+    for m in &moves {
         table = table.row([
             minute(&m.created_at),
             m.type_.clone(),
@@ -140,8 +142,8 @@ async fn history(ctx: &Context, hub: &Hub, cursor: Option<&str>) -> Result<ExitC
             m.source.clone(),
         ]);
     }
-    if let Some(more) = more {
-        table = table.note(format!("more: {more}"));
+    if more {
+        table = table.note("older moves: cozy credits history --json");
     }
     table.print();
     Ok(ExitCode::SUCCESS)

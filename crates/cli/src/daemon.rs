@@ -1,4 +1,4 @@
-//! `cozy status|logs`, and Calcifer's restart (`cozy update`, `cozy doctor`). Any cozy command starts
+//! `cozy status`, the logs `cozy machine logs` reads (Calcifer's too), and Calcifer's restart (`cozy update`, `cozy doctor`). Any cozy command starts
 //! Calcifer; restarting it never stops work: machines run what they accepted, and the next Calcifer
 //! resumes what it owed.
 use std::process::ExitCode;
@@ -103,41 +103,11 @@ fn word(value: impl serde::Serialize) -> String {
         .unwrap_or_default()
 }
 
-#[derive(clap::Args, Debug)]
-pub struct Logs {
-    /// Whose log.
-    #[arg(value_enum, default_value_t = Which::Calcifer)]
-    which: Which,
-    /// Keep printing as it is written.
-    #[arg(short, long)]
-    follow: bool,
-}
-
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum Which {
-    Calcifer,
-    Machine,
-}
-
-pub async fn logs(ctx: &Context, args: Logs) -> Result<ExitCode, Error> {
-    match args.which {
-        Which::Calcifer => calcifer_log(ctx, args.follow).await,
-        Which::Machine => {
-            let query = LogQuery {
-                log: LogName::Tensord,
-                follow: args.follow,
-                lines: 200,
-                since: None,
-            };
-            machine_log(ctx, "local", &query).await
-        }
-    }
-}
-
 /// Which of a machine's logs, and how much of it.
 #[derive(clap::Args, Debug)]
 pub struct LogQuery {
-    /// The machine's own log, or the TensorFS transport or memory log it keeps.
+    /// The machine's own log, the TensorFS transport or memory log it keeps, or (on `local`)
+    /// Calcifer's, this computer's controller.
     #[arg(value_enum, default_value_t = LogName::Tensord)]
     log: LogName,
     /// Keep printing as it grows.
@@ -156,6 +126,7 @@ enum LogName {
     Tensord,
     Tensorfs,
     Memory,
+    Calcifer,
 }
 
 impl LogName {
@@ -164,6 +135,7 @@ impl LogName {
             LogName::Tensord => "tensord",
             LogName::Tensorfs => "tensorfs",
             LogName::Memory => "memory",
+            LogName::Calcifer => "calcifer",
         }
     }
 }
@@ -181,6 +153,17 @@ pub(crate) async fn machine_log(
     name: &str,
     q: &LogQuery,
 ) -> Result<ExitCode, Error> {
+    if let LogName::Calcifer = q.log {
+        if name != "local" {
+            return Err(Error::new(
+                Kind::Usage,
+                "log_not_kept",
+                format!("{name} keeps no Calcifer log: Calcifer is this computer's"),
+            )
+            .next("cozy machine logs local calcifer"));
+        }
+        return calcifer_log(ctx, q).await;
+    }
     let path = format!("{}/logs/{}", crate::machine::route(name)?, q.log.as_str());
     let calcifer = ctx.calcifer().await?;
     let mut shown = Shown {
@@ -248,10 +231,10 @@ fn print_log_line(ctx: &Context, machine: &str, log: LogName, line: &str) {
     }
 }
 
-/// Calcifer's log, read from its file: there whether or not Calcifer is. Followed, each line as
-/// it is written, woken by a watch on its directory (`tail -F`, across a rotation to
-/// `calcifer.log.1`).
-async fn calcifer_log(ctx: &Context, follow: bool) -> Result<ExitCode, Error> {
+/// Calcifer's log, read from its file: there whether or not Calcifer is, its newest `lines` from
+/// the last `since`. Followed, each line as it is written, woken by a watch on its directory
+/// (`tail -F`, across a rotation to `calcifer.log.1`).
+async fn calcifer_log(ctx: &Context, q: &LogQuery) -> Result<ExitCode, Error> {
     let path = ctx.home.calcifer_log();
     if !path.exists() {
         return Err(Error::new(
@@ -272,13 +255,28 @@ async fn calcifer_log(ctx: &Context, follow: bool) -> Result<ExitCode, Error> {
         )
     };
     let log = Log::rotated(ctx.home.calcifer(), "calcifer.log");
-    if !follow {
-        let text = log.read(Start::Last(0)).map_err(|e| unreadable(&e))?;
-        text.lines().for_each(|line| print_line(ctx, line));
+    let start = Start::Last(q.lines as u64);
+    // Lines before `since` are skipped up to the first one stamped at or after it.
+    let mut cutoff = q
+        .since
+        .map(|window| Timestamp::now().saturating_sub(window).unwrap_or_default());
+    let mut emit = |text: &str| {
+        for line in text.lines().filter(|l| !l.is_empty()) {
+            if let Some(at) = cutoff {
+                if stamp(line).is_none_or(|stamped| stamped < at) {
+                    continue;
+                }
+                cutoff = None;
+            }
+            print_line(ctx, line);
+        }
+    };
+    if !q.follow {
+        emit(&log.read(start).map_err(|e| unreadable(&e))?);
         return Ok(ExitCode::SUCCESS);
     }
     let follow = log
-        .follow(Start::Last(0))
+        .follow(start)
         .map_err(|e| match e.is_unsupported() {
             true => Error::new(Kind::Unavailable, "log_follow_unsupported", e.to_string()),
             false => unreadable(&e),
@@ -294,7 +292,7 @@ async fn calcifer_log(ctx: &Context, follow: bool) -> Result<ExitCode, Error> {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => return Ok(ExitCode::SUCCESS),
             batch = batches.recv() => match batch {
-                Some(batch) => batch.text.lines().for_each(|line| print_line(ctx, line)),
+                Some(batch) => emit(&batch.text),
                 None => {
                     return match reading.await {
                         Ok(Err(e)) => Err(unreadable(&e)),

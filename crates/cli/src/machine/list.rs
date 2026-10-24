@@ -327,7 +327,7 @@ pub fn status_fields(status: &MachineStatus) -> Vec<(String, String)> {
                 if !toolchain.detail.is_empty() {
                     cell += &format!(" ({})", toolchain.detail);
                 }
-                cell += "; cozy machine toolchain install";
+                cell += "; it is fetched when a kernel first needs it";
                 if !toolchain.install.is_empty() {
                     cell += &format!(", and for a host compiler: {}", toolchain.install);
                 }

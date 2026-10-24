@@ -70,8 +70,6 @@ enum Command {
     Credits(credits::Args),
     /// Calcifer, machines and runs at a glance.
     Status(daemon::Status),
-    /// Calcifer's or a machine's log.
-    Logs(daemon::Logs),
     /// Replace this binary with the newest release.
     Update(update::Args),
     /// Print a shell completion script.
@@ -79,8 +77,6 @@ enum Command {
     /// Diagnose this computer's cozy (Calcifer, its service, the machine) and fix a stuck Calcifer;
     /// then a machine's driver, GPUs, toolchain and kernels.
     Doctor(doctor::Args),
-    /// The tools cozy uses on this computer, and installing the ones it fetches itself.
-    Tools(tools::Args),
 }
 
 /// Parses the command line, loads the config once, runs the verb and renders its refusal. Exit
@@ -149,10 +145,8 @@ async fn dispatch(ctx: &Context, command: Command) -> Result<ExitCode, Error> {
         Command::Hub(args) => hub::exec(ctx, args).await,
         Command::Credits(args) => credits::exec(ctx, args).await,
         Command::Status(args) => daemon::status(ctx, args).await,
-        Command::Logs(args) => daemon::logs(ctx, args).await,
         Command::Update(args) => update::exec(ctx, args).await,
         Command::Completion(args) => completion::exec(ctx, args).await,
         Command::Doctor(args) => doctor::exec(ctx, args).await,
-        Command::Tools(args) => tools::exec(ctx, args).await,
     }
 }

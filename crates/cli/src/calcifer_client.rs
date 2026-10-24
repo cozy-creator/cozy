@@ -395,7 +395,7 @@ impl Client {
                             "calcifer_start_failed",
                             format!("Calcifer exited ({status}) before it served"),
                         )
-                        .next("cozy logs calcifer")
+                        .next("cozy machine logs local calcifer")
                     }));
                 }
                 // Another Calcifer held the lock: wait for its record, or for it to let go.
@@ -404,7 +404,7 @@ impl Client {
             if reported.elapsed() >= REPORT {
                 reported = Instant::now();
                 self.say(&format!(
-                    "waiting for Calcifer to start ({}s so far); `cozy logs calcifer` shows what it is doing",
+                    "waiting for Calcifer to start ({}s so far); `cozy machine logs local calcifer` shows what it is doing",
                     began.elapsed().as_secs()
                 ));
             }
@@ -818,7 +818,7 @@ async fn envelope(answer: Response) -> Error {
     }
 }
 
-/// The steps of a start, each with its time, appended to Calcifer's log (`cozy logs calcifer`)
+/// The steps of a start, each with its time, appended to Calcifer's log (`cozy machine logs local calcifer`)
 /// beside Calcifer's own: a slow start names its slow step.
 struct Steps {
     log: PathBuf,

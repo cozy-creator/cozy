@@ -34,8 +34,8 @@ pub enum Class {
 /// How a missing tool is installed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Install {
-    /// A cozy verb: `cozy tools install uv`.
-    Cozy(&'static str),
+    /// cozy fetches its pinned build on first need.
+    Fetched,
     /// The OS package that carries it (`system_install` spells the command).
     System(&'static str),
     /// No package installs it alone: what to install, in words.
@@ -72,7 +72,7 @@ pub const TOOLS: &[Tool] = &[
         side: Side::Computer,
         class: Class::Essential,
         cost: "packages can't be authored, locked or published here",
-        install: Install::Cozy("cozy tools install uv"),
+        install: Install::Fetched,
         probe: uv,
     },
     Tool {
@@ -88,7 +88,7 @@ pub const TOOLS: &[Tool] = &[
         side: Side::Computer,
         class: Class::Optional,
         cost: "uploads go untrimmed (larger, slower)",
-        install: Install::Cozy("cozy tools install ffmpeg"),
+        install: Install::Fetched,
         probe: |tools, path| ffmpeg(tools, path).map(|(ffmpeg, _)| ffmpeg),
     },
     Tool {

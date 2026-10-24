@@ -83,11 +83,6 @@ enum Verb {
         #[arg(long, value_name = "SIZE|off", value_parser = gpu_memory_limit)]
         gpu_memory_limit: Option<u64>,
     },
-    /// A machine's build toolchain, for cards no prebuilt kernel serves.
-    Toolchain {
-        #[command(subcommand)]
-        verb: ToolchainVerb,
-    },
     /// Add another computer's machine by its address and TLS fingerprint.
     Add {
         name: String,
@@ -99,16 +94,6 @@ enum Verb {
     },
     /// On this computer: let the controller with this public key use this machine.
     Authorize { public_key: String },
-}
-
-#[derive(Subcommand, Debug)]
-enum ToolchainVerb {
-    /// Install CUDA's compiler, its headers and ninja on the machine (about 130 MB), as a run.
-    Install {
-        /// The machine.
-        #[arg(long, default_value = "local")]
-        on: String,
-    },
 }
 
 pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
@@ -131,9 +116,6 @@ pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
             tensord,
             gpu_memory_limit,
         } => end::update(ctx, &name, runtime, tensorfs, tensord, gpu_memory_limit).await,
-        Verb::Toolchain {
-            verb: ToolchainVerb::Install { on },
-        } => end::toolchain(ctx, &on).await,
         Verb::Authorize { public_key } => local::authorize(ctx, &public_key).await,
     }
 }

@@ -598,52 +598,6 @@ fn unapplied(name: &str, s: &MachineStatus, want: &[(&str, serde_json::Value)], 
     Error::new(Kind::Conflict, "update_unapplied", message).next(format!("cozy machine logs {name}"))
 }
 
-/// `cozy machine toolchain install`: CUDA's compiler, headers and ninja onto a machine, as an
-/// update run, so cards without a prebuilt kernel compile their own. Never run on its own: a run
-/// that would have used it says so and names this command.
-pub async fn toolchain(ctx: &Context, name: &str) -> Result<ExitCode, Error> {
-    let m = machine(ctx, name).await?;
-    if let Some(toolchain) = m.status.as_ref().and_then(|s| s.toolchain.as_ref())
-        && toolchain.state == "ready"
-    {
-        if ctx.json {
-            output::json(
-                &serde_json::json!({"machine": m.name, "changed": false, "toolchain": toolchain}),
-            );
-        } else {
-            output::say(
-                ctx,
-                &format!("{}'s toolchain is ready: {}", m.name, toolchain.nvcc),
-            );
-        }
-        return Ok(ExitCode::SUCCESS);
-    }
-    let hub = match m.hub.as_str() {
-        "" => ctx.hub()?,
-        origin => ctx.config.resolve(origin)?,
-    };
-    let payload = serde_json::json!({"toolchain": "install"});
-    let spec = v1::RunSpec {
-        kind: v1::RunKind::Update,
-        payload: Some(v1::Json::parse(payload.to_string()).expect("JSON")),
-        ..Default::default()
-    };
-    let submit = SubmitRun {
-        agreed: None,
-        on: On::Machine(m.name.clone()),
-        hub: hub.origin.into(),
-        kind: calcifer::Kind::Update,
-        target: "toolchain (CUDA 13.0 compiler, ninja)".into(),
-        spec,
-        inputs: vec![],
-        out: None,
-        warnings: vec![],
-    };
-    let submitted = crate::run::submit(ctx, submit, None).await?;
-    let run = crate::run::follow(ctx, submitted.run).await?;
-    Ok(crate::run::exit_code(&run))
-}
-
 /// A local wheel of `distribution` (or, empty, a `cozy` binary), measured once: its file name and
 /// what the run stages.
 fn wheel(path: &Path, distribution: &str) -> Result<(String, StagedInput), Error> {

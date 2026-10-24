@@ -80,7 +80,7 @@ pub struct GpuConfig {
     /// Explicitly configured locations; the executor seal is imposed on top of them.
     #[serde(default)]
     pub environment: BTreeMap<String, String>,
-    /// The machine's build toolchain (`cozy machine toolchain install`): once it holds nvcc,
+    /// The machine's build toolchain (fetched on a kernel's first need): once it holds nvcc,
     /// executors started after find it through CUDA_HOME and PATH.
     #[serde(default)]
     pub toolchain: Option<PathBuf>,

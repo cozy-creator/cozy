@@ -50,7 +50,7 @@ struct Cohort {
     tensord: Option<String>,
     /// The `cozy` binary as a CLI before 0.11.16 sends it: the `binary` input's file.
     binary: Option<String>,
-    /// `"install"`: the build toolchain, alone (`cozy machine toolchain install`).
+    /// `"install"`: the build toolchain, alone (a kernel's first need, `Updates::kernels`).
     toolchain: Option<String>,
     /// The `cozy` release the caller installed at the machine's launch path (`cozy update`).
     cozy: Option<String>,
