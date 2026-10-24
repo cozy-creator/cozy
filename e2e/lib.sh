@@ -66,7 +66,7 @@ user_services() {
 # spelling of the installed cozy (0.11.16 renamed --runtime-wheel/--tensorfs-wheel to --runtime/--tensorfs).
 candidates() {
   local args=() rt=--runtime tfs=--tensorfs
-  if cozy machine update --help | grep -q -- --runtime-wheel; then rt=--runtime-wheel tfs=--tensorfs-wheel; fi
+  if cozy machine update --help | grep -- --runtime-wheel > /dev/null; then rt=--runtime-wheel tfs=--tensorfs-wheel; fi
   [ -z "$CAND_COZY" ] || args+=(--tensord "$CAND_COZY")
   [ -z "$CAND_TFS" ] || args+=("$tfs" "$CAND_TFS")
   [ -z "$CAND_RT" ] || args+=("$rt" "$CAND_RT")
@@ -79,8 +79,13 @@ candidates() {
   machine_ready
 }
 
+# Whether this computer's cozy has `cozy machine <verb>`.
+has_verb() { cozy machine --help | grep -E "^ +$1 " > /dev/null; }
+
 # The local machine ends, as its idle exit ends it: the holder of its root's lock. The next use starts it.
+# A cozy before cl-646 disables it instead (machine_ready enables it again).
 machine_stop() {
+  if has_verb disable; then cozy --json machine disable > "$OUT/disable.json"; return; fi
   local pid
   pid=$(grep -o '"pid": *[0-9]*' "$HOME/.cozy/machine/var/lib/cozy/machine/agent.lock.holder" | grep -o '[0-9]*$') || return 1
   if [ "$RUNNER_OS" = Windows ]; then taskkill //F //T //PID "$pid"; else kill "$pid"; fi
@@ -89,8 +94,10 @@ machine_stop() {
 }
 
 # The local machine is up and reports itself (`machine show local` starts it); its record lands in
-# $OUT/machine.json.
+# $OUT/machine.json. A cozy before cl-646 (#1883; the installer's release until one carries it) makes its
+# machine with `cozy machine enable`; a later one starts it on first use.
 machine_ready() {
+  if has_verb enable; then cozy --json machine enable > "$OUT/enable.json" || check "cozy machine enable failed"; fi
   for _ in $(seq 120); do
     cozy --json machine show local > "$OUT/machine.json" 2>/dev/null && grep -q '"state": *"ready"' "$OUT/machine.json" && return 0
     sleep 5
