@@ -3156,7 +3156,7 @@ struct RequestFigures {
 impl Dispatched<'_> {
     fn record(&mut self, reply: &Frame, inventory: &[crate::machine::receipt::Gpu]) {
         let Some(value) = reply.memory.as_ref().and_then(|m| m.get("varena")) else { return };
-        let rows: Vec<GpuMeasurement> = match serde_json::from_value(value.clone()) {
+        let rows = match Vec::<GpuMeasurement>::deserialize(value) {
             Ok(rows) => rows,
             Err(error) => return tracing::warn!("memory: request {}'s final figures unread: {error}", self.id),
         };
