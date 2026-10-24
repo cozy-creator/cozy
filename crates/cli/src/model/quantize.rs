@@ -1,8 +1,10 @@
 //! `cozy model quantize`: the lane a named package's declared recipe writes from a checkpoint. A
 //! lane flag picks the package's recipe of that lane for this model; `--recipe` names one. The
-//! package is always named: packages that serve the same model can each declare a recipe for it.
+//! package is always named, a release or a local directory: packages that serve the same model
+//! can each declare a recipe for it.
 //! The package's `quantize` (the Runtime's) runs it on the machine, which writes the lane, its
 //! provenance in its header, and returns its checkpoint reference.
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use hub_client::types::ModelCatalogRelease;
@@ -18,6 +20,7 @@ use super::{Quantize, releases};
 use crate::Context;
 use crate::context::hub_answer;
 use crate::output::{self, Record};
+use crate::run::Callee;
 use crate::run::interface::{Interface, Recipe, RECIPES};
 
 /// A 16-bit lane: original weights a 4-bit lane may be written from.
@@ -115,15 +118,27 @@ fn not_on_hub(model: &ModelRef) -> Error {
         .next(format!("cozy model upload {model} <org/name>"))
 }
 
-/// The package named for the recipe: `org/name` and the release asked for, if any.
-fn package(args: &Quantize) -> Result<(String, Option<String>), Error> {
+/// The package named for the recipe: a release on the Hub, or local code nobody published.
+enum Named {
+    /// `org/name` and the release asked for, if any.
+    Hub(String, Option<String>),
+    /// A package directory, called as `cozy run ./dir` calls it.
+    Local(PathBuf),
+}
+
+fn package(args: &Quantize) -> Result<Named, Error> {
     let Some(named) = &args.package else {
         return Err(Error::new(Kind::Usage, "model_quantize_package",
             "name the package whose recipe writes the lane: packages that serve the same model can each declare one")
-            .remedy("add --package org/name[@release]"));
+            .remedy("add --package org/name[@release], or --package ./dir for a package not yet published"));
     };
+    if crate::run::target::local_path(named) {
+        let cwd = std::env::current_dir()
+            .map_err(|e| Error::new(Kind::Internal, "cwd", format!("the working directory: {e}")))?;
+        return Ok(Named::Local(cwd.join(named.trim())));
+    }
     let named = crate::package::PackageRef::parse(named)?;
-    Ok((named.package(), named.release))
+    Ok(Named::Hub(named.package(), named.release))
 }
 
 /// `name` as recipe names fold: `drafter-head` is `drafter_head`.
@@ -184,33 +199,46 @@ fn declared(interface: &Interface) -> String {
 }
 
 pub(crate) async fn quantize(ctx: &Context, args: Quantize) -> Result<ExitCode, Error> {
-    let (package, release) = package(&args)?;
+    let named = package(&args)?;
     let model = ModelRef::parse(&args.model)?;
     if matches!(model, ModelRef::Local(_) | ModelRef::Provider(_)) {
         return Err(not_on_hub(&model));
     }
     let destination = args.destination.as_deref().map(refs::destination).transpose()?;
     let hub = ctx.hub()?;
-    let card = crate::run::resolve(ctx, &hub, &package, release.as_deref()).await?.card;
-    let lane = lane(&args, &card.interface, &package)?;
+    let (card, prepared);
+    let callee = match &named {
+        Named::Hub(package, release) => {
+            card = crate::run::resolve(ctx, &hub, package, release.as_deref()).await?.card;
+            Callee::Release { package, card: &card }
+        }
+        Named::Local(path) => {
+            prepared = crate::run::local::prepare(ctx, path, args.placement.on(), false).await?;
+            Callee::Local(&prepared)
+        }
+    };
+    let interface = callee.interface();
+    let lane = lane(&args, interface, callee.package())?;
     let source = checkpoint(ctx, &hub, &model, &lane).await?;
-    let found = recipes(&card.interface, &lane, args.recipe.as_deref(), &source.components);
+    let found = recipes(interface, &lane, args.recipe.as_deref(), &source.components);
     if found.is_empty() {
         let what = args.recipe.as_deref().unwrap_or(&lane);
         return Err(Error::new(Kind::NotFound, "model_quantizer_not_found", format!(
-            "{package}@{} has no {what} recipe for this model ({})", card.release, source.components.join(", ")))
-            .remedy(declared(&card.interface)));
+            "{callee} has no {what} recipe for this model ({})", source.components.join(", ")))
+            .remedy(declared(interface)));
     }
     // The variant goes onto the tag's tree (main unless named): publishing the tag releases all.
+    // Local code's lane records its package as `local/<name>` and its release as the source's
+    // manifest digest: an unpublished recipe, exactly.
     let destination = destination.unwrap_or_else(|| format!("{}@main", source.repo));
     let mut terms = vec![source.spelled.clone(), destination.clone(), format!("lane={lane}"),
-        format!("package={package}"), format!("release={}", card.release)];
+        format!("package={}", callee.package()), format!("release={}", callee.release())];
     terms.extend(args.recipe.iter().map(|name| format!("recipe={name}")));
     // A calibration reads the original weights, never an encoded lane: the run takes 16 bits.
-    let calibrated = calibration(&card.interface, &found, &source.spelled);
+    let calibrated = calibration(interface, &found, &source.spelled);
     let bits = (!calibrated.is_empty()).then_some("16");
     terms.extend(calibrated);
-    let run = crate::run::call(ctx, &package, Some(&card.release), RECIPES, terms, bits, &args.placement, args.detach).await?;
+    let run = crate::run::call(ctx, &callee, RECIPES, terms, bits, &args.placement, args.detach).await?;
     if !ctx.json && run.status == Status::Completed {
         match written_checkpoint(&run, &lane) {
             Some(WrittenCheckpoint::Reference(reference)) => {

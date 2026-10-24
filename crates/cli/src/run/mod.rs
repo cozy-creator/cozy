@@ -28,7 +28,7 @@ pub(crate) mod local;
 mod play;
 mod show;
 mod spec;
-mod target;
+pub(crate) mod target;
 pub(crate) mod tree;
 mod upload;
 
@@ -314,22 +314,58 @@ pub(crate) async fn resolve(
     Ok(Resolved { card, from })
 }
 
-/// `cozy run <package>/<function>[@release] <inputs…> [--lane …] --on …` for another verb: `model
-/// quantize` runs a package's conversion this way. The run as it settled, or as sent with
-/// `detach`; its record is printed either way.
-#[allow(clippy::too_many_arguments)]
+/// What another verb's call runs: a package's release, or local code its machine installed.
+pub(crate) enum Callee<'a> {
+    Release { package: &'a str, card: &'a Card },
+    Local(&'a local::Prepared),
+}
+
+impl Callee<'_> {
+    /// The package as its runs name it: `org/name`, or `local/<name>`.
+    pub(crate) fn package(&self) -> &str {
+        match self {
+            Callee::Release { package, .. } => package,
+            Callee::Local(prepared) => prepared.package(),
+        }
+    }
+
+    pub(crate) fn interface(&self) -> &Interface {
+        match self {
+            Callee::Release { card, .. } => &card.interface,
+            Callee::Local(prepared) => prepared.interface(),
+        }
+    }
+
+    /// The code exactly: its release, or a local source's manifest digest.
+    pub(crate) fn release(&self) -> &str {
+        match self {
+            Callee::Release { card, .. } => &card.release,
+            Callee::Local(prepared) => prepared.source(),
+        }
+    }
+}
+
+impl std::fmt::Display for Callee<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Callee::Release { package, card } => write!(f, "{package}@{}", card.release),
+            Callee::Local(prepared) => f.write_str(prepared.package()),
+        }
+    }
+}
+
+/// `cozy run <package>/<function> <inputs…> [--lane …] --on …` for another verb: `model quantize`
+/// runs a package's recipes this way. The run as it settled, or as sent with `detach`; its record
+/// is printed either way.
 pub(crate) async fn call(
     ctx: &Context,
-    package: &str,
-    release: Option<&str>,
+    callee: &Callee<'_>,
     function: &str,
     inputs: Vec<String>,
     lane: Option<&str>,
     placement: &Placement,
     detach: bool,
 ) -> Result<Run, Error> {
-    let hub = ctx.hub()?;
-    let resolved = resolve(ctx, &hub, package, release).await?;
     let args = RunArgs {
         target: None,
         inputs,
@@ -347,7 +383,10 @@ pub(crate) async fn call(
         describe: false,
         idempotency_key: None,
     };
-    invoke(ctx, package, function, &resolved.card, args).await
+    match callee {
+        Callee::Release { package, card } => invoke(ctx, package, function, card, args).await,
+        Callee::Local(prepared) => prepared.call(ctx, function, args).await,
+    }
 }
 
 /// Binds the run's inputs to `function` of `card`, submits it pinned to `card`'s release, and
