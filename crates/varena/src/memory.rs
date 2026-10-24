@@ -849,7 +849,7 @@ struct Inner {
     grouped: Mutex<(Vec<Job>, Vec<Job>)>,
     burst: Arc<(Mutex<Burst>, Condvar)>,
     quiet: Arc<Quiet>,
-    ownership_lost: Arc<AtomicBool>,
+    ownership_lost: AtomicBool,
     public_owners: AtomicU64,
     #[cfg(unix)]
     tally: tensorfs::io::source::IoTally,
@@ -951,7 +951,7 @@ impl Memory {
                 grouped: Mutex::default(),
                 burst: Arc::new((Mutex::new(Burst::default()), Condvar::new())),
                 quiet: Arc::default(),
-                ownership_lost: Arc::new(AtomicBool::new(false)),
+                ownership_lost: AtomicBool::new(false),
                 public_owners: AtomicU64::new(0),
                 #[cfg(unix)]
                 tally: Default::default(),
@@ -1128,10 +1128,7 @@ impl Inner {
     fn guard<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
         self.check_ownership()?;
         let out = crate::caught(f);
-        if out.as_ref().err().is_some_and(Error::is_sticky) {
-            self.ownership_lost.store(true, Ordering::Release);
-            self.landed.notify_all();
-        }
+        if out.as_ref().err().is_some_and(Error::is_sticky) { self.ownership_lost.store(true, Ordering::Release); }
         if matches!(&out, Err(Error::Internal(m)) if m.starts_with("panic")) {
             self.recover();
         }
