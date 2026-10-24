@@ -187,6 +187,19 @@ fn public_root(entry: &Value) -> Result<(), Refused> {
     }
     Ok(())
 }
+/// The CLI's `%XX` file-name escape (`cozy model upload`), undone.
+fn unescape(name: &str) -> String {
+    let bytes = name.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match (bytes[i], name.get(i + 1..i + 3).and_then(|h| u8::from_str_radix(h, 16).ok())) {
+            (b'%', Some(byte)) => { out.push(byte); i += 3; }
+            (byte, _) => { out.push(byte); i += 1; }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
 fn refused(code: &'static str, message: impl Into<String>) -> Refused {
     Refused {
         code,
@@ -391,6 +404,29 @@ impl Runs {
     /// checkpoint this machine holds (a run's weights output, a `local/` alias) found. With a
     /// weights destination the one choice is put there: a `local/` alias held by name, or a
     /// repository at the run's TensorFS endpoint.
+    /// A written file (`object://sha256:<hex>/<name>`, `cozy model upload ./model.safetensors`) as the
+    /// import reads it: the signer's stored object, linked under its file's name (the name is its
+    /// format to the import). Any other source is the import's as it is.
+    fn written_source(&self, actor: &str, source: &str) -> Result<String, Refused> {
+        let Some(rest) = source.strip_prefix("object://") else {
+            return Ok(source.to_string());
+        };
+        let (digest, name) = rest.split_once('/').unwrap_or((rest, ""));
+        let name = unescape(name);
+        let unwritten = || refused("input_unwritten", format!("{source} was not written to this machine"));
+        if name.is_empty() || name.contains(['/', '\\']) || name.starts_with('.') {
+            return Err(refused("invalid_request", format!("{source} names no file")));
+        }
+        let (object, _) = self.objects.path(actor, digest)?.ok_or_else(unwritten)?;
+        let dir = self.publisher.store().root().join("tmp").join(format!("written-{}", digest.trim_start_matches("sha256:")));
+        std::fs::create_dir_all(&dir)?;
+        let file = dir.join(&name);
+        if !file.is_file() {
+            std::fs::hard_link(&object, &file).or_else(|_| std::fs::copy(&object, &file).map(drop))?;
+        }
+        Ok(file.display().to_string())
+    }
+
     fn warm_models(
         &self,
         actor: &str,
@@ -435,7 +471,8 @@ impl Runs {
                     "tree": folder.tree.id(), "variants": folder.variants});
                 (folder.header.clone(), Some(folder.tree.clone()), row)
             } else if !choice.source.is_empty() {
-                let made = publisher.make_source(&choice.source, &choice.profiles, &spec.providers, stop, observe)?;
+                let source = self.written_source(actor, &choice.source)?;
+                let made = publisher.make_source(&source, &choice.profiles, &spec.providers, stop, observe)?;
                 let row = json!({"parameter": choice.parameter, "source": choice.source,
                     "resolved": made.resolved, "profiles": made.profiles,
                     "repository": made.repository, "checkpoint": made.header.id()});
