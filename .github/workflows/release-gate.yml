@@ -26,6 +26,10 @@ on:
         description: "A cozy-creator/packages commit whose package directories run in place of the published packages"
         type: string
         default: ''
+      pins:
+        description: "Exact package releases the cells run, name@release,… (a candidate is published and yanked)"
+        type: string
+        default: ''
       changed:
         description: "For selection: '<repo> <base> <head>', or '<repo> <head>' (base: its previous release). Empty: everything"
         type: string
@@ -61,6 +65,7 @@ on:
       runtime_wheel: { type: string, default: '' }
       tensorfs_wheel: { type: string, default: '' }
       packages_ref: { type: string, default: '' }
+      pins: { type: string, default: '' }
       changed: { type: string, default: '' }
       skus: { type: string, default: '' }
       only: { type: string, default: '' }
@@ -68,7 +73,7 @@ on:
       stress: { type: boolean, default: false }
       publish: { type: boolean, default: true }
       nonce: { type: string, default: '' }
-run-name: release-gate ${{ inputs.cozy }} ${{ inputs.runtime_wheel }} ${{ inputs.tensorfs_wheel }} ${{ inputs.packages_ref }} ${{ inputs.nonce }}
+run-name: release-gate ${{ inputs.cozy }} ${{ inputs.runtime_wheel }} ${{ inputs.tensorfs_wheel }} ${{ inputs.packages_ref }} ${{ inputs.pins }} ${{ inputs.nonce }}
 
 # Callers grant contents: write and actions: read; only the baseline job, in this repo, writes.
 jobs:
@@ -194,7 +199,9 @@ jobs:
           elif [ "$COZY" = released ]; then
             curl -LsSf https://tensorhub.com/install.sh | sh
           elif [[ $COZY == v* ]]; then
+            # A release tag, a prerelease candidate's too: its binary is this runner's cozy and the pod's TensorD.
             curl -LsSf "https://github.com/cozy-creator/cozy-creator/releases/download/$COZY/cozy-installer.sh" | sh
+            args+=(--tensord "$bin/cozy")
           else
             gh run download "$COZY" -R cozy-creator/cozy-creator -p 'cozy-*' -D dev
             install -m 0755 dev/cozy-*/cozy-linux-x86_64 "$bin/cozy"; args+=(--tensord "$bin/cozy")
@@ -237,9 +244,11 @@ jobs:
           STRESS: ${{ needs.select.outputs.stress }}
           ESTABLISH: ${{ inputs.establish }}
           PACKAGES: ${{ inputs.packages_ref != '' && 'packages' || '' }}
+          PINS: ${{ inputs.pins }}
         run: |
           read -ra args <<< "$ARGS"
           [ -z "$ONLY" ] || args+=(--only "$ONLY")
+          [ -z "$PINS" ] || args+=(--pins "$PINS")
           [ -z "$PACKAGES" ] || args+=(--packages "$PACKAGES")
           [ "$ESTABLISH" != true ] || args+=(--establish)
           if [ -n "$STRESS" ]; then

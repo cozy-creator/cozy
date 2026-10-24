@@ -145,7 +145,8 @@ if im is not None:
     white = (np.asarray(im.convert('L')) > 245).mean(); notes.append(f'birefnet: white background {white:.0%}')
     if white < 0.05: fails.append(f'birefnet: no white background ({white:.1%})')
 if 'describer' in recs:
-    texts = [s for d in walk(recs['describer'].get('result')) for s in d.values() if isinstance(s, str) and len(s) > 20]
+    texts = [s for d in walk(recs['describer'].get('result')) for v in d.values() for s in (v if isinstance(v, list) else [v])
+             if isinstance(s, str) and len(s) > 20]
     if not texts: fails.append('describer: no description text')
 for n, min_h, min_frames in (('h3', 700, 300), ('seedvr2', 1000, 20)):
     c = summary.get(n)

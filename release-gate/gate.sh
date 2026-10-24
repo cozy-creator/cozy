@@ -3,11 +3,14 @@
 # first-party package. Any FAIL blocks the publish. Runs by hand through the default ~/.cozy, and from
 # .github/workflows/release-gate.yaml on a runner signed in with `cozy login --key`.
 #   gate.sh <SKU> [--out DIR] [--establish] [--publish] [--runtime-wheel F|URL] [--tensorfs-wheel F|URL]
-#           [--tensord BIN|URL] [--packages DIR] [--cells FILE]... [--only cell,cell] [--cli BIN] [--disk GB]
+#           [--tensord BIN|URL] [--packages DIR] [--pins name@release,...] [--cells FILE]... [--only cell,cell]
+#           [--cli BIN] [--disk GB]
 # One FRESH rental. The candidate goes on with `cozy machine update` (a new executor), then each cell runs ONCE
 # with a scenario prompt from scenarios.tsv and fresh seeds: H3 first at the product shape (15 s ref2va_turbo,
 # cold executor), SeedVR2 on its first second, every image package's default call, then a restart and one SDXL
-# in the second executor. --packages runs a packages checkout's dirs in place of the published packages.
+# in the second executor. A cell runs the root (first-party) package users get; --pins runs exact releases of
+# them instead (a yanked candidate installs by its exact pin), --packages a packages checkout's dirs.
+# candidate.json records the set the verdict is for (release-gate/verify.sh reads it before a promotion).
 # analyze.py holds each cell against the SKU's baseline, gate-<SKU>.json on the `release-gate-baselines`
 # release; a SKU with none needs --establish. --publish uploads a PASS as the SKU's new baseline.
 set -uo pipefail
@@ -18,7 +21,7 @@ if [ "${1:-}" != --copy ]; then
 fi
 HERE=$2; shift 2
 REPO=cozy-creator/cozy-creator TAG=release-gate-baselines
-SKU=$1; shift; CAND=() ONLY= EXTRA=() CLI=cozy DISK=400 OUT= PKGS= ESTABLISH= PUBLISH=
+SKU=$1; shift; CAND=() ONLY= EXTRA=() CLI=cozy DISK=400 OUT= PKGS= ESTABLISH= PUBLISH= PINS=
 RT= TFS= BIN=
 ver() { basename "${1%%#*}" | cut -d- -f2; }
 while [ $# -gt 0 ]; do
@@ -31,6 +34,7 @@ while [ $# -gt 0 ]; do
     --cli) CLI=$2;;
     --disk) DISK=$2;;
     --packages) PKGS=$(cd "$2" && pwd);;
+    --pins) PINS=",$2,";;
     --runtime-wheel) RT=$(ver "$2"); CAND+=("$1" "$2");;
     --tensorfs-wheel) TFS=$(ver "$2"); CAND+=("$1" "$2");;
     --tensord) if [ -f "$2" ]; then BIN=$("$2" --version | awk '{print $2}'); else BIN=$2; fi; CAND+=("$1" "$2");;
@@ -40,10 +44,21 @@ done
 SW=$(curl -sf https://tensorhub.com/v1/software | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["cozy"], d["runtime"], d["tensorfs"])')
 [ -n "$SW" ] || { echo "no /v1/software"; exit 1; }
 read -r C0 R0 T0 <<< "$SW"
-LABEL=cozy${BIN:-$C0}-rt${RT:-$R0}-tfs${TFS:-$T0}${PKGS:+-packages$(git -C "$PKGS" rev-parse --short HEAD)}
+LABEL=cozy${BIN:-$C0}-rt${RT:-$R0}-tfs${TFS:-$T0}${PKGS:+-packages$(git -C "$PKGS" rev-parse --short HEAD)}${PINS:+-pins$(cksum <<< "$PINS" | cut -d' ' -f1)}
 OUT=${OUT:-$PWD/gate-$SKU-$LABEL-$(date -u +%Y%m%dT%H%MZ)}
 B=$OUT/baseline
 mkdir -p "$B"; cd "$OUT"; : > cells.tsv; echo "$LABEL" > label
+digest() { case $1 in *'#sha256='*) echo "${1##*#sha256=}";; '') ;; *) [ -f "$1" ] && sha256sum "$1" | cut -d' ' -f1;; esac; }
+TD=; for ((i = 0; i < ${#CAND[@]}; i += 2)); do [ "${CAND[i]}" != --tensord ] || TD=${CAND[i+1]}; done
+RW=; TW=; for ((i = 0; i < ${#CAND[@]}; i += 2)); do case ${CAND[i]} in --runtime-wheel) RW=${CAND[i+1]};; --tensorfs-wheel) TW=${CAND[i+1]};; esac; done
+python3 - "$LABEL" "$BIN" "$(digest "$TD")" "$(basename "${RW%%#*}")" "$(digest "$RW")" "$(basename "${TW%%#*}")" "$(digest "$TW")" \
+  "${PINS//,/ }" "${PKGS:+$(git -C "$PKGS" rev-parse HEAD)}" > candidate.json <<'PY'
+import json, sys
+label, cozy, cozy_sha, rt, rt_sha, tfs, tfs_sha, pins, packages = sys.argv[1:]
+print(json.dumps({"label": label, "cozy": cozy, "cozy_sha256": cozy_sha, "runtime_wheel": rt, "runtime_sha256": rt_sha,
+                  "tensorfs_wheel": tfs, "tensorfs_sha256": tfs_sha, "pins": sorted(pins.split()), "packages_ref": packages},
+                 indent=1, sort_keys=True))
+PY
 log() { echo "$(date -u +%H:%M:%SZ) $*" | tee -a gate.log; }
 gh release download "$TAG" -R "$REPO" -D "$B" -p "gate-$SKU.json" -p "ref-$SKU.*" -p "ref-$SKU-clip.mp4" 2>/dev/null
 if [ -f "$B/gate-$SKU.json" ]; then
@@ -78,12 +93,15 @@ cell() {
   printf '%s\t%s\t%s\n' "$name" "$target" "${n:-none}" >> cells.tsv
   log "$name run ${n:-none} $(grep -o '"status":"[a-z_]*"' "$name.ndjson" | tail -1)"
 }
-# pkg <package> <fn>: the published package's function, or the --packages checkout's directory of it.
+# pkg <package> <fn>: the root package's function users get, its --pins release, or the --packages checkout's dir.
 pkg() {
-  if [ -n "$PKGS" ] && [ -f "$PKGS/$1/package.toml" ]; then ln -sfn "$PKGS/$1" "$OUT/$1"; echo "./$1/$2"; else echo "fidika/$1/$2"; fi
+  local pin; pin=$(tr , '\n' <<< "$PINS" | grep -m1 "^$1@" | cut -d@ -f2)
+  if [ -n "$pin" ]; then echo "$1/$2@$pin"
+  elif [ -n "$PKGS" ] && [ -f "$PKGS/$1/package.toml" ]; then ln -sfn "$PKGS/$1" "$OUT/$1"; echo "./$1/$2"
+  else echo "$1/$2"; fi
 }
 output() { local n; n=$(awk -F'\t' -v c="$1" '$1==c{print $3}' cells.tsv); ls ~/.cozy/outputs/*/"$n"-* 2>/dev/null | grep -E "\.($2)$" | head -1; }
-log "gate $LABEL on $SKU: scenario $NAME, seeds from $R, candidate: ${CAND[*]:-released}${PKGS:+ packages $PKGS}, cli: $CLI"
+log "gate $LABEL on $SKU: scenario $NAME, seeds from $R, candidate: ${CAND[*]:-released}${PKGS:+ packages $PKGS}${PINS:+ pins ${PINS//,/ }}, cli: $CLI"
 "$CLI" machine rent "$SKU" --disk-gb "$DISK" -y --json >rent.json 2>rent.err
 M=$(python3 -c 'import json,sys
 t = open(sys.argv[1]).read(); dec = json.JSONDecoder(); i = 0
@@ -111,7 +129,7 @@ cell qwen "$(pkg qwen-image-2 generate)" seed:=$((R + 5)) prompt="This is an RGB
 cell anima "$(pkg anima generate)" prompt="masterpiece, best quality, anime illustration of $CHAR" seed:=$((R + 6))
 K=$(output klein 'png|webp|jpg')
 cell birefnet "$(pkg birefnet remove_background)" --asset image="$K"
-cell describer "$(pkg character-describer describe_character)" --asset image="$K"
+cell describer "$(pkg qwen3.5 ask)" prompt="Describe this character: appearance, clothing and pose." --asset images="$K"
 # More cells (`--cells FILE`): `name<TAB>target<TAB>args`, args expanded here ($SCENE, $CHAR, $R, $K, $M, $CLI ...).
 for f in "${EXTRA[@]}"; do
   [[ $f == *.sh ]] && continue
