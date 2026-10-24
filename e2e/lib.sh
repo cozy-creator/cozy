@@ -103,6 +103,24 @@ calcifer_stuck() {
   [ -z "$stat" ] || [ "${stat#Z}" != "$stat" ] || check "the stuck Calcifer $pid still runs ($stat)"
 }
 
+# Calcifer stopped while the machine it started runs on (run 40071937261: the next Calcifer could not take
+# the home until that machine idled out, 15 min). `cozy doctor` must recover at once: name what holds
+# Calcifer's lock, end it, start Calcifer, and the next run must go.
+calcifer_orphaned() {
+  [ "$RUNNER_OS" != Windows ] || return 0
+  local pid began
+  machine_ready
+  pid=$(grep -o '"pid": *[0-9]*' "$HOME/.cozy/calcifer/calcifer.lock.holder" 2> /dev/null | grep -o '[0-9]*$')
+  [ -n "$pid" ] || { check "no Calcifer pid to stop"; return 1; }
+  kill -TERM "$pid"
+  for _ in $(seq 60); do kill -0 "$pid" 2> /dev/null || break; sleep 1; done
+  ls -l /proc/*/fd 2> /dev/null | grep -c calcifer.lock > "$OUT/orphan-fds.txt" || true
+  began=$(date +%s)
+  timeout 600 "$COZY" --json doctor > "$OUT/doctor-orphaned.json" || check "cozy doctor did not recover Calcifer after an orphaned machine ($(( $(date +%s) - began )) s)"
+  [ $(( $(date +%s) - began )) -lt 120 ] || check "cozy doctor took $(( $(date +%s) - began )) s to recover Calcifer"
+  grep -o '"fixed": *"[^"]*"' "$OUT/doctor-orphaned.json" || true
+}
+
 # Removing cozy as the README's "Remove cozy" says, for this OS: nothing of cozy is left.
 remove_cozy() {
   case $RUNNER_OS in
