@@ -392,11 +392,7 @@ impl Codec {
         let mut command = std::process::Command::new(&self.config.python);
         platform::process::inherit_nothing(&mut command);
         command
-            .args([
-                "-I",
-                "-c",
-                include_str!("../python/tensord_client/device_codec.py"),
-            ])
+            .args(["-I", "-m", "cozy_runtime.cli.main", "frame-codec"])
             .env_clear()
             .envs(&self.config.environment)
             .stdin(Stdio::piped())
@@ -426,8 +422,8 @@ impl Codec {
             output: std::io::BufReader::new(output),
         })
     }
-    /// Encodes `frames` with the SDK's `encode_frame`, each into its owned spool name: the
-    /// media type of each, by handle.
+    /// Encodes `frames` with the Runtime's `cozy-runtime frame-codec`, each into its owned spool
+    /// name: the media type of each, by handle.
     fn encode(&self, spool: &Path, frames: &[HostFrame]) -> io::Result<BTreeMap<String, String>> {
         use std::io::BufRead;
         #[derive(Serialize)]

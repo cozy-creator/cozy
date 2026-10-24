@@ -85,9 +85,8 @@ sentinel. Observations never authorize kills.
 - `ok`, `outcome.terminal == "succeeded"`, `quiescent` and an empty `poisoned`;
 - `result.canonical` in the spool, opened `O_PATH`/`NOFOLLOW`, matching `result_ref` SHA-256 and length.
 
-`postprocess(codec, spool, reply)` runs `device_codec.py` with the generation's Python (`-I`, env
-cleared, spool passed as an fd). It reuses the SDK's `encode_frame` and its own
-`blob_path` resolver to encode deferred host frames and bind outputs. Each
+`postprocess(codec, spool, reply)` runs the Runtime's `cozy-runtime frame-codec` with the generation's Python (`-I`, env
+cleared) to encode deferred host frames, then binds outputs. Each
 `AssetBinding` carries `output_id`, `asset_ref`, spool `name`, `kind`, `media_type` and `length`;
 neither encoder reads an output's bytes. The root then takes durable custody, which hashes each
 file once as it copies it, before reporting success.

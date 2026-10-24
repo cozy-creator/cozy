@@ -121,8 +121,7 @@ code is still not sandboxed.
 
 | Module | Role |
 |---|---|
-| `packages.py`, `captured_packages.py`, `installer.py`, `package_records.py`, `runtime_describe.py` | Static description and uv generation install (`python -m tensord_client.installer`) |
-| `device_codec.py` | Output encoder, embedded into `device_executor.rs` with `include_str!` |
+| `packages.py`, `captured_packages.py`, `installer.py`, `package_records.py` | uv generation install (`python -m tensord_client.installer`); descriptions come from the generation's own Runtime (`cozy-runtime machine-describe`) |
 
 ## Contracts
 
