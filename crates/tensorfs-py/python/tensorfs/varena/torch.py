@@ -15,6 +15,7 @@ top-level forward is a pass: the plan's cursor, and its arena's peak.
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import json
 import os
 import sys
@@ -569,7 +570,11 @@ class Memory:
             if w.keys is None or key in w.keys:
                 owned.setdefault(_block_of(key, paths), []).append(f"{w.component}/{key}")
         order = [p for p in ("", *paths) if p in owned]
-        name = f"{w.release or w.ck.id}/{w.component}"
+        # A set is one checkpoint's component as one module builds it: two models of a release that share a
+        # component name (two DiTs' `transformer`, two LoRAs' `model`) are two sets, and so are two modules
+        # building other keys of one checkpoint (a text encoder without the head beside the whole LM).
+        built = "" if w.keys is None else "#" + hashlib.sha256("\n".join(sorted(w.keys)).encode()).hexdigest()[:12]
+        name = f"{w.release}/{w.ck.id}/{w.component}{built}" if w.release else f"{w.ck.id}/{w.component}{built}"
         set = Set(name, w.ck, [owned[p] for p in order], fill=_fill(declared.fill), release=w.release, shard=w.shard, gpu=self.gpu.uuid)
         model = Model(self, module, declared, name, set, self.native.load(set, level))
         for region, path in enumerate(order):
