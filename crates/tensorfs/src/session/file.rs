@@ -240,6 +240,7 @@ struct Map {
 #[cfg(unix)]
 #[allow(unsafe_code)]
 unsafe impl Send for Map {}
+// SAFETY: as above.
 #[cfg(unix)]
 #[allow(unsafe_code)]
 unsafe impl Sync for Map {}

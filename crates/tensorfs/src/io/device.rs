@@ -42,6 +42,7 @@ impl Event {
     fn new(ctx: CUcontext, timing: bool) -> cuda::Result<Event> {
         let _ctx = CtxGuard::enter(ctx)?;
         let mut raw = std::ptr::null_mut();
+        // SAFETY: `raw` is a writable out-pointer and the event's context is current.
         cuda::check("cuEventCreate", unsafe {
             (cuda::driver()?.event_create)(
                 &mut raw,
@@ -56,18 +57,21 @@ impl Event {
     }
     fn record(&self, stream: CUstream) -> cuda::Result<()> {
         let _ctx = CtxGuard::enter(self.ctx)?;
+        // SAFETY: a live event and stream of this context, which is current.
         cuda::check("cuEventRecord", unsafe {
             (cuda::driver()?.event_record)(self.raw, stream)
         })
     }
     fn sync(&self) -> cuda::Result<()> {
         let _ctx = CtxGuard::enter(self.ctx)?;
+        // SAFETY: a live event of this context, which is current.
         cuda::check("cuEventSynchronize", unsafe {
             (cuda::driver()?.event_synchronize)(self.raw)
         })
     }
     fn since(&self, start: &Event) -> cuda::Result<u64> {
         let mut ms = 0.0f32;
+        // SAFETY: `ms` is writable and both events are live.
         cuda::check("cuEventElapsedTime", unsafe {
             (cuda::driver()?.event_elapsed_time)(&mut ms, start.raw, self.raw)
         })?;
@@ -78,6 +82,7 @@ impl Event {
 impl Drop for Event {
     fn drop(&mut self) {
         if let (Ok(d), Ok(_ctx)) = (cuda::driver(), CtxGuard::enter(self.ctx)) {
+            // SAFETY: the event is live in this context, which is current; destroyed once, here.
             unsafe { (d.event_destroy)(self.raw) };
         }
     }
@@ -94,6 +99,7 @@ impl Slot {
     fn new(ctx: CUcontext) -> cuda::Result<Slot> {
         let done = Event::new(ctx, false)?;
         let mut ptr = std::ptr::null_mut();
+        // SAFETY: `ptr` is a writable out-pointer and the slot's context is current.
         cuda::check("cuMemHostAlloc", unsafe {
             (cuda::driver()?.mem_host_alloc)(&mut ptr, PIECE, cuda::MEMHOSTALLOC_PORTABLE)
         })?;
@@ -117,6 +123,7 @@ impl Drop for Slot {
                 // rather than free an unproved in-flight stage during unwinding.
                 return;
             }
+            // SAFETY: this slot allocated `ptr` and every copy using it has completed (checked above).
             unsafe { (d.mem_free_host)(self.ptr.cast()) };
         }
     }
@@ -205,6 +212,7 @@ impl DeviceBuffer {
         let _ctx = CtxGuard::enter(engine.ctx)?;
         let mut ptr = 0;
         if len != 0 {
+            // SAFETY: `ptr` is a writable out-pointer and the engine's context is current.
             cuda::check("cuMemAlloc", unsafe {
                 (cuda::driver()?.mem_alloc)(&mut ptr, len)
             })?;
@@ -232,6 +240,7 @@ impl Drop for DeviceBuffer {
     fn drop(&mut self) {
         if self.ptr != 0 {
             if let (Ok(d), Ok(_ctx)) = (cuda::driver(), CtxGuard::enter(self.engine.ctx)) {
+                // SAFETY: this buffer allocated `ptr` in the engine's context, which is current; freed once, here.
                 unsafe { (d.mem_free)(self.ptr) };
             }
         }
@@ -329,7 +338,9 @@ pub(super) fn retain_decode(stream: Option<cuda::Stream>, buffers: Vec<DeviceBuf
 }
 
 // Handles are used only after entering their primary context; calls on a stream are ordered.
+// SAFETY: handles are used only after entering their primary context, and calls on one stream are ordered by its lock.
 unsafe impl Send for Engine {}
+// SAFETY: as above.
 unsafe impl Sync for Engine {}
 
 impl Engine {
@@ -389,6 +400,7 @@ impl Engine {
     fn wait(&self, event: &Event, streams: usize) -> cuda::Result<()> {
         let _ctx = CtxGuard::enter(self.ctx)?;
         for stream in &self.streams[..streams] {
+            // SAFETY: a live stream and event of this engine's context, which is current.
             cuda::check("cuStreamWaitEvent", unsafe {
                 (cuda::driver()?.stream_wait_event)(stream.raw() as CUstream, event.raw, 0)
             })?;
@@ -552,11 +564,13 @@ impl Engine {
                 if !staged_host {
                     if let (Src::Host(ptr), Dst::Device { .. }) = (c.src, c.dst) {
                         let reused = self.reused(ptr as usize, c.dst.len());
+                        // SAFETY: `ptr` is the caller's live host source for this read (read's contract).
                         if unsafe { cuda::registered(ptr) }.map_err(|e| failed(copy, e))? {
                             direct = true;
                         } else if reused {
                             let start = Instant::now();
                             let pin =
+                                // SAFETY: `[ptr, ptr+len)` is the caller's live host source until the copy completes (read's contract).
                                 unsafe { cuda::pin_region(ptr.cast_mut(), c.dst.len(), true) };
                             tally
                                 .pin_ns
@@ -751,6 +765,7 @@ impl Engine {
                     threads: 1,
                     ..opts.clone()
                 };
+                // SAFETY: the staging slot is this engine's own and the source is the caller's (read's contract).
                 let stats = unsafe { host::fill(&[copy], &options) }.map_err(|e| Error {
                     copy: job.copy,
                     source: e.source,
@@ -759,6 +774,7 @@ impl Engine {
                 tally.cached.fetch_add(stats.cached, Relaxed);
                 tally.bounced.fetch_add(stats.bounced, Relaxed);
             }
+            // SAFETY: the host source covers `job.at + job.len` bytes (read's contract) and the slot holds `PIECE >= job.len`.
             Src::Host(ptr) => unsafe {
                 std::ptr::copy_nonoverlapping(ptr.add(job.at), slot.ptr, job.len)
             },
@@ -767,9 +783,11 @@ impl Engine {
         }
         let _queue = self.queues[lane].lock().unwrap();
         let rc = match (job.c.src, job.c.dst) {
+            // SAFETY: the device destination covers `job.at + job.len` bytes and the slot stays pending until the event syncs.
             (_, Dst::Device { ptr, .. }) => unsafe {
                 (d.memcpy_htod_async)(ptr + job.at as u64, slot.ptr.cast(), job.len, stream)
             },
+            // SAFETY: the device source covers `job.at + job.len` bytes and the slot stays pending until the event syncs.
             (Src::Device { ptr, .. }, Dst::Host { .. }) => unsafe {
                 (d.memcpy_dtoh_async)(slot.ptr.cast(), ptr + job.at as u64, job.len, stream)
             },
@@ -783,6 +801,7 @@ impl Engine {
         if let Dst::Host { ptr, .. } = job.c.dst {
             slot.done.sync().map_err(|e| failed(job.copy, e))?;
             slot.pending = false;
+            // SAFETY: the copy into the slot completed (synced above); the host destination covers `job.at + job.len` bytes.
             unsafe { std::ptr::copy_nonoverlapping(slot.ptr, ptr.add(job.at), job.len) };
         }
         tally.staged.fetch_add(job.len as u64, Relaxed);

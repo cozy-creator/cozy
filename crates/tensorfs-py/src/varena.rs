@@ -948,6 +948,7 @@ unsafe extern "C" fn deleter(t: *mut DLManagedTensor) {
     if !t.is_null() {
         // SAFETY: both boxes were leaked by `__dlpack__` and are freed exactly once, here.
         let m = unsafe { Box::from_raw(t) };
+        // SAFETY: as above.
         drop(unsafe { Box::from_raw(m.manager_ctx as *mut Tensor) });
     }
 }

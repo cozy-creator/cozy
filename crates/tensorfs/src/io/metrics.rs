@@ -189,6 +189,7 @@ impl Drop for PrimaryContext {
     fn drop(&mut self) {
         if let Ok(driver) = cuda::driver() {
             // Balances this probe's successful primary-context retain.
+            // SAFETY: balances this probe's successful primary-context retain.
             unsafe { (driver.primary_ctx_release)(self.0) };
         }
     }
@@ -234,6 +235,7 @@ impl Drop for Probe {
             return;
         };
         // Every private stream has a checked completion proof before either allocation frees.
+        // SAFETY: the probe allocated both buffers in its context, and every stream completed (checked above).
         unsafe {
             if owners.dev != 0 {
                 (driver.mem_free)(owners.dev);
@@ -257,6 +259,7 @@ fn measure_h2d(device: i32, ctx: cuda::CUcontext, retained: PrimaryContext) -> R
         streams: Vec::new(),
     })));
     let p = probe.0.as_mut().expect("probe owners live");
+    // SAFETY: out-pointers into the probe's owned record; its context is current.
     unsafe {
         cuda::check(
             "cuMemHostAlloc",
@@ -273,6 +276,7 @@ fn measure_h2d(device: i32, ctx: cuda::CUcontext, retained: PrimaryContext) -> R
         let t = Instant::now();
         for (i, stream) in p.streams[..n].iter().enumerate() {
             // Both ranges lie inside the owned probe allocations.
+            // SAFETY: both ranges lie inside the probe's own allocations, which outlive the synced copies.
             cuda::check("cuMemcpyHtoDAsync", unsafe {
                 (driver.memcpy_htod_async)(
                     p.dev + (i * piece) as u64,

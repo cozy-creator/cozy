@@ -157,6 +157,7 @@ pub unsafe fn into(
                     let bytes = if p.len == 0 {
                         &[]
                     } else {
+                        // SAFETY: caller owns each checked host span (contract above); empty spans are never read.
                         unsafe { std::slice::from_raw_parts(ptr, p.len) }
                     };
                     (
@@ -174,6 +175,7 @@ pub unsafe fn into(
                 unreachable!("placement checked")
             };
             if !decoded.is_empty() {
+                // SAFETY: the output span was checked to hold `decoded.len()` bytes and is the caller's exclusive destination.
                 unsafe { std::ptr::copy_nonoverlapping(decoded.as_ptr(), ptr, decoded.len()) };
             }
             Ok(())
@@ -307,6 +309,7 @@ struct Module {
 impl Drop for Module {
     fn drop(&mut self) {
         if let (Ok(driver), Ok(_context)) = (cuda::driver(), CtxGuard::enter(self.context as _)) {
+            // SAFETY: the module was loaded in this context, which is current; it is unloaded once, here.
             unsafe { (driver.module_unload)(self.raw as _) };
         }
     }
@@ -326,6 +329,7 @@ fn module(context: usize, binary: &'static Binary) -> Result<Arc<Module>> {
     let driver = cuda::driver()?;
     let _context = CtxGuard::enter(context as _)?;
     let mut raw = std::ptr::null_mut();
+    // SAFETY: `raw` is a writable out-pointer and `binary.image` a live, complete module image.
     cuda::check("cuModuleLoadData", unsafe {
         (driver.module_load_data)(&mut raw, binary.image.as_ptr().cast())
     })?;
@@ -339,6 +343,7 @@ fn module(context: usize, binary: &'static Binary) -> Result<Arc<Module>> {
         detail: "kernel symbol contains NUL".into(),
     })?;
     let mut function = std::ptr::null_mut();
+    // SAFETY: `function` is a writable out-pointer, `raw` a loaded module and `name` NUL-terminated.
     cuda::check("cuModuleGetFunction", unsafe {
         (driver.module_get_function)(&mut function, raw, name.as_ptr())
     })?;
@@ -379,6 +384,7 @@ fn launch_kernel(
     // addresses point at zero device-pointer values for the unused scratch inputs.
     let mut args = argument_pointers(&mut values);
     let driver = cuda::driver()?;
+    // SAFETY: `args` points at live host values matching the kernel's parameters for the launch.
     cuda::check("cuLaunchKernel", unsafe {
         (driver.launch_kernel)(
             module.function as _,
@@ -524,6 +530,7 @@ fn execute_into(
         streams.insert(stream);
     }
     for stream in streams {
+        // SAFETY: a producer stream the caller named; synchronizing has no memory preconditions.
         cuda::check("cuStreamSynchronize(decode producer)", unsafe {
             (cuda::driver()?.stream_synchronize)(stream as _)
         })?;
@@ -644,6 +651,7 @@ fn execute_into(
             },
             dst: Dst::host(&mut value),
         };
+        // SAFETY: `value` is a live, exclusive host destination for the call; the device source is this decode's own buffer.
         unsafe { super::read(&[copy], &ReadOpts::default()) }.map_err(io_error)?;
         if i32::from_le_bytes(value) != 0 {
             return crate::failure::fail(

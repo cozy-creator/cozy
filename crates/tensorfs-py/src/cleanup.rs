@@ -28,6 +28,7 @@ fn state() -> Result<&'static State, std::io::Error> {
         let old = STATE.load(Ordering::Acquire);
         // SAFETY: published boxes are never freed; pid is immutable after publication.
         if !old.is_null() && unsafe { (*old).pid == pid } {
+            // SAFETY: as above.
             return Ok(unsafe { &*old });
         }
         let (sender, receiver) = mpsc::channel::<Task>();
@@ -45,6 +46,7 @@ fn state() -> Result<&'static State, std::io::Error> {
             })?;
         let fresh = Box::into_raw(Box::new(State { pid, sender }));
         match STATE.compare_exchange(old, fresh, Ordering::AcqRel, Ordering::Acquire) {
+            // SAFETY: `fresh` was just published; published states are never freed.
             Ok(_) => return Ok(unsafe { &*fresh }),
             // SAFETY: this fresh, unpublished state belongs to this process. Closing its
             // unused sender ends its fresh worker; it is not an inherited channel.

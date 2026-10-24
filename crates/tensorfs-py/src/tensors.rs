@@ -139,6 +139,7 @@ impl PyTensors {
                         },
                         dst,
                     };
+                    // SAFETY: `buffer` is this call's live decode output and `dst` the caller's destination (read's contract).
                     if let Err(error) = unsafe { tensorfs::io::read(&[copy], &ReadOpts::default()) }
                     {
                         defer_failed_cuda(device, buffer);
@@ -163,6 +164,7 @@ impl PyTensors {
             };
             return py
                 .detach(|| {
+                    // SAFETY: `range` lies in the loaded array, alive for the call; `dst` is the caller's destination (read's contract).
                     unsafe { tensorfs::io::read(&[copy], &ReadOpts::default()) }
                         .map_err(|e| Failure::from(e.source))
                 })
