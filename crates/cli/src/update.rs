@@ -25,8 +25,11 @@ const RELEASES: &str = "https://github.com/cozy-creator/cozy-creator/releases";
 const ISSUER: &str = "https://token.actions.githubusercontent.com";
 /// This repo's GitHub id, which a rename keeps.
 const REPOSITORY_ID: &str = "1345607976";
-/// Its release workflow, on any ref.
-const WORKFLOW: &str = "/.github/workflows/release.yml@";
+/// Its release workflow, on any ref: cozy-publish.yaml, and release.yml, which signed the releases before it.
+const WORKFLOWS: [&str; 2] = [
+    "/.github/workflows/cozy-publish.yaml@",
+    "/.github/workflows/release.yml@",
+];
 
 /// The dist target whose archive replaces this binary.
 const TARGET: &str = if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
@@ -309,7 +312,7 @@ fn ours(result: &VerificationResult) -> Result<String, String> {
     let release_workflow = !repository.is_empty()
         && signer
             .strip_prefix(repository)
-            .is_some_and(|path| path.starts_with(WORKFLOW));
+            .is_some_and(|path| WORKFLOWS.iter().any(|w| path.starts_with(w)));
     if result.certificate_verified() && id == REPOSITORY_ID && release_workflow {
         Ok(signer.to_owned())
     } else {
