@@ -6,13 +6,12 @@
 //! `CUevent`.
 
 use std::ffi::{c_char, c_int, c_void, CStr};
-use std::sync::Arc;
 
 use platform::handles::Owned;
 use tensorfs::io::cuda::{self, AccessDesc, AllocationProp, CUcontext, CUdevice, CUevent, CUstream, CtxGuard};
 use tensorfs::io::Dst;
 
-use crate::backend::{Access, Backend, Event, Events, Lazy, Physical, User, Va};
+use crate::backend::{Access, Backend, Event, Events, Physical, Va};
 use crate::{Error, GpuId, Result};
 
 #[cfg(unix)]
@@ -24,13 +23,13 @@ const HANDLES: u32 = cuda::MEM_HANDLE_TYPE_WIN32;
 #[cfg(windows)]
 const HANDLES_SUPPORTED: c_int = cuda::ATTR_WIN32_HANDLE_SUPPORTED;
 
-/// One driver call; the caller has the context entered.
+/// One driver call, with the backend's context entered where the call needs one.
 macro_rules! call {
     ($op:literal, $f:ident($($arg:expr),* $(,)?)) => {{
         // Each driver call is a trace span of its name: a subscriber can time every one.
         let _call = tracing::trace_span!($op).entered();
-        // SAFETY: the documented driver ABI, on live handles of this backend's context; every
-        // out-param points at a live local.
+        // SAFETY: the documented driver ABI, on live handles of this backend; every out-param
+        // points at a live local.
         cuda::check($op, unsafe { (cuda::driver()?.$f)($($arg),*) })
     }};
 }
@@ -534,20 +533,25 @@ impl Backend for CudaBackend {
     }
 }
 
-/// TensorD's chunks on one device. A chunk is created with no context current (P1); export and
-/// release run in [`minimal`]'s context, opened at the first export and kept while the device
-/// holds any chunk (design: closing it under live chunks is unproven on a card), none otherwise.
-/// It serves the manager's calls only: it maps nothing and orders no stream.
+/// TensorD's chunks on one device, with no context of its own: the driver creates, exports and
+/// releases a chunk with no context current, and a chunk outlives every context (P1; P1b runs
+/// 15862, 15911). [`minimal`]'s context opens only to read the granularity and capacity, and
+/// stays only where NVML is unavailable, for the driver's free bytes. It serves the manager's
+/// calls only: it maps nothing and orders no stream.
 pub struct CudaChunks {
     ordinal: i32,
     prop: AllocationProp,
     _security: Security,
     granularity: u64,
     capacity: u64,
-    nvml: Option<Arc<platform::gpu::Device>>,
-    context: Lazy<Minimal>,
-    /// Live chunks, and the hold that keeps the context while there are any.
-    chunks: parking_lot::Mutex<(u64, Option<User<Minimal>>)>,
+    free: Free,
+}
+
+/// Where the device's free bytes are read.
+enum Free {
+    Nvml(Box<platform::gpu::Device>),
+    /// No NVML: the driver's, in a minimal context kept for it.
+    Driver(Primary),
 }
 
 // SAFETY: as `CudaBackend`'s: `prop`'s only pointer is the WIN32 metadata, owned and never written.
@@ -556,23 +560,15 @@ unsafe impl Send for CudaChunks {}
 unsafe impl Sync for CudaChunks {}
 
 /// The device's primary context with its stack, printf FIFO and malloc heap at 0 (P1: 188 MiB
-/// becomes 102): the least a context costs, for export and release.
-struct Minimal {
-    primary: Primary,
-    /// This process's NVML bytes across opening it (0 where NVML has no per-process figure).
-    bytes: u64,
-}
-
-fn minimal(ordinal: i32, nvml: Option<&platform::gpu::Device>) -> Result<Minimal> {
-    let before = process_used(nvml).ok();
+/// becomes 102): the least a context costs.
+fn minimal(ordinal: i32) -> Result<Primary> {
     let (device, ctx) = cuda::primary_context(ordinal)?;
     let primary = Primary { device, ctx: ctx as usize };
     let _ctx = primary.enter()?;
     for limit in [cuda::LIMIT_STACK_SIZE, cuda::LIMIT_PRINTF_FIFO_SIZE, cuda::LIMIT_MALLOC_HEAP_SIZE] {
         call!("cuCtxSetLimit", ctx_set_limit(limit, 0))?;
     }
-    let bytes = process_used(nvml).ok().zip(before).map_or(0, |(after, before)| after.saturating_sub(before));
-    Ok(Minimal { primary, bytes })
+    Ok(primary)
 }
 
 impl CudaBackend {
@@ -580,26 +576,16 @@ impl CudaBackend {
     pub fn chunks(ordinal: i32) -> Result<CudaChunks> {
         let device = device(ordinal)?;
         let (prop, security) = pages(device);
-        let nvml = nvml(device).map(Arc::new);
-        let measure = nvml.clone();
-        let context = Lazy::new(move || minimal(ordinal, measure.as_deref()));
+        let context = minimal(ordinal)?;
         let (mut granularity, mut free, mut total) = (0usize, 0usize, 0usize);
         {
-            let open = context.enter()?;
-            let _ctx = open.primary.enter()?;
+            let _ctx = context.enter()?;
             call!("cuMemGetAllocationGranularity", mem_get_allocation_granularity(&mut granularity, &prop, cuda::MEM_GRANULARITY_MINIMUM))?;
             call!("cuMemGetInfo", mem_get_info(&mut free, &mut total))?;
         }
-        Ok(CudaChunks { ordinal, prop, _security: security, granularity: granularity as u64, capacity: total as u64, nvml, context, chunks: Default::default() })
-    }
-}
-
-impl CudaChunks {
-    /// `f` in the minimal context, opened for it if it is not open.
-    fn inside<R>(&self, f: impl FnOnce() -> Result<R>) -> Result<R> {
-        let open = self.context.enter()?;
-        let _ctx = open.primary.enter()?;
-        f()
+        // With NVML the context goes here: its last release destroys it.
+        let free = nvml(device).map_or(Free::Driver(context), |nvml| Free::Nvml(Box::new(nvml)));
+        Ok(CudaChunks { ordinal, prop, _security: security, granularity: granularity as u64, capacity: total as u64, free })
     }
 }
 
@@ -612,23 +598,28 @@ impl Backend for CudaChunks {
         self.capacity
     }
 
-    /// NVML's; the driver's (in the context) where NVML is unavailable.
     fn free(&self) -> Result<u64> {
-        if let Some(nvml) = &self.nvml {
-            return Ok(nvml.read()?.free);
+        match &self.free {
+            Free::Nvml(nvml) => Ok(nvml.read()?.free),
+            Free::Driver(context) => {
+                let _ctx = context.enter()?;
+                let (mut free, mut total) = (0usize, 0usize);
+                call!("cuMemGetInfo", mem_get_info(&mut free, &mut total))?;
+                Ok(free as u64)
+            }
         }
-        let (mut free, mut total) = (0usize, 0usize);
-        self.inside(|| Ok(call!("cuMemGetInfo", mem_get_info(&mut free, &mut total))?))?;
-        Ok(free as u64)
     }
 
     fn process_used(&self) -> Result<u64> {
-        process_used(self.nvml.as_deref())
+        match &self.free {
+            Free::Nvml(nvml) => process_used(Some(nvml)),
+            Free::Driver(_) => process_used(None),
+        }
     }
 
-    /// The minimal context's bytes while it is open, else 0.
+    /// None: chunks need no context (NVML-less, the kept context is unmeasured).
     fn opened_context(&self) -> u64 {
-        self.context.peek().map_or(0, |m| m.bytes)
+        0
     }
 
     fn granularity(&self) -> u64 {
@@ -641,28 +632,15 @@ impl Backend for CudaChunks {
         }
         let mut id = 0;
         call!("cuMemCreate", mem_create(&mut id, len as usize, &self.prop, 0))?;
-        let mut chunks = self.chunks.lock();
-        chunks.0 += 1;
-        if chunks.1.is_none() {
-            chunks.1 = Some(self.context.hold());
-        }
         Ok(Physical { id, len })
     }
 
-    /// The last chunk's release closes the context after it; a failed release leaves the chunk counted.
     fn destroy(&self, page: Physical) -> Result<()> {
-        self.inside(|| Ok(call!("cuMemRelease", mem_release(page.id))?))?;
-        let last = {
-            let mut chunks = self.chunks.lock();
-            chunks.0 = chunks.0.saturating_sub(1);
-            if chunks.0 == 0 { chunks.1.take() } else { None }
-        };
-        drop(last);
-        Ok(())
+        Ok(call!("cuMemRelease", mem_release(page.id))?)
     }
 
     fn export(&self, page: &Physical) -> Result<Owned> {
-        self.inside(|| export(page))
+        export(page)
     }
 
     fn reserve(&self, _: u64) -> Result<Va> {
