@@ -17,11 +17,14 @@ w = [f for f in w if "manylinux" in f["filename"] and "x86_64" in f["filename"] 
 print(w[0]["url"] + "#sha256=" + w[0]["digests"]["sha256"])'; }
 number() { grep -ho '"number":[0-9]*' "$@" 2>/dev/null | head -1 | cut -d: -f2; }
 mkdir -p "$OUT/cl650"; C=$OUT/cl650
-gh release download "v$OLDV" -R cozy-creator/cozy-creator -D "$C" --clobber \
-  -p cozy-x86_64-unknown-linux-gnu.tar.gz -p cozy-x86_64-unknown-linux-gnu.tar.gz.sha256 \
-  && (cd "$C" && sha256sum -c cozy-x86_64-unknown-linux-gnu.tar.gz.sha256 >/dev/null && tar -xzf cozy-x86_64-unknown-linux-gnu.tar.gz)
+# cozy 0.11.15's Linux archive, its digest checked: straight from github.com (the API that `gh` uses drops out here).
+u=https://github.com/cozy-creator/cozy-creator/releases/download/v$OLDV/cozy-x86_64-unknown-linux-gnu.tar.gz
+for _ in 1 2 3; do
+  curl -fsSL --retry 5 --retry-all-errors "$u" -o "$C/cozy-x86_64-unknown-linux-gnu.tar.gz" && curl -fsSL --retry 5 --retry-all-errors "$u.sha256" -o "$C/cozy-x86_64-unknown-linux-gnu.tar.gz.sha256" \
+    && (cd "$C" && sha256sum -c cozy-x86_64-unknown-linux-gnu.tar.gz.sha256 >/dev/null && tar -xzf cozy-x86_64-unknown-linux-gnu.tar.gz) && break
+done
 OLD=$C/cozy-x86_64-unknown-linux-gnu/cozy
-read -r v rt tfs <<< "$(pair)"
+for _ in $(seq 30); do read -r v rt tfs <<< "$(pair)"; [ -n "$v" ] && break; sleep 5; done  # a fresh pod reports once up
 log "cl650: fresh $M runs cozy $v, Runtime $rt, TensorFS $tfs"
 
 if [ -z "$TDF" ]; then expect cl650-b-update-from-0.11.15 FAIL "no --tensord candidate to update a 0.11.15 TensorD to"; else
