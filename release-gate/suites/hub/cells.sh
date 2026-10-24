@@ -3,13 +3,15 @@
 # end (the package's releases yanked, the model deleted):
 #   paths            contract.py: each path no cozy verb reaches, called anonymously, answers as its contract says
 #   account          whoami, credits, credits history, the rental catalog, the rental $M itself
+#   providers        an admin rental of the cheapest CPU SKU on each provider (RunPod, vast), ended and checked
+#                    gone, so both acquisition paths are covered (renters never pick one: th-254)
 #   package          lock and publish 0.1.0 and 0.1.1; the unversioned run takes 0.1.1; yank 0.1.1 → the simple index marks it
 #                    data-yanked, a fresh install takes 0.1.0, its exact pin still installs; un-yank → 0.1.1 again
 #   model            upload, publish 0.1.0 (listed), download; yank (listed yanked), the exact pin downloads; un-yank;
 #                    delete → gone
 # Each is an `expect` row: a FAIL fails the gate. The migration rehearsal on a prod dump is the release agent's
 # step before a Hub deploy (release-gate README).
-HB=$OUT/suite-hub HUB_URL=${HUB_URL:-https://tensorhub.com} HUB_REF=${HUB_REF:-master} HUB_PKG= HUB_MODEL= HUB_LIVE=
+HB=$OUT/suite-hub HUB_URL=${HUB_URL:-https://tensorhub.com} HUB_REF=${HUB_REF:-master} HUB_PKG= HUB_MODEL= HUB_LIVE= HUB_RENTED=
 mkdir -p "$HB"
 # hub_do <check> ok|refused <cozy args...>: PASS (returns 0) when the command exits as wanted; output in <check>.out.
 hub_do() {
@@ -50,7 +52,8 @@ hub_cleanup() {
   local v
   for v in $HUB_LIVE; do "$CLI" package yank "$WHO/$HUB_PKG@$v" -y >>"$HB/cleanup.log" 2>&1; done
   [ -z "$HUB_MODEL" ] || "$CLI" model delete "$HUB_MODEL" -y >>"$HB/cleanup.log" 2>&1
-  HUB_LIVE= HUB_MODEL=
+  for v in $HUB_RENTED; do "$CLI" machine end "$v" -y >>"$HB/cleanup.log" 2>&1; done
+  HUB_LIVE= HUB_MODEL= HUB_RENTED=
 }
 trap 'hub_cleanup; declare -F tfs_cleanup >/dev/null && tfs_cleanup; end_it' EXIT
 
@@ -70,10 +73,48 @@ done
 hub_do credits ok credits
 hub_do credits-history ok credits history
 hub_do catalog ok machine rent
-# The rental itself is gate.sh's (rent, then end and check it is gone). The CLI neither picks nor names a provider,
-# so the suite covers whichever one the Hub placed $M on.
+# The rental itself is gate.sh's (rent, then end and check it is gone).
 P=$("$CLI" --json machine show "$M" 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["rental"]["sku"])' 2>/dev/null)
 [ -n "$P" ] && expect "hub rental" PASS "$M is a $P rental" || expect "hub rental" FAIL "machine show $M names no rental"
+# hub_machines: the names `cozy machine list` shows, one per line.
+hub_machines() {
+  "$CLI" --json machine list 2>/dev/null | python3 -c 'import json,sys
+def walk(o):
+    if isinstance(o, dict):
+        if isinstance(o.get("name"), str) and ("rental" in o or "kind" in o): print(o["name"])
+        for v in o.values(): walk(v)
+    elif isinstance(o, list):
+        for v in o: walk(v)
+walk(json.load(sys.stdin))' 2>/dev/null | sort -u
+}
+# hub_rent_on <provider>: an admin rental of `cpu` there (`machine rent --provider`, admin-only), ended and checked
+# gone. A rental it cannot name from the reply is the one new in `machine list`; hub_cleanup ends any left.
+hub_rent_on() {
+  local m before
+  before=$(hub_machines)
+  "$CLI" --json machine rent cpu --provider "$1" -y >"$HB/rent-$1.out" 2>&1
+  m=$(python3 -c 'import json,sys
+t = open(sys.argv[1]).read(); dec = json.JSONDecoder(); i = 0
+while (i := t.find("{", i)) >= 0:
+    d, i = dec.raw_decode(t, i)
+    if isinstance(d.get("machine"), dict) and d["machine"].get("name"): print(d["machine"]["name"]); break' "$HB/rent-$1.out" 2>/dev/null)
+  [ -n "$m" ] || m=$(comm -13 <(echo "$before") <(hub_machines) | grep -vxF "$M" | head -1)
+  [ -n "$m" ] || { expect "hub rent on $1" FAIL "$(tail -c 300 "$HB/rent-$1.out")"; return; }
+  HUB_RENTED="$HUB_RENTED $m"
+  grep -q '"machine"' "$HB/rent-$1.out" && expect "hub rent on $1" PASS "rented $m on $1" ||
+    expect "hub rent on $1" FAIL "rented $m on $1, but the reply named no machine: $(tail -c 200 "$HB/rent-$1.out")"
+  "$CLI" machine end "$m" -y >"$HB/end-$1.out" 2>&1
+  for _ in $(seq 30); do
+    hub_machines | grep -qxF "$m" || { expect "hub end on $1" PASS "$m ended and gone"; HUB_RENTED=${HUB_RENTED/ $m/}; return; }
+    sleep 10
+  done
+  expect "hub end on $1" FAIL "$m still listed 5 min after cozy machine end: $(tail -c 200 "$HB/end-$1.out")"
+}
+if "$CLI" machine rent --help 2>/dev/null | grep -q -- --provider || "$CLI" machine rent cpu --provider runpod --help >/dev/null 2>&1; then
+  for p in runpod vast; do hub_rent_on "$p"; done
+else
+  expect "hub providers" FAIL "this cozy has no admin \`machine rent --provider\`: it cannot rent on each provider"
+fi
 [ -n "$WHO" ] || return 0
 HUB_PKG=ci-hub-$R
 # package
