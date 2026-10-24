@@ -31,6 +31,8 @@ pub struct Staged {
 
 /// Stages `root`'s files, each digest remembered in `memo` as an input file's is.
 pub fn stage(root: &Path, memo: Option<&Path>, manifests: &Path) -> Result<Staged, Error> {
+    // Calcifer reads the files, from its own directory: `./folder` is this one's.
+    let root = &std::path::absolute(root).map_err(|e| unreadable(root, e))?;
     let mut found = vec![];
     walk(root, root, &mut found)?;
     found.sort();
