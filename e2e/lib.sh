@@ -50,7 +50,7 @@ install_cozy() {
   if [ "$RUNNER_OS" = Windows ]; then
     powershell -NoProfile -ExecutionPolicy Bypass -c 'irm https://tensorhub.com/install.ps1 | iex' || fail "the installer failed"
   else
-    curl -LsSf https://tensorhub.com/install.sh | sh || fail "the installer failed"
+    curl -LsSf --retry 3 --retry-all-errors https://tensorhub.com/install.sh | sh || fail "the installer failed"
     found=$(env -i HOME="$HOME" PATH=/usr/bin:/bin sh -lc 'command -v cozy' || true)
     [ "$found" = "$COZY" ] || fail "a login shell finds '$found', not $COZY"
   fi
