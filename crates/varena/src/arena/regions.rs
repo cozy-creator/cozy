@@ -62,11 +62,21 @@ pub struct Evicted {
     pub bytes: u64,
     spans: Vec<(u64, u64, u64)>,
     swap: Option<SwapFile>,
+    /// A failed drain may still read or write this host mapping: retain it until process exit.
+    quarantined: bool,
 }
 
 impl Evicted {
     pub fn swapped(&self) -> bool {
         self.swap.is_some()
+    }
+}
+
+impl Drop for Evicted {
+    fn drop(&mut self) {
+        if self.quarantined {
+            std::mem::forget(self.swap.take());
+        }
     }
 }
 
@@ -115,6 +125,10 @@ impl Torch {
     /// guarantees nothing allocates into the region meanwhile (it is unpinned). `None` while a
     /// capture is open: no epoch can be recorded then (R2), so the caller asks again later.
     pub fn evict(&self, owner: Owner, swap: bool) -> Result<Option<Evicted>> {
+        self.sh.checked(|| self.evict_region(owner, swap))
+    }
+
+    fn evict_region(&self, owner: Owner, swap: bool) -> Result<Option<Evicted>> {
         if !matches!(owner, Owner::Region(_)) {
             return Err(Error::Invalid(format!("only a region's arena is evicted, not {owner:?}")));
         }
@@ -130,7 +144,8 @@ impl Torch {
             return Ok(None);
         }
         let spans: Vec<(u64, u64)> = a.st.lock().spans.iter().filter(|(_, s)| !s.chunks.is_empty()).map(|(b, s)| (*b, s.len)).collect();
-        let mut out = Evicted { bytes: spans.iter().map(|(_, len)| len).sum(), ..Evicted::default() };
+        let mut out = Evicted::default();
+        out.bytes = spans.iter().map(|(_, len)| len).sum();
         if swap {
             out.swap = Some(SwapFile::new(out.bytes)?);
         }
@@ -139,7 +154,16 @@ impl Torch {
         let mut off = 0;
         for &(base, len) in &spans {
             if let Some(file) = out.swap.as_mut() {
-                sh.backend.copy_out(Va { base, len }, 0, file.at(off, len)?, Event::DONE)?;
+                if let Err(error) = sh.backend.copy_out(Va { base, len }, 0, file.at(off, len)?, Event::DONE) {
+                    if let Err(drain) = sh.backend.drain() {
+                        let lost = Error::Ownership(format!("region eviction failed ({error}); its copy completion is unknown ({drain})"));
+                        out.quarantined = true;
+                        sh.poison(&lost);
+                        return Err(lost);
+                    }
+                    sh.poison(&error);
+                    return Err(error);
+                }
             }
             out.spans.push((base, len, off));
             off += len;
@@ -166,6 +190,10 @@ impl Torch {
     /// `evicted` is empty after. Never on a capturing thread (R6). True when nothing was swapped:
     /// the bytes are new.
     pub fn make_resident(&self, owner: Owner, evicted: &mut Evicted) -> Result<bool> {
+        self.sh.checked(|| self.restore_region(owner, evicted))
+    }
+
+    fn restore_region(&self, owner: Owner, evicted: &mut Evicted) -> Result<bool> {
         let sh = &self.sh;
         if sh.capturing() {
             return Err(Error::Invalid("a region is made resident before a capture, never during one (R6)".into()));
@@ -188,7 +216,13 @@ impl Torch {
                 if let Err(error) = sh.backend.copy_in(va, 0, file.at(off, len)?) {
                     // The copy may have been queued before its failure. No rollback may
                     // unmap its destination until the copy stream is proven complete.
-                    sh.backend.drain()?;
+                    if let Err(drain) = sh.backend.drain() {
+                        let lost = Error::Ownership(format!("region restoration failed ({error}); its copy completion is unknown ({drain})"));
+                        evicted.quarantined = true;
+                        sh.poison(&lost);
+                        return Err(lost);
+                    }
+                    sh.poison(&error);
                     return Err(error);
                 }
             }
@@ -320,6 +354,7 @@ impl Shared {
                     return Ok(chunks);
                 }
                 Err(e) => {
+                    self.poison(&e);
                     let len = chunks.iter().map(|c| c.len).sum();
                     self.mapped.fetch_add(len, AcqRel);
                     self.unmap(Va { base: va.base, len }, chunks, false, true);

@@ -2,8 +2,8 @@
 
 use platform::handles::Owned;
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
-    Arc,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    Arc, Mutex,
 };
 use tensorfs::io::Dst;
 use varena::arena::{Direct, Owner, Torch};
@@ -12,6 +12,8 @@ use varena::{Access, Backend, Error, Event, HostBackend, Physical, Result, Va};
 
 struct Faults {
     host: HostBackend,
+    fail_drain: AtomicBool,
+    during_out: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     fail_in_at: AtomicU64,
     ins: AtomicU64,
     fail_map_at: AtomicU64,
@@ -25,6 +27,8 @@ impl Faults {
     fn new() -> Self {
         Self {
             host: HostBackend::new(64 << 20),
+            fail_drain: AtomicBool::new(false),
+            during_out: Mutex::new(None),
             fail_in_at: AtomicU64::new(0),
             ins: AtomicU64::new(0),
             fail_map_at: AtomicU64::new(0),
@@ -100,6 +104,10 @@ impl Backend for Faults {
         self.host.copy_in(v, o, b)
     }
     fn copy_out(&self, v: Va, o: u64, b: &mut [u8], e: Event) -> Result<()> {
+        let hook = self.during_out.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook();
+        }
         let n = self.outs.fetch_add(1, Ordering::SeqCst) + 1;
         if self.fail_out_at.load(Ordering::SeqCst) == n {
             return Err(Error::Io("injected copy-out failure".into()));
@@ -131,6 +139,9 @@ impl Backend for Faults {
         self.host.retire(e)
     }
     fn drain(&self) -> Result<()> {
+        if self.fail_drain.load(Ordering::SeqCst) {
+            return Err(Error::Io("injected drain failure".into()));
+        }
         self.host.drain()
     }
 }
@@ -327,4 +338,72 @@ fn capture_cannot_enter_standalone_recovery() {
     memory.pool_end(pool);
     memory.pool_release(pool);
     assert_eq!(memory.classes()[3], 32 << 20);
+}
+
+#[test]
+fn failed_restore_drain_quarantines_mappings_instead_of_reusing_them() {
+    let (b, t) = allocator();
+    populated(&b, &t);
+    let mut saved = t.evict(Owner::Region(1), true).unwrap().unwrap();
+    b.fail_in_at
+        .store(b.ins.load(Ordering::SeqCst) + 2, Ordering::SeqCst);
+    b.fail_drain.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        t.make_resident(Owner::Region(1), &mut saved),
+        Err(Error::Ownership(_))
+    ));
+    assert_eq!(saved.bytes, 4 << 20);
+    assert!(saved.swapped());
+    assert_eq!(t.mapped(), 4 << 20);
+    assert_eq!(b.process_used().unwrap(), 4 << 20);
+    assert!(matches!(
+        t.make_resident(Owner::Region(1), &mut saved),
+        Err(Error::Ownership(_))
+    ));
+    assert!(matches!(t.alloc(512, 0, None), Err(Error::Ownership(_))));
+    drop(t);
+    assert_eq!(b.process_used().unwrap(), 4 << 20);
+}
+
+#[test]
+fn failed_eviction_drain_preserves_original_mappings_and_quarantines_device() {
+    let (b, t) = allocator();
+    populated(&b, &t);
+    b.fail_out_at.store(2, Ordering::SeqCst);
+    b.fail_drain.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        t.evict(Owner::Region(1), true),
+        Err(Error::Ownership(_))
+    ));
+    assert_eq!(t.mapped(), 4 << 20);
+    assert_eq!(b.process_used().unwrap(), 4 << 20);
+    assert!(matches!(t.alloc(512, 0, None), Err(Error::Ownership(_))));
+    drop(t);
+    assert_eq!(b.process_used().unwrap(), 4 << 20);
+}
+
+#[test]
+fn a_free_during_eviction_is_deferred_until_copying_finishes() {
+    let (b, t) = allocator();
+    let pointers = populated(&b, &t);
+    let allocator = t.clone();
+    *b.during_out.lock().unwrap() = Some(Box::new(move || {
+        allocator.free(pointers[0], 1 << 20, 1);
+    }));
+    let mut saved = t.evict(Owner::Region(1), true).unwrap().unwrap();
+    assert_eq!(saved.bytes, 4 << 20);
+    assert!(!t.make_resident(Owner::Region(1), &mut saved).unwrap());
+    let mut contents = [0; 16];
+    b.copy_out(
+        Va {
+            base: pointers[1],
+            len: 16,
+        },
+        0,
+        &mut contents,
+        Event::DONE,
+    )
+    .unwrap();
+    assert_eq!(contents, [124; 16]);
+    t.free(pointers[1], 1 << 20, 2);
 }
