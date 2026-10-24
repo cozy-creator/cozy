@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The `cli` suite: cozy as a person uses it on a computer with no GPU, Linux, macOS or Windows. Install,
+# The `cli` suite: cozy as a person uses it, on a computer with no GPU, Linux, macOS or Windows. Install,
 # status, the local machine, the candidates through `cozy machine update local` (cozy doctor restarts the
 # installer's Calcifer on them and must find everything healthy), a weightless request through them, a real
 # BiRefNet removal on the CPU from a YAML request, run list/show, a second executor (the machine restarted)
