@@ -142,14 +142,7 @@ impl Source {
         for item in items {
             if let ItemSource::Object(range) = &item.source {
                 let file = self.file(&range.obj)?;
-                #[cfg(target_os = "linux")]
-                // SAFETY: advice on a descriptor this source holds open.
-                unsafe {
-                    use std::os::fd::AsRawFd;
-                    libc::posix_fadvise(file.as_raw_fd(), range.off as libc::off_t, range.len as libc::off_t, libc::POSIX_FADV_WILLNEED);
-                }
-                #[cfg(not(target_os = "linux"))]
-                let _ = file;
+                platform::durable::will_need(&file, range.off, range.len);
             }
         }
         Ok(())

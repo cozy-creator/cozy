@@ -135,6 +135,19 @@ pub fn open_direct(file: &File) -> crate::Result<Option<File>> {
     }
 }
 
+/// Asks the kernel to read `[off, off+len)` of `file` into the page cache ahead of its readers
+/// (`POSIX_FADV_WILLNEED`, Linux; elsewhere nothing). Best effort.
+pub fn will_need(file: &File, off: u64, len: u64) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: advice on a descriptor the caller holds open.
+        unsafe { libc::posix_fadvise(file.as_raw_fd(), off as libc::off_t, len as libc::off_t, libc::POSIX_FADV_WILLNEED) };
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (file, off, len);
+}
+
 /// Whether the page cache holds every page of `[off, off+len)`; `None` where the OS cannot say,
 /// which callers treat as cold.
 pub fn cached(file: &File, off: u64, len: u64) -> Option<bool> {

@@ -55,6 +55,32 @@ pub fn whole(store: &Store, header: &str, components: &[String]) -> bool {
     whole
 }
 
+/// What `selected` (header, components) reads that is here already goes to the page cache now,
+/// on its own thread, the smallest component first (the Start pass's order): it overlaps the
+/// executor's start, which reads it next. Best effort.
+fn readahead(store: Arc<Store>, selected: Vec<(String, Vec<String>)>) {
+    let spawned = std::thread::Builder::new().name("weights-readahead".into()).spawn(move || {
+        let mut components: Vec<Vec<ObjectRef>> = vec![];
+        for (header, names) in &selected {
+            let Ok(checkpoint) = checkpoint(&store, header) else { continue };
+            match names.is_empty() {
+                true => components.push(storage::chunks(&checkpoint, &[])),
+                false => components.extend(names.iter().map(|name| storage::chunks(&checkpoint, std::slice::from_ref(name)))),
+            }
+        }
+        components.sort_by_key(|objects| objects.iter().map(|o| o.length).sum::<u64>());
+        for object in components.iter().flatten() {
+            let file = store.path(object).ok().and_then(|path| std::fs::File::open(path).ok());
+            if let Some(file) = file.filter(|f| f.metadata().is_ok_and(|m| m.len() == object.length)) {
+                platform::durable::will_need(&file, 0, object.length);
+            }
+        }
+    });
+    if let Err(error) = spawned {
+        tracing::warn!("its weights' readahead: {error}");
+    }
+}
+
 pub fn failed(refusal: Refusal) -> io::Error {
     let failure = match refusal.code {
         Code::CAPACITY_EXHAUSTED => format!("machine_disk_full: {refusal}"),
@@ -119,6 +145,7 @@ impl Fetch {
     /// `later`'s (its on-demand models, built when a stage first uses one) the same way, right
     /// behind them. Held until the call ends. Its run's progress waits on `selected` only.
     pub fn ahead(&self, selected: &[(String, Vec<String>)], later: &[(String, Vec<String>)]) -> io::Result<()> {
+        readahead(self.store().clone(), selected.to_vec());
         let mut wanted = self.components(selected, true)?;
         // A model the call may never read must not cost it the ones it reads first.
         let mut behind = self.components(later, false).unwrap_or_else(|error| {
