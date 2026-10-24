@@ -8,10 +8,9 @@ if [ -z "$RW$TW" ] || ! "$ICLI" machine update --help 2>/dev/null | grep -q -- -
 else
   "$CLI" machine update "$M" --tensord "$SKEWV" -y > "$T/skew-tensord.log" 2>&1
   "$ICLI" machine update "$M" ${RW:+--runtime-wheel "$RW"} ${TW:+--tensorfs-wheel "$TW"} -y > "$T/skew-wheels.log" 2>&1
-  read -r v rt tfs <<< "$(timeout 60 "$CLI" --json machine show "$M" 2>/dev/null | python3 -c 'import json,sys
-s = json.load(sys.stdin)["status"]; print(s["version"], s["runtime"], s["tensorfs"])')"
+  read -r v rt tfs <<< "$(timeout 60 "$CLI" --json machine show "$M" 2>/dev/null | jq -r '.status | "\(.version) \(.runtime) \(.tensorfs)"')"
   n=$(submit "sdxl/generate@$NEW" prompt="$SCENE, an old TensorD" seed:=$((R + 44))); until_status "$n" terminal
-  warned=$(grep -hoiE '[^"]*standalone[^"]*' "$T/skew-wheels.log" "$T/$n.watch" "$T/$n.json" 2>/dev/null | head -1)
+  warned=$(grep -hoiE '[^"]*standalone[^"]*' "$T/skew-wheels.log" "$T/$n.follow" "$T/$n.json" 2>/dev/null | head -1)
   if [ "$v" != "$SKEWV" ]; then
     expect tensord-skew FAIL "the machine runs cozy ${v:-?}, not $SKEWV: $(tail -c 200 "$T/skew-tensord.log")"
   elif [ "$(get "$n" status)" = completed ]; then

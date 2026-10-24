@@ -7,15 +7,13 @@
 #      cozy-runtime>=0.31 (packages 710a0a1d) and the pod holds the Hub's 0.30 pair. `cozy machine update <m> --runtime
 #      0.31.0 --tensorfs 0.14.0` (versions the machine fetches from PyPI) then serves it.
 OLDV=0.11.15 FLOORED=sdxl/generate@2.13.1 MEETS=(--runtime 0.31.0 --tensorfs 0.14.0)
-pair() { timeout 60 "$CLI" --json machine show "$M" 2>/dev/null \
-  | python3 -c 'import json,sys; s=json.load(sys.stdin)["status"]; print(s["version"], s["runtime"], s["tensorfs"])'; }
+pair() { timeout 60 "$CLI" --json machine show "$M" 2>/dev/null | jq -r '.status | "\(.version) \(.runtime) \(.tensorfs)"'; }
 # pypi <dist> <version>: its wheel for the pod's CPython 3.12 on manylinux x86_64 (else pure), as URL#sha256=<hex>.
-pypi() { curl -sf "https://pypi.org/pypi/$1/$2/json" | python3 -c 'import json,sys
-w = [f for f in json.load(sys.stdin)["urls"] if f["filename"].endswith(".whl")]
-w = [f for f in w if "manylinux" in f["filename"] and "x86_64" in f["filename"] and ("-cp312-" in f["filename"] or "-abi3-" in f["filename"])] \
-    or [f for f in w if "-none-any" in f["filename"]]
-print(w[0]["url"] + "#sha256=" + w[0]["digests"]["sha256"])'; }
-number() { grep -ho '"number":[0-9]*' "$@" 2>/dev/null | head -1 | cut -d: -f2; }
+pypi() { curl -sf --retry 5 --retry-all-errors "https://pypi.org/pypi/$1/$2/json" | jq -r '[.urls[] | select(.filename | endswith(".whl"))] as $w
+  | ([$w[] | select(.filename | test("manylinux.*x86_64") and test("-cp312-|-abi3-"))] + [$w[] | select(.filename | test("-none-any"))])[0]
+  | .url + "#sha256=" + .digests.sha256'; }
+number() { jq -r 'select(.run.number != null) | .run.number' "$1" 2>/dev/null | head -1; }  # a run's NDJSON
+ended_as() { jq -r 'select(.run.status != null) | .run.status' "$1" 2>/dev/null | tail -1; }
 mkdir -p "$OUT/cl650"; C=$OUT/cl650
 # cozy 0.11.15's Linux archive, its digest checked: straight from github.com (the API that `gh` uses drops out here).
 u=https://github.com/cozy-creator/cozy-creator/releases/download/v$OLDV/cozy-x86_64-unknown-linux-gnu.tar.gz
@@ -44,19 +42,19 @@ else
 fi
 fi
 
-"$CLI" run "$FLOORED" --on "$M" --json prompt="$SCENE, a floor check" seed:=$((R + 20)) > "$C/a-refused.ndjson" 2> "$C/a-refused.err"
+"$CLI" --json run "$FLOORED" --on "$M" prompt="$SCENE, a floor check" seed:=$((R + 20)) > "$C/a-refused.ndjson" 2> "$C/a-refused.err"
 n=$(number "$C/a-refused.ndjson")
 if grep -qs runtime_floor_unmet "$C/a-refused.ndjson" "$C/a-refused.err"; then
   expect cl650-a-floor-refuses PASS "$FLOORED (run ${n:-none}) on Runtime $rt / TensorFS $tfs: runtime_floor_unmet"
 else
-  expect cl650-a-floor-refuses FAIL "$FLOORED (run ${n:-none}) on Runtime $rt / TensorFS $tfs: $(grep -o '"status":"[a-z_]*"' "$C/a-refused.ndjson" | tail -1) $(tail -c 200 "$C/a-refused.err")"
+  expect cl650-a-floor-refuses FAIL "$FLOORED (run ${n:-none}) on Runtime $rt / TensorFS $tfs: $(ended_as "$C/a-refused.ndjson") $(tail -c 200 "$C/a-refused.err")"
 fi
 "$CLI" machine update "$M" "${MEETS[@]}" -y > "$C/a-update.log" 2>&1
 read -r v rt tfs <<< "$(pair)"
-"$CLI" run "$FLOORED" --on "$M" --json prompt="$OBJECT, the floor met" seed:=$((R + 21)) > "$C/a-served.ndjson" 2> "$C/a-served.err"
+"$CLI" --json run "$FLOORED" --on "$M" prompt="$OBJECT, the floor met" seed:=$((R + 21)) > "$C/a-served.ndjson" 2> "$C/a-served.err"
 n=$(number "$C/a-served.ndjson")
-if grep -q '"status":"completed"' "$C/a-served.ndjson"; then
+if [ "$(ended_as "$C/a-served.ndjson")" = completed ]; then
   expect cl650-a-floor-met-serves PASS "after machine update ${MEETS[*]} (Runtime $rt / TensorFS $tfs): run $n completed"
 else
-  expect cl650-a-floor-met-serves FAIL "after machine update ${MEETS[*]} (Runtime $rt / TensorFS $tfs): run ${n:-none} $(grep -o '"status":"[a-z_]*"' "$C/a-served.ndjson" | tail -1) $(tail -c 200 "$C/a-served.err")"
+  expect cl650-a-floor-met-serves FAIL "after machine update ${MEETS[*]} (Runtime $rt / TensorFS $tfs): run ${n:-none} $(ended_as "$C/a-served.ndjson") $(tail -c 200 "$C/a-served.err")"
 fi

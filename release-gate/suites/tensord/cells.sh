@@ -2,50 +2,50 @@
 # fresh pod through TensorD 0.11.15 to the candidate and met a release's Runtime floor. Each check below is an `expect`
 # row, PASS or FAIL with what happened, which analyze.py fails the gate on. Every request has its own prompt and seed.
 T=$OUT/tensord; mkdir -p "$T"
-show() { timeout 120 "$CLI" run show "$1" --json 2>/dev/null > "$T/$1.json"; }
-# get <run> <expr>: a field of the run's record (status, number, attempt, executor, gpus, length, ms).
+# The CLI's own verbs: cozy before #1985 has `run watch` and `package update`; later ones follow a run with `run show`,
+# move a package with `package install`, and snapshot with `run show --once`. JSON is read with jq.
+ONCE=; "$CLI" run show --help 2>/dev/null | grep -q -- --once && ONCE=--once
+FOLLOW=(run show); "$CLI" run watch --help >/dev/null 2>&1 && FOLLOW=(run watch)
+MOVE=install; "$CLI" package update --help >/dev/null 2>&1 && MOVE=update
+show() { timeout 120 "$CLI" run show "$1" $ONCE --json 2>/dev/null | jq -s 'last // {}' > "$T/$1.json"; }
+# get <run> <field>: the run's record, now (status, reason, attempt, executor, gpus, window, ms).
 get() {
-  show "$1"; python3 - "$T/$1.json" "$2" <<'PY'
-import json, sys
-try: r = json.load(open(sys.argv[1]))
-except Exception: sys.exit()
-m = r.get('measurements') or {}
-def walk(o):
-    if isinstance(o, dict):
-        yield o
-        for v in o.values(): yield from walk(v)
-    elif isinstance(o, list):
-        for v in o: yield from walk(v)
-f = {'status': lambda: r.get('status'), 'reason': lambda: (r.get('reason') or {}).get('code', ''),
-     'attempt': lambda: (m.get('software') or {}).get('attempt_ordinal'),
-     'executor': lambda: ((m.get('execution') or {}).get('executor') or {}).get('started_unix_ms'),
-     'gpus': lambda: ','.join(sorted({str(d['gpu']) for d in walk(m) if isinstance(d.get('gpu'), int) and d['gpu'] >= 0})),
-     'window': lambda: f"{r.get('accepted_at_ms') or 0} {r.get('settled_at_ms') or 0}",
-     'ms': lambda: r.get('execution_ms') or ''}[sys.argv[2]]
-print(f() if f() is not None else '')
-PY
+  show "$1"
+  case $2 in
+    status) jq -r '.status // ""';; reason) jq -r '.reason.code // ""';; ms) jq -r '.execution_ms // ""';;
+    attempt) jq -r '.measurements.software.attempt_ordinal // ""';;
+    executor) jq -r '.measurements.execution.executor.started_unix_ms // ""';;
+    gpus) jq -r '[.measurements | .. | objects | select((.gpu | type) == "number" and .gpu >= 0) | .gpu] | unique | map(tostring) | join(",")';;
+    window) jq -r '"\(.accepted_at_ms // 0) \(.settled_at_ms // 0)"';;
+  esac < "$T/$1.json" 2>/dev/null
 }
-# submit <target> [inputs]: a detached run's number.
-submit() { "$CLI" run "$@" --on "$M" --detach --json 2>>"$T/submit.err" | grep -o '"number":[0-9]*' | head -1 | cut -d: -f2; }
-until_status() {  # until_status <run> <status|terminal>: waits while the run moves (cozy run watch for the end)
-  if [ "$2" = terminal ]; then timeout 3600 "$CLI" run watch "$1" --json > "$T/$1.watch" 2>&1; return; fi
-  local i; for i in $(seq 300); do [ "$(get "$1" status)" = "$2" ] && return 0; case $(get "$1" status) in completed|failed|canceled) return 1;; esac; sleep 2; done; return 1
+# submit <target> [inputs]: starts the run, followed in the background into its own NDJSON, and prints its number
+# (the first event's .run.number).
+submit() {
+  local f n i; f=$(mktemp "$T/run-XXXXXX.ndjson")
+  "$CLI" --json run "$@" --on "$M" > "$f" 2>>"$T/submit.err" &
+  for i in $(seq 300); do
+    n=$(jq -r 'select(.run.number != null) | .run.number' "$f" 2>/dev/null | head -1); [ -n "$n" ] && { echo "$n"; return; }
+    kill -0 $! 2>/dev/null || break; sleep 1
+  done
 }
-envs() { timeout 60 "$CLI" --json machine show "$M" 2>/dev/null | python3 -c 'import json,sys
-print(" ".join(sorted(e["package"].split("/")[-1] + "@" + e["release"] for e in json.load(sys.stdin)["status"]["environments"])))'; }
+until_status() {  # until_status <run> <in_progress|terminal>: the run's end, followed; or its status reached
+  if [ "$2" = terminal ]; then timeout 3600 "$CLI" "${FOLLOW[@]}" "$1" --json > "$T/$1.follow" 2>&1; return; fi
+  local i s; for i in $(seq 300); do s=$(get "$1" status); [ "$s" = "$2" ] && return 0; case $s in completed|failed|canceled) return 1;; esac; sleep 2; done; return 1
+}
+envs() { timeout 60 "$CLI" --json machine show "$M" 2>/dev/null | jq -r '[.status.environments[] | (.package | split("/") | last) + "@" + .release] | sort | join(" ")'; }
 released() {  # released <package>: its two newest releases users get (not yanked), newest first
-  timeout 60 "$CLI" package info "$1" --json 2>/dev/null | python3 -c 'import json,sys
-print(" ".join([r["release"] for r in json.load(sys.stdin)["releases"] if not r.get("yanked")][:2]))'; }
-NGPU=$(timeout 60 "$CLI" --json machine show "$M" 2>/dev/null | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["status"]["gpus"]))')
+  timeout 60 "$CLI" package info "$1" --json 2>/dev/null | jq -r '[.releases[] | select(.yanked | not) | .release][:2] | join(" ")'; }
+NGPU=$(timeout 60 "$CLI" --json machine show "$M" 2>/dev/null | jq '.status.gpus | length')
 
 # Generations: install, update and roll back a package; then the Runtime back a release and forward to the candidate.
 read -r first second <<< "$(released sdxl)"
 NEW=$(tr , '\n' <<< "$PINS" | sed -n 's/^sdxl@//p' | head -1); NEW=${NEW:-$first}
 OLD=$first; [ "$OLD" != "$NEW" ] || OLD=$second
 "$CLI" package install "sdxl@$OLD" --on "$M" -y > "$T/install.log" 2>&1; a=$(envs)
-"$CLI" package update "sdxl@$NEW" --on "$M" -y > "$T/update.log" 2>&1; b=$(envs)
+"$CLI" package $MOVE "sdxl@$NEW" --on "$M" -y > "$T/update.log" 2>&1; b=$(envs)
 n1=$(submit "sdxl/generate@$NEW" prompt="$SCENE, generation $NEW" seed:=$((R + 30))); until_status "$n1" terminal
-"$CLI" package update "sdxl@$OLD" --on "$M" -y > "$T/rollback.log" 2>&1; c=$(envs)
+"$CLI" package $MOVE "sdxl@$OLD" --on "$M" -y > "$T/rollback.log" 2>&1; c=$(envs)
 n2=$(submit "sdxl/generate@$OLD" prompt="$OBJECT, generation $OLD" seed:=$((R + 31))); until_status "$n2" terminal
 if [[ " $a " == *" sdxl@$OLD "* && " $b " == *" sdxl@$NEW "* && " $c " == *" sdxl@$OLD "* ]] \
    && [ "$(get "$n1" status)" = completed ] && [ "$(get "$n2" status)" = completed ]; then
@@ -68,12 +68,12 @@ fi
 # and a completed run's outputs land here whole.
 a=$(submit "sdxl/generate@$NEW" prompt="$SCENE, the long run" steps:=60 seed:=$((R + 34)))
 b=$(submit "sdxl/generate@$NEW" prompt="$OBJECT, the queued run" steps:=60 seed:=$((R + 35)))
-until_status "$a" running; qb=$(get "$b" status)
+until_status "$a" in_progress; qb=$(get "$b" status)
 "$CLI" run cancel "$b" -y > "$T/cancel-queued.log" 2>&1; until_status "$b" terminal
 "$CLI" run cancel "$a" -y > "$T/cancel-running.log" 2>&1; until_status "$a" terminal
 c=$(submit "sdxl/generate@$NEW" prompt="$CHAR, the landed run" seed:=$((R + 36))); until_status "$c" terminal
 f=$(ls ~/.cozy/outputs/*/"$c"-* 2>/dev/null | grep -v '\.part$' | head -1)
-want=$(grep -ho '"length":[0-9]*' "$T/$c.watch" | tail -1 | cut -d: -f2)
+want=$(jq -r 'select(.type == "output_item.done") | .item.length' "$T/$c.follow" 2>/dev/null | tail -1)
 if [ "$qb" = queued ] && [ "$(get "$b" status)" = canceled ] && [ -z "$(get "$b" ms)" ] && [ "$(get "$a" status)" = canceled ] \
    && [ "$(get "$c" status)" = completed ] && [ -n "$f" ] && [ "$(stat -c %s "$f")" = "$want" ]; then
   expect tensord-run-lifecycle PASS "run $b queued behind $a and canceled unrun; $a canceled running; $c's $want bytes landed"
@@ -87,7 +87,7 @@ fi
 s=$(submit "$(pkg anima generate)" prompt="masterpiece, anime illustration of $CHAR, stacked" seed:=$((R + 37))); until_status "$s" terminal
 k=$(submit "$(pkg flux-3-klein generate_turbo)" prompt="$OBJECT, stacked" seed:=$((R + 38))); until_status "$k" terminal
 d=$(submit "$(pkg qwen3.5 ask)" prompt="Describe this image in one sentence." --asset images="$REF"); until_status "$d" terminal
-ended=$(timeout 60 "$CLI" machine logs "$M" -n 2000 2>/dev/null | grep -c 'ending idle')
+ended=$(timeout 60 "$CLI" machine logs "$M" tensord -n 0 2>/dev/null | grep -c 'ending idle')
 [ "$(get "$s" status)$(get "$k" status)$(get "$d" status)" = completedcompletedcompleted ] \
   && expect tensord-leases PASS "SDXL, Anima and Klein stacked, then the describer fit (run $d); $ended idle executors ended" \
   || expect tensord-leases FAIL "anima $s $(get "$s" status), klein $k $(get "$k" status), describer $d $(get "$d" status) $(get "$d" reason)"
@@ -99,7 +99,7 @@ r=$(submit "sdxl/generate@$NEW" prompt="$SCENE, after the restart" seed:=$((R + 
 
 # No re-execution: the machine restarts while a run is in flight; the run ends once, as completed or failed with a
 # reason, and is never attempted again.
-x=$(submit "sdxl/generate@$NEW" prompt="$OBJECT, in flight" steps:=60 seed:=$((R + 40))); until_status "$x" running
+x=$(submit "sdxl/generate@$NEW" prompt="$OBJECT, in flight" steps:=60 seed:=$((R + 40))); until_status "$x" in_progress
 "$CLI" machine update "$M" --gpu-memory-limit off -y > "$T/restart-inflight.log" 2>&1; until_status "$x" terminal
 case "$(get "$x" status):$(get "$x" attempt)" in
   completed:1) expect tensord-no-reexecution PASS "run $x completed once (the restart waited for it: a mid-run TensorD kill is not reachable through cozy)";;
@@ -122,10 +122,10 @@ fi
 
 # Output delivery: an output's landing against this computer's own download speed (5.9 MB took 4 min on 10-23).
 link=$(curl -sfL -o /dev/null -w '%{speed_download}' "https://github.com/cozy-creator/cozy-creator/releases/download/v0.11.15/cozy-x86_64-unknown-linux-gnu.tar.gz")
-"$CLI" run "sdxl/generate@$NEW" --on "$M" --json prompt="$SCENE, a large render" megapixels:=2 seed:=$((R + 43)) 2>/dev/null \
-  | while IFS= read -r l; do printf '%s %s\n' "$(date +%s.%N)" "$l"; done > "$T/delivery.ndjson"; end=$(date +%s.%N)
-read -r done_ bytes <<< "$(grep '"type":"output_item.done"' "$T/delivery.ndjson" | tail -1 | python3 -c 'import json,sys
-t, j = sys.stdin.read().split(" ", 1); print(t, json.loads(j)["item"]["length"])' 2>/dev/null)"
+"$CLI" --json run "sdxl/generate@$NEW" --on "$M" prompt="$SCENE, a large render" megapixels:=2 seed:=$((R + 43)) 2>/dev/null \
+  | while IFS= read -r l; do jq -c --arg t "$(date +%s.%N)" '. + {at_here: ($t | tonumber)}' <<< "$l" 2>/dev/null; done > "$T/delivery.ndjson"
+end=$(date +%s.%N)
+read -r done_ bytes <<< "$(jq -r 'select(.type == "output_item.done") | "\(.at_here) \(.item.length)"' "$T/delivery.ndjson" | tail -1)"
 python3 - "${done_:-0}" "$end" "${bytes:-0}" "${link:-0}" <<'PY' > "$T/delivery.txt"
 import sys
 done, end, size, link = map(float, sys.argv[1:])
@@ -133,3 +133,5 @@ took = end - done; expect = size / link if link else 0
 print('PASS' if size and took <= 10 * expect + 5 else 'FAIL', f'{size / 1e6:.1f} MB landed in {took:.1f} s; this computer downloads {link / 1e6:.1f} MB/s, so {expect:.1f} s (bar: 10x + 5 s)')
 PY
 read -r v rest < "$T/delivery.txt"; expect tensord-output-delivery "$v" "$rest"
+
+. "$HERE/suites/tensord/skew.sh"
