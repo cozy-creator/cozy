@@ -8,9 +8,10 @@
 #   --runtime-wheel FILE  a candidate cozy-runtime wheel for the local machine
 #   --packages DIR        a packages checkout: its package directories run instead of the published releases
 #   --pins N@R,...        package releases to take instead of the latest unyanked ones (gated candidates)
+#   --published           the imports suite loads published releases, not the packages checkout
 
 set -euo pipefail
-OUT='' CAND_COZY='' CAND_TFS='' CAND_RT='' PACKAGES='' PINS=''
+OUT='' CAND_COZY='' CAND_TFS='' CAND_RT='' PACKAGES='' PINS='' PUBLISHED=''
 COZY=$HOME/.cozy/bin/cozy
 [ "${RUNNER_OS:-}" != Windows ] || COZY=$HOME/.cozy/bin/cozy.exe
 
@@ -23,6 +24,7 @@ parse() {
       --runtime-wheel) CAND_RT=$2 ;;
       --packages) PACKAGES=$2 ;;
       --pins) PINS=$2 ;;
+      --published) PUBLISHED=1; shift; continue ;;
       *) echo "unknown argument $1" >&2; exit 2 ;;
     esac
     shift 2
