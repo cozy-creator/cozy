@@ -270,7 +270,7 @@ pub async fn exec(ctx: &Context, id: &str, once: bool) -> Result<ExitCode, Error
     );
     gpus.print(ctx, "attention kernels");
     let memory = grid(
-        &["GPU", "KEPT", "LEASED", "STORE", "DERIVED", "STALL", "PEAK", "TORCH", "COMPUTE", "EVICTED", "LEFTOVER"],
+        &["GPU", "KEPT", "LEASED", "STORE", "DERIVED", "STALL", "PEAK", "WORKING", "TORCH", "COMPUTE", "EVICTED", "LEFTOVER"],
         &measured,
         memory_rows,
     );
@@ -586,8 +586,9 @@ fn gpu_rows(measured: &Measured) -> Vec<Vec<String>> {
 
 /// Each GPU's whole request: the bytes moved by source (kept from the manager's retention, leased
 /// and filled, read from the store, refilled from a derived entry) at their rate against the measured ceiling, the stall, the
-/// most it held (pages and torch's bytes), torch's own peak, the compute bytes, what make_room took
-/// and what it still held at the end.
+/// most it held (pages and torch's bytes), the most it needed at once (its step's pages and the
+/// pass's torch peak), torch's own peak, the compute bytes, what make_room took and what it
+/// still held at the end.
 fn memory_rows(measured: &Measured) -> Vec<Vec<String>> {
     let row = |g: &GpuMemory| {
         let s = &g.stats;
@@ -602,6 +603,7 @@ fn memory_rows(measured: &Measured) -> Vec<Vec<String>> {
             moved(&s.moved.derived, disk),
             duration(s.stall_ns as f64 / 1e6),
             output::bytes(s.peak),
+            output::bytes(s.working),
             output::bytes(g.torch_peak),
             output::bytes(s.compute),
             evicted(&s.evicted),

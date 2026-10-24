@@ -357,7 +357,11 @@ class Stats:
     @property
     def evicted(self) -> list[int]: ...
     @property
-    def peak(self) -> int: ...
+    def peak(self) -> int:
+        """The most it held at a pass end: pages and torch's bytes."""
+    @property
+    def working(self) -> int:
+        """The most it needed at once: its step's mapped pages and the pass's torch peak."""
     @property
     def compute(self) -> int: ...
     @property

@@ -247,6 +247,9 @@ pub struct Stats {
     /// The most it held at a pass end: pages and torch's bytes (the peak its passes reported,
     /// when more).
     pub peak: u64,
+    /// The most it needed at once: at a pass end, the mapped pages of its step's sets and the
+    /// pass's torch peak. What a capped card must fit; `peak` adds whatever else stays resident.
+    pub working: u64,
     /// The most its passes allocated beside its weights, as they reported it: its compute bytes.
     pub compute: u64,
     /// The process's anonymous host high-water over it (file mappings aside); `None` where it
@@ -2229,8 +2232,11 @@ impl Inner {
         let mut st = self.lock();
         st.active.retain(|(r, _), a| !(*r == req && a.id == pass));
         let held = st.table.mapped() + peak;
+        let step = st.table.request(req).and_then(|r| r.steps.get(r.cursor.step as usize)).map(|(sets, _)| sets.clone()).unwrap_or_default();
+        let working = st.table.pages().filter(|(k, p)| p.mapped && step.contains(&k.0)).map(|(_, p)| p.bytes).sum::<u64>() + peak;
         if let Some(s) = st.stats(Some(req)) {
             s.peak = s.peak.max(held);
+            s.working = s.working.max(working);
             s.compute = s.compute.max(peak);
         }
         self.unlock(st);
