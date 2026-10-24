@@ -368,6 +368,9 @@ class Stats:
     @property
     def outlived(self) -> list[Outlived]:
         """Its torch blocks still live at its end: the request-end audit."""
+    @property
+    def torch_peak(self) -> int:
+        """The most torch's blocks in its arena held over it."""
 
 class MakeRoom:
     """One make_room that took bytes for a request."""

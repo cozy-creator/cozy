@@ -625,7 +625,8 @@ class Memory:
     def torch_stats(self) -> dict[str, object]:
         """varena's figures for torch's blocks here (torch's own memory statistics don't see a
         pluggable allocator): allocated, mapped and peak bytes, fragmentation (mapped less live);
-        per open request (allocated, peak); per capture pool (mapped, allocated)."""
+        per open request by the name it was opened under (allocated, the most it held so far); per
+        capture pool (mapped, allocated)."""
         allocated, mapped, peak, fragmentation, requests, pools = self.native.torch_stats()
         return {
             "allocated": allocated, "mapped": mapped, "peak": peak, "fragmentation": fragmentation,

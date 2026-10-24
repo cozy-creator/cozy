@@ -131,6 +131,7 @@ pub struct Outlived {
 #[cfg_attr(feature = "python", pyo3::pyclass(module = "tensorfs.varena", frozen, get_all, skip_from_py_object))]
 pub struct Ended {
     pub allocated: u64,
+    /// The most it held over its life (a request's passes and sections reset only their own).
     pub peak: u64,
     pub outlived: Vec<Outlived>,
 }
@@ -139,7 +140,10 @@ pub struct Ended {
 pub struct ArenaStats {
     /// Bytes of live blocks as placed (a slot its class, a run its 512 B rounding).
     pub allocated: u64,
+    /// Since the open pass or section began.
     pub peak: u64,
+    /// The most it held over its life.
+    pub high: u64,
     /// Bytes of the spans it holds.
     pub mapped: u64,
 }
@@ -252,6 +256,8 @@ struct State {
     held: Vec<u64>,
     allocated: u64,
     peak: u64,
+    /// The most it held over its life: no pass or section resets it.
+    high: u64,
     /// The highest a section of the open pass reached ([`Torch::reset_peak`]): the pass's peak
     /// covers it.
     carried: u64,
@@ -940,7 +946,7 @@ impl Torch {
         }
         let ended = {
             let st = a.st.lock();
-            Ended { allocated: st.allocated, peak: st.peak, outlived: st.live() }
+            Ended { allocated: st.allocated, peak: st.high, outlived: st.live() }
         };
         // Its idle spans beyond the float go back now.
         self.sh.kick();
@@ -955,7 +961,7 @@ impl Torch {
             .into_iter()
             .map(|a| {
                 let st = a.st.lock();
-                (a.owner, ArenaStats { allocated: st.allocated, peak: st.peak, mapped: st.mapped })
+                (a.owner, ArenaStats { allocated: st.allocated, peak: st.peak, high: st.high, mapped: st.mapped })
             })
             .collect();
         // Mapped before idle: a give-back between them leaves mapped ≥ idle still.
@@ -1252,6 +1258,7 @@ impl Shared {
     fn count(&self, st: &mut State, n: u64) {
         st.allocated += n;
         st.peak = st.peak.max(st.allocated);
+        st.high = st.high.max(st.allocated);
         let now = self.allocated.fetch_add(n, AcqRel) + n;
         self.peak.fetch_max(now, AcqRel);
     }

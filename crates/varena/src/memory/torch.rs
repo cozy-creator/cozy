@@ -31,7 +31,7 @@ pub struct TorchStats {
     pub peak: u64,
     /// The allocator's own overhead: mapped less live torch bytes.
     pub fragmentation: u64,
-    /// Request id → (allocated, peak).
+    /// Each open request by the name it was opened under → (allocated, the most it held so far).
     pub requests: Vec<(String, u64, u64)>,
     /// Pool → (mapped, allocated): torch's `MemPool.snapshot()` raises under a pluggable allocator.
     pub pools: Vec<(PoolId, u64, u64)>,
@@ -133,11 +133,13 @@ impl Memory {
 
     pub fn torch_stats(&self) -> TorchStats {
         let Some(t) = self.inner.torch.get() else { return TorchStats::default() };
+        // A request by the name it was opened under, which is how its caller knows it.
+        let names: std::collections::HashMap<u64, String> = self.inner.state.lock().table.requests.iter().map(|r| (r.id, r.name.clone())).collect();
         let s = t.stats();
         let mut out = TorchStats { allocated: s.allocated, mapped: s.mapped, peak: s.peak, fragmentation: s.fragmentation, ..TorchStats::default() };
         for (owner, a) in s.arenas {
             match owner {
-                Owner::Request(id) => out.requests.push((id.to_string(), a.allocated, a.peak)),
+                Owner::Request(id) => out.requests.push((names.get(&id).cloned().unwrap_or_else(|| id.to_string()), a.allocated, a.high)),
                 Owner::Pool(p) => out.pools.push((p, a.mapped, a.allocated)),
                 Owner::Process | Owner::Region(_) => {}
             }
