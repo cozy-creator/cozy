@@ -542,6 +542,17 @@ impl Wakes {
     }
 }
 
+/// Why a page is mapped. Speculative: prefetch, regrowth, a leased preload; a refusal leaves it
+/// unmapped quietly. Idle: a bind of idle work (an idle request, a free-only bind); it waits or
+/// fails like a demand one. Leased, both ask the manager speculatively: free bytes above high
+/// only, never a reclaim (a game keeps what an idle warm-up would take).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Want {
+    Demand,
+    Idle,
+    Speculative,
+}
+
 /// A call to the device's virtual-memory mechanism (`cuMemCreate`, `cuMemMap`, `cuMemUnmap`):
 /// each may wait on the host for queued device work, so none runs under the state lock. One
 /// thread runs them in the order decided (an eviction's unmap before the create its bytes go
@@ -549,7 +560,7 @@ impl Wakes {
 enum Mech {
     /// Create (or lease) a page, map it read-write, then queue its fill; `decided`: the bind's
     /// (none: a speculative page, which goes quietly when refused).
-    Map { key: Key, gen: u64, va: Va, off: u64, span: u64, job: Job, decided: bool },
+    Map { key: Key, gen: u64, va: Va, off: u64, span: u64, job: Job, want: Want },
     /// Unmap a page (the driver lets its consumers finish) and give it back.
     Unmap { va: Va, off: u64, span: u64, phys: Option<Physical>, ready: Event },
     /// A leased page whose fill identity changed (a grant's identity never changes): unmapped
@@ -1379,7 +1390,7 @@ impl Inner {
 
     /// Maps a page read-write and queues its fill. A speculative map that finds no device
     /// memory stops softly (false).
-    fn map(&self, st: &mut State, key: Key, req: Option<u64>, speculative: bool) -> Result<bool> {
+    fn map(&self, st: &mut State, key: Key, req: Option<u64>, want: Want) -> Result<bool> {
         if st.homes.contains_key(&key) {
             return Ok(true);
         }
@@ -1388,9 +1399,9 @@ impl Inner {
         let identity = st.mech(key.0)?.key.clone();
         // Counted mapped (and pinned, filling) now; the mechanism creates and maps it after
         // the unmaps decided before it, then queues its fill.
-        st.homes.insert(key, Home::new(gen, speculative, identity));
+        st.homes.insert(key, Home::new(gen, want == Want::Speculative, identity));
         st.sync(key);
-        self.mech.post(Mech::Map { key, gen, va, off, span, job: Job { key, gen, req, span, after: vec![] }, decided: !speculative });
+        self.mech.post(Mech::Map { key, gen, va, off, span, job: Job { key, gen, req, span, after: vec![] }, want });
         Ok(true)
     }
 
@@ -1867,7 +1878,7 @@ impl Inner {
         while let Some(bytes) = (w < blocks).then(|| st.table.page((set, w)).map(|p| p.bytes)).flatten().filter(|b| *b <= room) {
             // A slot already there is resident now at no cost; a block with no page is mapped.
             if !st.homes.contains_key(&(set, w)) {
-                if !self.map(&mut st, (set, w), Some(req), true).unwrap_or(false) {
+                if !self.map(&mut st, (set, w), Some(req), Want::Speculative).unwrap_or(false) {
                     break;
                 }
                 room -= bytes;
@@ -1887,7 +1898,7 @@ impl Inner {
                 next += 1;
             }
             let Some(bytes) = (next < blocks).then(|| st.table.page((set, next)).map(|p| p.bytes)).flatten().filter(|b| *b <= room) else { break };
-            if !self.map(&mut st, (set, next), Some(req), true).unwrap_or(false) {
+            if !self.map(&mut st, (set, next), Some(req), Want::Speculative).unwrap_or(false) {
                 break;
             }
             room -= bytes;
@@ -1901,7 +1912,7 @@ impl Inner {
         let mut st = self.lock();
         let spare = self.spare(&st);
         for key in decide::prefetch(&st.table, req, spare) {
-            if self.map(&mut st, key, Some(req), true).unwrap_or(false) {
+            if self.map(&mut st, key, Some(req), Want::Speculative).unwrap_or(false) {
                 let step = st.table.request(req).map_or(0, |r| r.cursor.step);
                 if let Some(p) = st.table.page_mut(key) {
                     p.speculative = Some((req, step));
@@ -1963,7 +1974,7 @@ impl Inner {
                         if bytes > free {
                             break;
                         }
-                        self.map(&mut st, key, None, leased)?;
+                        self.map(&mut st, key, None, if leased { Want::Speculative } else { Want::Demand })?;
                         free -= bytes;
                     }
                     self.unlock(st);
@@ -2104,7 +2115,8 @@ impl Inner {
                         }
                     }
                     if !st.homes.contains_key(&key) {
-                        self.map(&mut st, key, req, false)?;
+                        let idle = free_only || req.and_then(|r| st.table.request(r)).is_some_and(|r| r.idle);
+                        self.map(&mut st, key, req, if idle { Want::Idle } else { Want::Demand })?;
                     }
                 }
             }
@@ -2630,7 +2642,7 @@ impl Inner {
             return;
         }
         match op {
-            Mech::Map { key, gen, va, off, span, job, decided } => self.place_page(key, gen, va, off, span, job, decided),
+            Mech::Map { key, gen, va, off, span, job, want } => self.place_page(key, gen, va, off, span, job, want),
             #[cfg(unix)]
             Mech::Revoke => self.revoke(),
             #[cfg(unix)]
@@ -2659,7 +2671,7 @@ impl Inner {
                     }
                 }
                 after.into_iter().for_each(|e| self.backend.retire(e));
-                self.place_page(key, gen, va, off, span, job, true);
+                self.place_page(key, gen, va, off, span, job, Want::Demand);
             }
             Mech::Unmap { va, off, span, phys, ready } => {
                 // A page read ready at issue may still be landing: its copies end first.
@@ -2687,11 +2699,11 @@ impl Inner {
     }
 
     /// Creates and maps a page for `key` and queues its fill; a create the device cannot serve
-    /// leaves the page unmapped (`decided` false: a speculative page, which goes quietly).
-    /// Leased, the page is asked of the manager and placed on the agent's thread when granted:
-    /// this thread never waits on it.
-    #[allow(clippy::too_many_arguments)]
-    fn place_page(self: &Arc<Self>, key: Key, gen: u64, va: Va, off: u64, span: u64, job: Job, decided: bool) {
+    /// leaves a speculative page unmapped (it goes quietly). Leased, the page is asked of the
+    /// manager (speculatively unless it is demand) and placed on the agent's thread when
+    /// granted: this thread never waits on it.
+    fn place_page(self: &Arc<Self>, key: Key, gen: u64, va: Va, off: u64, span: u64, job: Job, want: Want) {
+        let decided = want != Want::Speculative;
         #[cfg(unix)]
         if let Some(agent) = self.lease.get().cloned() {
             let (start, region) = (Instant::now(), self.lease_region(key));
@@ -2701,6 +2713,7 @@ impl Inner {
                 crate::lease::Kind::Weights,
                 region,
                 self.fill_key(key),
+                want != Want::Demand,
                 Box::new(move |got| {
                     if let Some(inner) = me.upgrade() {
                         inner.leased_page(key, gen, va, off, span, job, decided, got, start, region.is_some());

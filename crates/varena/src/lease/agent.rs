@@ -226,11 +226,12 @@ impl Agent {
         let _ = self.end.send(&ToManager::Answered, None);
     }
 
-    /// Asks for `bytes` of weights for `region` (`fill`: its declared fill key); `done` runs on
+    /// Asks for `bytes` of weights for `region` (`fill`: its declared fill key; `speculative`:
+    /// prefetch, warm-up or idle work, served from free bytes above high only); `done` runs on
     /// the reader thread with the imported leases (the holder maps each and answers it) or the
     /// refusal (Exhausted), once the manager answers: after room is made, which may take other
     /// processes' revokes.
-    pub fn ask(&self, bytes: u64, kind: Kind, region: Option<Region>, fill: Option<String>, done: Done) -> Result<()> {
+    pub fn ask(&self, bytes: u64, kind: Kind, region: Option<Region>, fill: Option<String>, speculative: bool, done: Done) -> Result<()> {
         let id = {
             let mut p = self.pending.lock();
             if p.closed {
@@ -243,7 +244,7 @@ impl Agent {
             p.asks.insert(id, Asking { bytes, got: vec![], entry: None, done });
             id
         };
-        self.end.send(&ToManager::Ask { id, bytes, kind, region, fill }, None)
+        self.end.send(&ToManager::Ask { id, bytes, kind, region, fill, speculative }, None)
     }
 
     /// Asks the host for a disk entry to write `key`'s derived bytes into; `done` runs on the
@@ -269,7 +270,7 @@ impl Agent {
     }
 
     /// [`Agent::ask`], waiting for the answer here: never on a thread that answers revokes.
-    pub fn take(&self, bytes: u64, kind: Kind, region: Option<Region>) -> Result<Vec<Lease>> {
+    pub fn take(&self, bytes: u64, kind: Kind, region: Option<Region>, speculative: bool) -> Result<Vec<Lease>> {
         let answer = Arc::new((Mutex::new(None), Condvar::new()));
         let set = answer.clone();
         self.ask(
@@ -277,6 +278,7 @@ impl Agent {
             kind,
             region,
             None,
+            speculative,
             Box::new(move |r| {
                 *set.0.lock() = Some(r);
                 set.1.notify_all();

@@ -98,7 +98,8 @@ pub trait Source: Send + Sync {
     /// the wait never needs Python: the caller may hold the GIL. It is never called on a capturing
     /// thread; its driver calls run in relaxed capture mode, since another thread may be
     /// capturing. It errs only at the floor: `Exhausted` (nothing revocable) or `Closed`.
-    fn map(&self, va: Va, kind: Kind, into: &mut Vec<Chunk>) -> Result<()>;
+    /// `speculative` (idle work, a capture's pool): served from free bytes above high only.
+    fn map(&self, va: Va, kind: Kind, speculative: bool, into: &mut Vec<Chunk>) -> Result<()>;
     /// Unmaps chunks the arenas are done with (whole free, their epochs passed) and gives them back.
     /// Returns those it could not take back (still pinned, or an unmap failed), each at its
     /// address: they stay mapped, the arena keeps their addresses reserved, and it calls again for
@@ -266,6 +267,8 @@ struct State {
 
 struct Arena {
     owner: Owner,
+    /// Idle work's (an idle request's): its chunks are asked speculatively.
+    speculative: AtomicBool,
     ended: AtomicBool,
     queued: AtomicBool,
     /// A pool whose use count reached 0.
@@ -280,6 +283,7 @@ impl Arena {
     fn new(owner: Owner) -> Arc<Arena> {
         Arc::new(Arena {
             owner,
+            speculative: AtomicBool::new(false),
             ended: AtomicBool::new(false),
             queued: AtomicBool::new(false),
             released: AtomicBool::new(false),
@@ -899,7 +903,7 @@ impl Torch {
             };
             let va = sh.reserve(short)?;
             let mut chunks = Vec::new();
-            match sh.source.map(va, Kind::Pool, &mut chunks) {
+            match sh.source.map(va, Kind::Pool, true, &mut chunks) {
                 Ok(()) => {
                     sh.mapped.fetch_add(va.len, AcqRel);
                     let mut st = a.st.lock();
@@ -916,11 +920,15 @@ impl Torch {
     }
 
     /// Routes this thread's blocks to `owner`'s arena (made at first use) until the route drops.
-    pub fn route(&self, owner: Owner) -> Route {
+    /// `speculative`: the owner's work is idle (an idle request's), its chunks asked speculatively.
+    pub fn route(&self, owner: Owner, speculative: bool) -> Route {
         let arena = match owner {
             Owner::Process => self.sh.process.clone(),
             o => self.sh.arena(o),
         };
+        if speculative && owner != Owner::Process {
+            arena.speculative.store(true, Release);
+        }
         let to = Arc::new(RouteTo { arena, live: AtomicBool::new(true) });
         let id = self.sh.id;
         let _ = ROUTES.try_with(|r| r.borrow_mut().push((id, to.clone())));
@@ -1321,7 +1329,7 @@ impl Shared {
             }
             let va = self.reserve(new)?;
             let mut chunks = Vec::new();
-            match self.source.map(va, if a.pool() { Kind::Pool } else { Kind::Torch }, &mut chunks) {
+            match self.source.map(va, if a.pool() { Kind::Pool } else { Kind::Torch }, a.speculative.load(Acquire), &mut chunks) {
                 Ok(()) => {
                     self.mapped.fetch_add(va.len, AcqRel);
                     let mut st = a.st.lock();
@@ -1711,7 +1719,7 @@ impl Direct {
 }
 
 impl Source for Direct {
-    fn map(&self, va: Va, _: Kind, into: &mut Vec<Chunk>) -> Result<()> {
+    fn map(&self, va: Va, _: Kind, _: bool, into: &mut Vec<Chunk>) -> Result<()> {
         let mut off = 0;
         while off < va.len {
             let len = (va.len - off).min(CHUNK);
