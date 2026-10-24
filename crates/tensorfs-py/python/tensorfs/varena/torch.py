@@ -657,9 +657,10 @@ class Memory:
         return self._graph_pool
 
     def graph_region(self, sets: nn.Module | Model | Sequence[nn.Module | Model] = (), retained: nn.Module | Model | Sequence[nn.Module | Model] = ()) -> GraphRegion:
-        """One component's graphs on this device: `sets` the models they read, `retained` those
-        held bound across replays."""
-        return GraphRegion(self, self.native.graph_region(self.graph_pool, self._set_ids(sets), self._set_ids(retained)))
+        """One component's graphs on this device. It pins no weights (D11): a replay's are its
+        Binding's, leased only around that replay. `sets` and `retained` are the Runtime's
+        names for them and go unused."""
+        return GraphRegion(self, self.native.graph_region(self.graph_pool))
 
     def _set_ids(self, models: nn.Module | Model | Sequence[nn.Module | Model]) -> list[int]:
         many = models if isinstance(models, Sequence) else [models]

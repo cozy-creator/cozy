@@ -20,7 +20,7 @@ use parking_lot::Mutex;
 
 use crate::arena::{Ended, Evicted, Owner, PoolId};
 use crate::backend::Event;
-use crate::memory::{Allocating, Memory, Pin, Retained, SetId};
+use crate::memory::{Allocating, Memory, SetId};
 use crate::table::SLOTS;
 use crate::{Error, Result};
 
@@ -393,17 +393,15 @@ impl Word {
 struct Held {
     /// Per stream, the event recorded after its last released replay.
     events: HashMap<usize, Event>,
-    /// A replay whose completion is unknown (no event, no synchronize): its pins are never released.
+    /// A replay whose completion is unknown (no event, no synchronize): its pool is never released.
     lost: bool,
-    pins: Vec<Pin>,
-    bindings: Vec<Retained>,
 }
 
+/// A component's graphs: their capture pool and the drop word. They pin no weights: a replay's
+/// weights are its Binding's, leased only around that replay (D11).
 struct Graph {
     id: u64,
     memory: Memory,
-    sets: Vec<SetId>,
-    retained: Vec<SetId>,
     pool: PoolId,
     word: Arc<Word>,
     held: Mutex<Held>,
@@ -459,8 +457,6 @@ impl Graph {
             h.events.remove(&stream);
             self.memory.retire_event(event);
         }
-        h.pins.clear();
-        h.bindings.clear();
         self.dropped.store(true, Ordering::Release);
         drop(h);
         if !self.closed.load(Ordering::Acquire) {
@@ -471,16 +467,13 @@ impl Graph {
 
     fn record(&self) -> Record {
         let dropped = self.dropped.load(Ordering::Acquire);
-        let mut slots = Vec::new();
-        if !dropped {
-            let sets: Vec<SetId> = self.sets.iter().chain(&self.retained).copied().collect();
-            slots = self.memory.lease_slots(&sets);
-            slots.extend(self.memory.torch_if().map_or_else(Vec::new, |t| t.slots(Owner::Pool(self.pool))));
-        }
+        let torch = self.memory.torch_if().filter(|_| !dropped);
+        let slots = torch.as_ref().map_or_else(Vec::new, |t| t.slots(Owner::Pool(self.pool)));
+        let bytes = torch.map_or(0, |t| t.stats().arenas.iter().find(|(o, _)| *o == Owner::Pool(self.pool)).map_or(0, |(_, s)| s.mapped));
         Record {
             id: self.id,
             kind: Reclaimable::Graph,
-            bytes: if dropped { 0 } else { self.held.lock().pins.iter().map(|p| p.len).sum() },
+            bytes,
             slots,
             cost_ns: self.capture_ns.load(Ordering::Acquire),
             last_use: self.last_use.load(Ordering::Acquire),
@@ -518,14 +511,6 @@ impl GraphRegion {
     /// The capture pool token every graph of the region captures into.
     pub fn pool(&self) -> PoolId {
         self.g.pool
-    }
-
-    pub fn sets(&self) -> &[SetId] {
-        &self.g.sets
-    }
-
-    pub fn retained(&self) -> &[SetId] {
-        &self.g.retained
     }
 
     /// Maps `expected` bytes into the pool before capture begins, making room now. A shape's first capture has none.
@@ -609,23 +594,15 @@ impl Memory {
     }
 
     /// A component's graph region on this device (§5): `pool` is the device's one capture pool
-    /// token. Every block of `sets` and `retained` is pinned (made resident now) for its life.
-    pub fn graph_region(&self, sets: &[SetId], retained: &[SetId], pool: PoolId) -> Result<GraphRegion> {
-        let mut held = Held::default();
-        for &set in sets.iter().chain(retained) {
-            let binding = self.retain(set, &self.blocks(set)?)?;
-            held.pins.extend(binding.prepare(0)?);
-            held.bindings.push(binding);
-        }
+    /// token. It pins no weights (D11): a replay's are its Binding's, leased around that replay.
+    pub fn graph_region(&self, pool: PoolId) -> Result<GraphRegion> {
         self.torch()?.pool_retain(pool);
         let g = Arc::new(Graph {
             id: IDS.fetch_add(1, Ordering::Relaxed),
             memory: self.clone(),
-            sets: sets.to_vec(),
-            retained: retained.to_vec(),
             pool,
             word: Arc::default(),
-            held: Mutex::new(held),
+            held: Mutex::new(Held::default()),
             dropped: AtomicBool::new(false),
             closed: AtomicBool::new(false),
             capture_ns: AtomicU64::new(0),

@@ -289,11 +289,9 @@ impl PyMemory {
     }
 
     /// A component's graph region on this device (§5): every graph of it captures into `pool`,
-    /// the device's one capture pool token.
-    #[pyo3(signature = (pool, sets = Vec::new(), retained = Vec::new()))]
-    fn graph_region(&self, py: Python<'_>, pool: (u64, u64), sets: Vec<u32>, retained: Vec<u32>) -> PyResult<PyGraphRegion> {
-        let (sets, retained): (Vec<SetId>, Vec<SetId>) = (sets.into_iter().map(SetId).collect(), retained.into_iter().map(SetId).collect());
-        let graph = detached(py, &self.gpu.uuid, || self.memory().graph_region(&sets, &retained, varena::PoolId(pool.0, pool.1)))?;
+    /// the device's one capture pool token. It pins no weights (D11).
+    fn graph_region(&self, py: Python<'_>, pool: (u64, u64)) -> PyResult<PyGraphRegion> {
+        let graph = detached(py, &self.gpu.uuid, || self.memory().graph_region(varena::PoolId(pool.0, pool.1)))?;
         Ok(PyGraphRegion { graph: Mutex::new(Some(graph)), gpu: self.gpu.uuid.clone() })
     }
 

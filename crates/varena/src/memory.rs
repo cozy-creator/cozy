@@ -409,23 +409,6 @@ impl Memory {
         let _ = (id, record);
     }
 
-    /// The lease slots of `sets`' leased pages.
-    pub(crate) fn lease_slots(&self, sets: &[SetId]) -> Vec<u32> {
-        #[cfg(unix)]
-        return self.inner.leased.lock().values().filter(|(_, key, _)| sets.iter().any(|s| s.0 == key.0)).map(|(t, ..)| t.slot).collect();
-        #[cfg(not(unix))]
-        {
-            let _ = sets;
-            Vec::new()
-        }
-    }
-
-    /// Every block of `set`.
-    pub(crate) fn blocks(&self, set: SetId) -> Result<Vec<u32>> {
-        let st = self.inner.state.lock();
-        let n = st.table.sets.get(set.0 as usize).and_then(|s| s.as_ref()).map(|s| s.pages.len()).ok_or_else(|| Error::Closed(format!("set {}", set.0)))?;
-        Ok((0..n as u32).collect())
-    }
 }
 
 /// A request in flight; dropping it ends it: its pins go, and the leftover is measured.
