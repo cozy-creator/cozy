@@ -35,7 +35,8 @@ fi
 # Describe reads a checkout's editable install statically (direct_url.json and .pth paths, never their code).
 step "describe"
 cozy --json run "$(birefnet)" --describe > "$OUT/describe.json" 2> "$OUT/describe.err" || check "cozy run $(birefnet) --describe failed: $(tail -c 300 "$OUT/describe.err")"
-grep -q '"image"' "$OUT/describe.json" || check "the description of $(birefnet) names no image input"
+# (`--describe` prints its table even under --json.)
+grep -Eq '(^|[[:space:]"])image("|:)' "$OUT/describe.json" || check "the description of $(birefnet) names no image input"
 
 step "BiRefNet on the CPU, from a YAML request"
 dog=$(picture dog1.jpg)
