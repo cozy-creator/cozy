@@ -195,3 +195,69 @@ pub(super) fn process(pid: u32) -> io::Result<ProcessMemory> {
         pss_shmem: field("Pss_Shmem"),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const GIB: u64 = 1 << 30;
+
+    /// A fake cgroup mount under the temp directory: `(file, contents)` rows.
+    fn tree(name: &str, files: &[(&str, String)]) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("cozy-cgroup-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        for (file, text) in files {
+            let path = root.join(file);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, text).unwrap();
+        }
+        root
+    }
+
+    fn limit_in(root: &Path, memberships: &str, mounts: &str) -> Option<u64> {
+        cgroups_in(root, memberships, || Some(mounts.to_string())).and_then(|(path, limits, _)| tightest(&path, limits))
+    }
+
+    #[test]
+    fn v2_takes_the_tightest_max_or_set_high_on_the_path() {
+        let root = tree("v2", &[
+            ("cgroup.controllers", "cpu memory".into()),
+            ("ci/memory.max", (32 * GIB).to_string()),
+            ("ci/job/memory.max", "max".into()),
+            ("ci/job/memory.high", "max".into()),
+        ]);
+        assert_eq!(limit_in(&root, "0::/ci/job\n", ""), Some(32 * GIB), "a parent's max bounds its child");
+        fs::write(root.join("ci/job/memory.high"), (24 * GIB).to_string()).unwrap();
+        assert_eq!(limit_in(&root, "0::/ci/job\n", ""), Some(24 * GIB), "a set high is tighter");
+        assert_eq!(limit_in(&root, "0::/\n", ""), None, "the root's own files are no limit");
+        // A container's namespace: its cgroup is the mount.
+        fs::write(root.join("memory.max"), (16 * GIB).to_string()).unwrap();
+        assert_eq!(limit_in(&root, "0::/\n", ""), Some(16 * GIB));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn v1_reads_the_memory_controllers_mount_and_no_unlimited_value() {
+        let unlimited = "9223372036854771712".to_string();
+        let root = tree("v1", &[
+            ("memory/memory.limit_in_bytes", unlimited.clone()),
+            ("memory/docker/abc/memory.limit_in_bytes", (32 * GIB).to_string()),
+            ("container/memory.limit_in_bytes", (8 * GIB).to_string()),
+        ]);
+        let memberships = "12:cpu,cpuacct:/docker/abc\n9:memory:/docker/abc\n";
+        let mount = |mount_root: &str, point: &Path| format!("30 25 0:27 {mount_root} {} rw,nosuid shared:9 - cgroup cgroup rw,memory\n", point.display());
+        // The host's view: the whole hierarchy is mounted.
+        assert_eq!(limit_in(&root, memberships, &mount("/", &root.join("memory"))), Some(32 * GIB));
+        // A container's view: the mount is its own cgroup.
+        assert_eq!(limit_in(&root, memberships, &mount("/docker/abc", &root.join("container"))), Some(8 * GIB));
+        // No memory controller mounted: no limit read.
+        assert_eq!(limit_in(&root, memberships, ""), None);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn the_limit_is_never_above_physical_memory() {
+        let physical = u64::try_from(total()).unwrap();
+        assert!(super::super::limit().is_some_and(|limit| limit <= physical));
+    }
+}
