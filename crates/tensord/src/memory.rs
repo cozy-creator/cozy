@@ -47,6 +47,31 @@ pub struct Leases {
     pub open: Option<Opener>,
     pub tenants: Tenants,
     pub derived: Arc<crate::derived::Derived>,
+    pub ending: Arc<Ending>,
+}
+
+/// The idle executors a GPU's manager asked TensorD to end ([`Hosting::end_idle`]), for the
+/// pool's events thread ([`Source::Ending`]): it ends each whose session is still idle, never one
+/// handed a request meanwhile (that one runs, and the ask waits on it as on any running holder).
+pub struct Ending {
+    pids: Mutex<Vec<u32>>,
+    asked: Signal,
+}
+
+impl Ending {
+    pub fn new() -> io::Result<Arc<Ending>> {
+        Ok(Arc::new(Ending { pids: Mutex::default(), asked: Signal::new().map_err(io::Error::other)? }))
+    }
+
+    fn ask(&self, pids: &[u32]) {
+        self.pids.lock().unwrap_or_else(|e| e.into_inner()).extend(pids);
+        self.asked.set();
+    }
+
+    /// The pids asked for since the last take.
+    pub fn take(&self) -> Vec<u32> {
+        std::mem::take(&mut *self.pids.lock().unwrap_or_else(|e| e.into_inner()))
+    }
 }
 
 /// One GPU's hosting: its peers, its free bytes as NVML reads them, which needs no CUDA
@@ -56,6 +81,7 @@ struct Hosted {
     peers: Arc<Peers>,
     device: Option<platform::gpu::Device>,
     derived: Arc<crate::derived::Derived>,
+    ending: Arc<Ending>,
 }
 
 impl Hosting for Hosted {
@@ -69,6 +95,15 @@ impl Hosting for Hosted {
 
     fn free(&self) -> Option<u64> {
         self.device.as_ref()?.free().ok()
+    }
+
+    fn ends_idle(&self) -> bool {
+        true
+    }
+
+    /// The pool's events thread ends each named executor still idle; the ask waits on its exit.
+    fn end_idle(&self, pids: &[u32]) {
+        self.ending.ask(pids);
     }
 
     fn derive(&self, domain: &str, key: &str, bytes: u64) -> Option<varena::lease::DerivedEntry> {
@@ -111,7 +146,7 @@ impl Gpu {
             .map_err(|error| format!("its listener: {error}"))
             .and_then(|listener| listener.ok_or_else(|| "another process serves its leases".to_string()))
             .and_then(|listener| {
-                let hosting = Arc::new(Hosted { peers: leases.peers, device: platform::gpu::Device::open(&id.uuid).ok(), derived: leases.derived });
+                let hosting = Arc::new(Hosted { peers: leases.peers, device: platform::gpu::Device::open(&id.uuid).ok(), derived: leases.derived, ending: leases.ending });
                 Manager::create(&id, limit, mode, leases.open, listener, hosting).map_err(|error| error.to_string())
             });
         let manager = match manager {
@@ -559,12 +594,15 @@ pub enum Woke {
     Gpu,
     /// The host is short of what its running calls must keep free ([`Host`]).
     HostShort,
+    /// A GPU's manager asked TensorD to end idle executors ([`Ending`]).
+    Ending,
 }
 
 /// A source the events thread waits on: a GPU manager's events, or the host's short event.
 pub enum Source {
     Gpu(Arc<Gpu>),
     Host(Arc<Host>),
+    Ending(Arc<Ending>),
 }
 
 impl Source {
@@ -572,6 +610,7 @@ impl Source {
         match self {
             Source::Gpu(gpu) => gpu.manager.events(),
             Source::Host(host) => host.short.waitable(),
+            Source::Ending(ending) => ending.asked.waitable(),
         }
     }
 
@@ -585,6 +624,10 @@ impl Source {
             Source::Host(host) => {
                 host.short();
                 Woke::HostShort
+            }
+            Source::Ending(ending) => {
+                ending.asked.clear();
+                Woke::Ending
             }
         }
     }
