@@ -2482,7 +2482,12 @@ components:
         rental_id: {type: string}
         name: {type: string}
         state: {type: string}
-        requested_accelerator_model: {type: string}
+        sku:
+          type: string
+          description: The product asked for, then the one its latest attempt bought (one of the request's sku and fallbacks).
+        requested_accelerator_model:
+          type: string
+          description: The card asked for, then the one bought; accelerator_count and the hourly rate follow it.
         provider: {type: string}
         provider_machine_id: {type: string}
         machine_name: {type: string}
@@ -2772,9 +2777,17 @@ components:
           type: string
           description: 1-32 lowercase letters, digits and hyphens, beginning with a letter.
         sku: {type: string, description: A product name from GET /v1/rental-skus.}
+        fallbacks:
+          type: array
+          maxItems: 16
+          description: >-
+            Machines the rental may be bought as, in order, when no offer of the asked one is bought (a run's
+            other placements). Each is bought only at or below the hourly price accepted for the asked one,
+            and only on the same host CPU; a product this Hub does not sell is ignored.
+          items: {$ref: '#/components/schemas/RentalFallback'}
         provider:
           type: string
-          description: An admin's provider choice; refused from anyone else.
+          description: An admin's provider choice; refused from anyone else. Omitted buys from every provider.
         excluded_provider_machines:
           type: array
           description: An admin's excluded provider machines; refused from anyone else.
@@ -2800,6 +2813,12 @@ components:
           maxItems: 32
           items: {$ref: '#/components/schemas/RentalServingModel'}
         container_disk_gb: {type: integer, format: int64, minimum: 0, maximum: 4096}
+    RentalFallback:
+      type: object
+      required: [sku]
+      properties:
+        sku: {type: string}
+        accelerator_count: {type: integer, format: int64, minimum: 0, description: GPU count; 0 or omitted is 1.}
     RentalServingModel:
       type: object
       required: [model]
