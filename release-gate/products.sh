@@ -2,6 +2,8 @@
 # with a scenario prompt and its own seed. A cell that takes another's output (SeedVR2 H3's clip, BiRefNet and the
 # describer Klein's image, Qwen-Image's edits its render) falls back to the gate's reference when that one did not run.
 PRODUCTS=(minimax-h3 seedvr2 sdxl flux-3-klein qwen-image-2 anima birefnet qwen3.5 fibo-2 hidream-o1 moss-image qwen-image)
+# --first runs these packages before the rest, in its order: a clean standalone number before models stack.
+[ -z "$FIRST" ] || mapfile -t PRODUCTS < <(tr , '\n' <<< "$FIRST"; printf '%s\n' "${PRODUCTS[@]}" | grep -vxF -f <(tr , '\n' <<< "$FIRST"))
 product() {
   local f=product_${1//[-.]/_}
   if declare -F "$f" >/dev/null; then "$f"; else log "$1: no product cells"; fi

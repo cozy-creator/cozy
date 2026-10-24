@@ -1,8 +1,91 @@
 [
- {"cell": "h3 with a 3 s video reference", "issue": "cr-215", "sku": "l4", "what": "15 s ref2va_turbo, image + 3 s 1344x768 video reference: CUDA unknown error at condition (varena eviction without a stream fence); not run until fixed (lead 10-23)"},
- {"cell": "Klein under 8, 6 and 3 GiB caps", "issue": "cr-220", "sku": "*", "what": "runs 15168, 15236, 15239: CUDA out of memory in the weight bind (encoding/formats.py to_blocked, from varena _bind), raised past the memory manager as accepted_envelope_breach; uncapped Klein completes. Not run until fixed", "cells": ["s8-klein", "s6-klein-1", "s6-klein-2", "s6-klein-3", "s3-klein"]},
- {"cell": "H3 15 s under 8 GiB", "issue": "cr-222", "sku": "*", "what": "run 15176: ref2va_turbo 15 s 768p under an 8 GiB cap, step 1 407 s and step 2 still running at 25 min (uncapped: 346 s for the whole run); canceled", "cells": ["s8-h3-15"]},
- {"cell": "klein", "issue": "cr-220", "sku": "rtx-3070", "what": "run 15143 on a real 8 GB card: the same weight-bind out of memory as Klein under a cap. Not run until fixed", "cells": ["klein", "cold-klein", "co-klein", "reload-klein"]},
- {"cell": "qwen", "issue": "cr-221", "sku": "rtx-3070", "what": "run 15150 on a real 8 GB card: memory_exhausted, the Qwen-Image 2.1 VAE's repeat_interleave needs 4.8 GB more and cannot be cut. Not run until fixed", "cells": ["qwen"]},
- {"cell": "host-klein, host-qwen (Klein and Qwen under a CPU rental's cgroup memory.max)", "issue": "xs-058", "sku": "cpu", "what": "CPU mode on hitogami (16 vCPU / 32 GB): the executor SIGKILLed at the 32 GB cgroup (Klein 15370, Qwen 15437; also describer 15378, SeedVR2 15423, fibo 15425, qwen-edit 15467). Released varena never pages and master sizes the host table from physical RAM (varena/torch.py:529, 790 GB). Not run until the host tier takes its capacity from memory.max/high and pages or spills to disk", "cells": ["host-klein", "host-qwen"]}
+ {
+  "cell": "h3 with a 3 s video reference",
+  "issue": "cr-215",
+  "sku": "l4",
+  "what": "15 s ref2va_turbo, image + 3 s 1344x768 video reference: CUDA unknown error at condition (varena eviction without a stream fence); not run until fixed (lead 10-23)"
+ },
+ {
+  "cell": "Klein under 8, 6 and 3 GiB caps",
+  "issue": "cr-220",
+  "sku": "*",
+  "what": "runs 15168, 15236, 15239: CUDA out of memory in the weight bind (encoding/formats.py to_blocked, from varena _bind), raised past the memory manager as accepted_envelope_breach; uncapped Klein completes. Not run until fixed",
+  "cells": [
+   "s8-klein",
+   "s6-klein-1",
+   "s6-klein-2",
+   "s6-klein-3",
+   "s3-klein"
+  ]
+ },
+ {
+  "cell": "H3 15 s under 8 GiB",
+  "issue": "cr-222",
+  "sku": "*",
+  "what": "run 15176: ref2va_turbo 15 s 768p under an 8 GiB cap, step 1 407 s and step 2 still running at 25 min (uncapped: 346 s for the whole run); canceled",
+  "cells": [
+   "s8-h3-15"
+  ]
+ },
+ {
+  "cell": "klein",
+  "issue": "cr-220",
+  "sku": "rtx-3070",
+  "what": "run 15143 on a real 8 GB card: the same weight-bind out of memory as Klein under a cap. Not run until fixed",
+  "cells": [
+   "klein",
+   "cold-klein",
+   "co-klein",
+   "reload-klein"
+  ]
+ },
+ {
+  "cell": "qwen",
+  "issue": "cr-221",
+  "sku": "rtx-3070",
+  "what": "run 15150 on a real 8 GB card: memory_exhausted, the Qwen-Image 2.1 VAE's repeat_interleave needs 4.8 GB more and cannot be cut. Not run until fixed",
+  "cells": [
+   "qwen"
+  ]
+ },
+ {
+  "cell": "host-klein, host-qwen (Klein and Qwen under a CPU rental's cgroup memory.max)",
+  "issue": "xs-058",
+  "sku": "cpu",
+  "what": "CPU mode on hitogami (16 vCPU / 32 GB): the executor SIGKILLed at the 32 GB cgroup (Klein 15370, Qwen 15437; also describer 15378, SeedVR2 15423, fibo 15425, qwen-edit 15467). Released varena never pages and master sizes the host table from physical RAM (varena/torch.py:529, 790 GB). Not run until the host tier takes its capacity from memory.max/high and pages or spills to disk",
+  "cells": [
+   "host-klein",
+   "host-qwen"
+  ]
+ },
+ {
+  "cell": "Qwen-Image's one-release swap",
+  "issue": "var-010",
+  "sku": "*",
+  "cells": [
+   "qwen-image-edit",
+   "qwen-image-t2i",
+   "qwen-image-turbo",
+   "qwen-image-turbo-edit"
+  ],
+  "what": "pending fix var-010 (TFS 0.15.1): varena names a weight set {release}/{component}, so a release's second checkpoint of one component is refused (run 15744)"
+ },
+ {
+  "cell": "qwen-image (Qwen-Image 2512) after other models",
+  "issue": "xs-088",
+  "sku": "*",
+  "cells": [
+   "qwen-image"
+  ],
+  "what": "pending fix xs-088: varena's self-pin deadlocks Qwen-Image under co-residency or after a cancel"
+ },
+ {
+  "cell": "qwen (Qwen-Image 2.1) on a card other than the 4090",
+  "issue": "cr-223",
+  "sku": "rtx-5090",
+  "cells": [
+   "qwen"
+  ],
+  "what": "pending fix cr-223 (d6766ae3f, needs a Runtime 0.32.x candidate): the fusion RecursionError on Qwen-Image 2.1's first request"
+ }
 ]

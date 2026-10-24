@@ -4,7 +4,9 @@
 # .github/workflows/release-gate.yaml on a runner signed in with `cozy login --key`.
 #   gate.sh <SKU> --suite name,... [--gpus N] [--out DIR] [--establish] [--publish] [--runtime F|URL] [--tensorfs F|URL]
 #           [--tensord BIN|URL] [--packages DIR] [--pins name@release,...] [--only cell,cell] [--before FILE]...
-#           [--cells FILE]... [--cli BIN] [--disk GB]
+#           [--cells FILE]... [--first pkg,...] [--cli BIN] [--install-cli BIN] [--disk GB]
+# --install-cli puts the candidate on with that cozy (0.11.15 or older: its machine fetches URL#sha256 candidates itself,
+# where cozy 0.11.16+ uploads them from here, slow on a slow uplink); every other command uses --cli.
 # --suite runs those suites (suites/<name>/: README.md says what each proves and costs); there is no default, the
 # release agent chooses. A suite's before.sh runs on the fresh pod before the candidate goes on, its cells.sh after it
 # and its check.py in analyze.py; the baseline is gate-<SKU>-<suites>.json.
@@ -25,7 +27,7 @@ if [ "${1:-}" != --copy ]; then
 fi
 HERE=$2; shift 2
 REPO=cozy-creator/cozy-creator TAG=release-gate-baselines
-SKU=$1; shift; CAND=() ONLY= EXTRA=() BEFORE=() CLI=cozy DISK=400 OUT= PKGS= ESTABLISH= PUBLISH= PINS= SUITES= K= CLIP= GPUS=
+SKU=$1; shift; CAND=() ONLY= EXTRA=() BEFORE=() CLI=cozy DISK=400 OUT= PKGS= ESTABLISH= PUBLISH= PINS= SUITES= K= CLIP= GPUS= FIRST= ICLI=
 RT= TFS= BIN= RW= TW= TD=
 ver() { basename "${1%%#*}" | cut -d- -f2; }
 while [ $# -gt 0 ]; do
@@ -38,6 +40,8 @@ while [ $# -gt 0 ]; do
     --before) BEFORE+=("$2");;
     --suite) SUITES=$2;;
     --gpus) GPUS=$2;;
+    --first) FIRST=$2;;
+    --install-cli) ICLI=$2;;
     --cli) CLI=$2;;
     --disk) DISK=$2;;
     --packages) PKGS=$(cd "$2" && pwd);;
@@ -77,16 +81,21 @@ fetch() {
   case $1 in
     '') return 0;;
     *://*#sha256=*) mkdir -p "$OUT/candidate"; f=$OUT/candidate/$(basename "${1%%#*}")
-      [ -f "$f" ] || curl -fsSL --retry 5 "${1%%#*}" -o "$f" || { log "cannot fetch ${1%%#*}"; return 1; }
+      [ -f "$f" ] || curl -fsSL --retry 5 --retry-all-errors "${1%%#*}" -o "$f" || { log "cannot fetch ${1%%#*}"; return 1; }
       [ "$(sha256sum "$f" | cut -d' ' -f1)" = "${1##*#sha256=}" ] || { log "$f does not hash to ${1##*#sha256=}"; return 1; };;
     *://*) log "$1 names no #sha256="; return 1;;
     *) f=$1; [ -f "$f" ] || { log "no file $f"; return 1; };;
   esac
   echo "$f"
 }
-RWF=$(fetch "$RW") && TWF=$(fetch "$TW") && TDF=$(fetch "$TD") || exit 1
-[ -z "$TDF" ] || { chmod +x "$TDF"; BIN=$("$TDF" --version | awk '{print $2}'); }
-W=; "$CLI" machine update --help 2>/dev/null | grep -q -- --runtime-wheel && W=-wheel
+ICLI=${ICLI:-$CLI}
+if [ "$ICLI" != "$CLI" ]; then  # the machine fetches the URLs itself
+  RWF=$RW TWF=$TW TDF=$TD
+else
+  RWF=$(fetch "$RW") && TWF=$(fetch "$TW") && TDF=$(fetch "$TD") || exit 1
+  [ -z "$TDF" ] || { chmod +x "$TDF"; BIN=$("$TDF" --version | awk '{print $2}'); }
+fi
+W=; "$ICLI" machine update --help 2>/dev/null | grep -q -- --runtime-wheel && W=-wheel
 [ -z "$RWF" ] || CAND+=("--runtime$W" "$RWF"); [ -z "$TWF" ] || CAND+=("--tensorfs$W" "$TWF"); [ -z "$TDF" ] || CAND+=(--tensord "$TDF")
 BK=$SKU${SUITES:+-${SUITES//,/-}}  # the baseline's name
 gh release download "$TAG" -R "$REPO" -D "$B" -p "gate-$BK.json" -p "ref-$SKU.*" -p "ref-$SKU-clip.mp4" 2>/dev/null
@@ -100,13 +109,14 @@ mapfile -t ROWS < <(grep -v '^#' "$HERE/scenarios.tsv")
 I=$(( $(date +%s) / 60 + $(cksum <<< "$SKU" | cut -d' ' -f1) ))
 IFS=$'\t' read -r NAME CHAR MOTION OBJECT SCENE <<< "${ROWS[$((I % ${#ROWS[@]}))]}"
 R=$(( $(date +%s%N) / 1000 % 4000000000 ))
-M=
+M= KEEP=
 end_it() {
+  [ -z "$KEEP" ] || kill "$KEEP" 2>/dev/null
   [ -n "$M" ] || return
   # The machine's own logs leave with it: keep them for every gate (a poisoned executor is diagnosed from them).
   timeout 300 "$CLI" machine logs "$M" memory -n 0 >machine-memory.log 2>&1
   timeout 300 "$CLI" machine logs "$M" tensord -n 0 >machine-tensord.log 2>&1
-  timeout 120 "$CLI" logs calcifer >calcifer.log 2>&1
+  if "$CLI" logs --help >/dev/null 2>&1; then timeout 120 "$CLI" logs calcifer; else timeout 120 "$CLI" machine logs local calcifer -n 0; fi >calcifer.log 2>&1
   "$CLI" machine end "$M" -y >end.log 2>&1
   for _ in $(seq 1 30); do timeout 30 "$CLI" machine list 2>/dev/null | grep -q "^$M " || { log "ended $M, gone"; M=; return; }; sleep 10; done
   log "WARNING $M still listed"
@@ -124,7 +134,7 @@ cell() {
   ! cut -f1 cells.tsv | grep -qx -- "$name" || return 0
   issue=$(jq -r --arg s "$SKU" --arg c "$name" '.[] | select((.sku == $s or .sku == "*") and ((.cells // []) | index($c))) | .issue' \
     "$HERE/known-failing.json" | head -1)
-  [ -z "$issue" ] || { log "$name: parked on $SKU ($issue), not run"; return 0; }
+  [ -z "$issue" ] || { log "$name: pending fix $issue, not run on $SKU"; return 0; }
   for p in "$@"; do [[ $p != prompt=* ]] || printf '%s\t%s\n' "$name" "${p#prompt=}" >> prompts.tsv; done  # quality.py
   "$CLI" run "$target" --on "$M" --json "$@" >"$name.ndjson" 2>"$name.err"
   local n; n=$(grep -o '"number":[0-9]*' "$name.ndjson" | head -1 | cut -d: -f2)
@@ -154,12 +164,27 @@ while i < len(t):
 [ -n "$M" ] || { log "rent failed: $(tail -c 300 rent.err) $(tail -c 300 rent.json)"; exit 1; }
 echo "$M" > machine
 log "rented $M"
+# The gate holds the rental between runs too (fetches, uploads, analysis here): reset its 15-minute idle clock.
+(while sleep 240; do "$CLI" machine keepalive "$M" >/dev/null 2>&1; done) & KEEP=$!
 timeout 60 "$CLI" machine show "$M" > machine-fresh.txt 2>&1
 # Sourced on the fresh pod, before the candidate goes on: each suite's before.sh, then `--before FILE`s.
 for s in ${SUITES//,/ }; do [ ! -f "$HERE/suites/$s/before.sh" ] || . "$HERE/suites/$s/before.sh"; done
 for f in "${BEFORE[@]}"; do . "$f"; done
+# A machine already on the candidate cozy (a suite's before.sh moved it) keeps it: no second upload or restart.
+if [ -n "$BIN" ] && [ "$(timeout 60 "$CLI" --json machine show "$M" | python3 -c 'import json,sys; print(json.load(sys.stdin)["status"]["version"])' 2>/dev/null)" = "$BIN" ]; then
+  for ((i = 0; i < ${#CAND[@]}; i += 2)); do [ "${CAND[i]}" = --tensord ] && CAND=("${CAND[@]:0:i}" "${CAND[@]:i+2}") && break; done
+fi
+# --install-cli's URL payload reaches a TensorD before 0.11.16 only (a later one refuses it, invalid_payload): a machine
+# already past that (a suite's before.sh moved it) is sent the candidate's files by --cli.
+mv=$(timeout 60 "$CLI" --json machine show "$M" 2>/dev/null | jq -r '.status.version // ""')
+if [ "$ICLI" != "$CLI" ] && [ -n "$mv" ] && [ "$(printf '%s\n' 0.11.16 "$mv" | sort -V | head -1)" = 0.11.16 ]; then
+  ICLI=$CLI CAND=()
+  if [ -n "$RW" ]; then RWF=$(fetch "$RW") || exit 1; CAND+=(--runtime "$RWF"); fi
+  if [ -n "$TW" ]; then TWF=$(fetch "$TW") || exit 1; CAND+=(--tensorfs "$TWF"); fi
+  [ -z "$TD" ] || [ "$mv" = "$BIN" ] || { TDF=$(fetch "$TD") || exit 1; CAND+=(--tensord "$TDF"); }
+fi
 if [ ${#CAND[@]} -gt 0 ]; then
-  "$CLI" machine update "$M" "${CAND[@]}" -y >update.log 2>&1; code=$?
+  "$ICLI" machine update "$M" "${CAND[@]}" -y >update.log 2>&1; code=$?
   log "candidate on $M: exit $code $(grep -E '^status' update.log)"
   [ "$code" = 0 ] || expect candidate-update FAIL "$(tail -c 400 update.log)"
 fi

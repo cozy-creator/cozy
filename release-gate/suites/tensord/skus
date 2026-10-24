@@ -1,0 +1,2 @@
+# One cheap 2-GPU pod: placement across GPUs, and every other check on GPU 0 (SKU, disk GB, GPUs).
+rtx-5060-ti 150 2
