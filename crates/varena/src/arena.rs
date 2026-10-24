@@ -250,6 +250,8 @@ struct State {
     deferred: Vec<Deferred>,
     /// Whole-free spans kept while a capture is open: they leave once it ends.
     held: Vec<u64>,
+    /// A region residency transaction holds every span until copying and mapping finish.
+    changing: bool,
     allocated: u64,
     peak: u64,
     /// The highest a section of the open pass reached ([`Torch::reset_peak`]): the pass's peak
@@ -683,6 +685,10 @@ struct Shared {
     id: usize,
     backend: Arc<dyn Backend>,
     source: Arc<dyn Source>,
+    /// Shared with weight placement: uncertain ownership forbids all reuse on this device.
+    ownership_lost: Arc<AtomicBool>,
+    /// Wakes Memory's waiters when an allocator or epoch failure poisons the device.
+    notify_poisoned: Box<dyn Fn() + Send + Sync>,
     space: Mutex<Space>,
     /// Chunks given back that the source could not take: retried at every give-back pass.
     stuck: Mutex<Vec<Stuck>>,
@@ -721,6 +727,10 @@ pub struct Torch {
 
 impl Torch {
     pub fn new(backend: Arc<dyn Backend>, source: Arc<dyn Source>) -> Result<Arc<Torch>> {
+        Self::with_ownership(backend, source, Arc::new(AtomicBool::new(false)), Box::new(|| {}))
+    }
+
+    pub(crate) fn with_ownership(backend: Arc<dyn Backend>, source: Arc<dyn Source>, ownership_lost: Arc<AtomicBool>, notify_poisoned: Box<dyn Fn() + Send + Sync>) -> Result<Arc<Torch>> {
         if !UNIT.is_multiple_of(backend.granularity().max(1)) {
             return Err(Error::Invalid(format!("granularity {} does not divide {UNIT}", backend.granularity())));
         }
@@ -731,6 +741,8 @@ impl Torch {
             id: TORCHES.fetch_add(1, AcqRel),
             backend,
             source,
+            ownership_lost,
+            notify_poisoned,
             space: Mutex::new(space),
             stuck: Mutex::new(Vec::new()),
             dir: RwLock::new(BTreeMap::new()),
@@ -761,7 +773,7 @@ impl Torch {
     pub fn alloc(&self, bytes: u64, stream: usize, pool: Option<PoolId>) -> Result<u64> {
         let size = bytes.max(1).checked_next_multiple_of(ALIGN).filter(|s| *s < 1 << 50).ok_or_else(|| exhausted(bytes, "no device holds that much"))?;
         let sh = &self.sh;
-        match pool {
+        sh.checked(|| match pool {
             Some(p) => {
                 sh.capturing_on(p, stream);
                 sh.alloc_in(&sh.arena(Owner::Pool(p)), size, stream, true)
@@ -770,11 +782,12 @@ impl Torch {
                 sh.begun(stream);
                 sh.alloc_in(&sh.routed(), size, stream, sh.capturing())
             }
-        }
+        })
     }
 
     /// Never fails and never waits on the device; a pointer no arena holds is logged.
     pub fn free(&self, ptr: u64, bytes: u64, stream: usize) {
+        if self.sh.check_ownership().is_err() { return; }
         self.sh.begun(stream);
         let Some(a) = self.sh.owner_of(ptr) else {
             tracing::error!("varena: torch freed {ptr:#x} ({bytes} bytes, stream {stream:#x}), which no arena holds");
@@ -787,6 +800,7 @@ impl Torch {
     /// torch used `ptr` on `stream` too: its free waits for that stream's epoch. A pointer that is
     /// not this device's is ignored.
     pub fn record_stream(&self, ptr: u64, stream: usize) {
+        if self.sh.check_ownership().is_err() { return; }
         let Some(a) = self.sh.owner_of(ptr) else { return };
         let mut st = a.st.lock();
         if st.stream_of(ptr).is_some_and(|own| own != stream) {
@@ -849,13 +863,19 @@ impl Torch {
     /// An event on `stream` after the pool's use there (a replay, and its readers): a released
     /// pool's spans leave only once every fence completed. Not from a capturing thread.
     pub fn pool_fence(&self, pool: PoolId, stream: usize) -> Result<()> {
+        self.sh.checked(|| self.fence_pool(pool, stream))
+    }
+
+    fn fence_pool(&self, pool: PoolId, stream: usize) -> Result<()> {
         let sh = &self.sh;
         let a = sh.arena(Owner::Pool(pool));
         let fence = match sh.backend.record(stream) {
             Ok(event) => Fence::Event(stream, event),
             Err(e) => {
                 tracing::warn!("varena: recording a pool fence failed ({e}); synchronizing its stream");
-                sh.backend.synchronize(stream)?;
+                if let Err(failed) = sh.backend.synchronize(stream) {
+                    return Err(Error::Ownership(format!("pool fence failed: {e}; fallback: {failed}")));
+                }
                 return Ok(());
             }
         };
@@ -875,6 +895,10 @@ impl Torch {
     /// Before a capture into `pool` begins (never on a capturing thread): `expected` bytes of it
     /// mapped and free, made room for here.
     pub fn pool_prepare(&self, pool: PoolId, expected: u64) -> Result<()> {
+        self.sh.checked(|| self.prepare_pool(pool, expected))
+    }
+
+    fn prepare_pool(&self, pool: PoolId, expected: u64) -> Result<()> {
         let sh = &self.sh;
         if sh.capturing() {
             return Err(Error::Invalid("a pool is prepared before its capture begins".into()));
@@ -906,6 +930,7 @@ impl Torch {
                     sh.install(&a, &mut st, va.base, chunks, None, Tier::Pool);
                 }
                 Err(e) => {
+                    sh.poison(&e);
                     sh.unmap(va, chunks, true, false);
                     if !(matches!(e, Error::Exhausted(_)) && sh.give_back()) {
                         return Err(e);
@@ -1025,6 +1050,12 @@ impl Drop for Torch {
         let sh = &self.sh;
         sh.stop.store(true, Release);
         sh.kick();
+        if sh.check_ownership().is_err() {
+            // Driver mappings/consumers are unproven. Keep the backend, handles and reservations
+            // alive until process exit; dropping the last Rust handle must not make them reusable.
+            std::mem::forget(self.sh.clone());
+            return;
+        }
         sh.reclaim(u64::MAX);
         let mapped = sh.mapped.load(Acquire);
         if mapped == 0 {
@@ -1036,6 +1067,34 @@ impl Drop for Torch {
 }
 
 impl Shared {
+    pub(crate) fn check_ownership(&self) -> Result<()> {
+        if self.ownership_lost.load(Acquire) {
+            Err(Error::Ownership("torch memory ownership is unproven; retire this executor".into()))
+        } else { Ok(()) }
+    }
+
+    pub(crate) fn poison(&self, error: &Error) {
+        if error.is_sticky() || matches!(error, Error::Internal(_)) {
+            if !self.ownership_lost.swap(true, AcqRel) {
+                tracing::error!("varena: torch memory quarantined: {error}");
+            }
+            (self.notify_poisoned)();
+            self.progressed();
+            self.kick();
+        }
+    }
+
+    pub(crate) fn checked<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        self.check_ownership()?;
+        let out = crate::caught(f);
+        if let Err(e) = &out { self.poison(e); }
+        match out {
+            Err(Error::Internal(e)) => Err(Error::Ownership(format!("torch allocator invariant failed: {e}"))),
+            Ok(value) => { self.check_ownership()?; Ok(value) }
+            out => out,
+        }
+    }
+
     fn kick(&self) {
         let mut w = self.wake.0.lock();
         if !*w {
@@ -1236,6 +1295,7 @@ impl Shared {
             Err(e) => {
                 c.lost.store(true, Release);
                 tracing::error!("varena: stream {:#x}'s epoch failed ({why}) and so did its synchronize ({e}): its spans are quarantined", c.stream);
+                self.poison(&Error::Ownership(format!("stream {:#x} completion failed: {why}; fallback: {e}", c.stream)));
             }
         }
     }
@@ -1304,6 +1364,9 @@ impl Shared {
         loop {
             {
                 let mut st = a.st.lock();
+                if st.changing {
+                    return Err(Error::Held("the region is changing residency".into()));
+                }
                 if let Some(ptr) = self.carve(a, &mut st, size, stream) {
                     return Ok(ptr);
                 }
@@ -1331,6 +1394,7 @@ impl Shared {
                     }
                 }
                 Err(e) => {
+                    self.poison(&e);
                     self.unmap(va, chunks, true, false);
                     if !(matches!(e, Error::Exhausted(_)) && self.give_back()) {
                         return Err(e);
@@ -1344,6 +1408,7 @@ impl Shared {
     /// (the poller, a Rust thread, sees them land); false when none is left to give.
     fn give_back(&self) -> bool {
         loop {
+            if self.check_ownership().is_err() { return false; }
             let seen = *self.progress.0.lock();
             let (quiet, pending) = self.idle.lock().bytes();
             if quiet > 0 {
@@ -1357,12 +1422,14 @@ impl Shared {
             self.kick();
             let mut p = self.progress.0.lock();
             while *p == seen {
+                if self.check_ownership().is_err() { return false; }
                 self.progress.1.wait(&mut p);
             }
         }
     }
 
     fn reclaim(&self, want: u64) -> u64 {
+        if self.check_ownership().is_err() { return 0; }
         let retried = self.retry_stuck();
         let spares = self.idle.lock().quiet(want);
         retried + spares.into_iter().map(|s| self.give(s)).sum::<u64>()
@@ -1379,6 +1446,15 @@ impl Shared {
     /// list, and the next give-back pass retries it. `owned`: the range's addresses are freed here
     /// as its chunks go (else an evicted span keeps them); `counted`: `mapped` counts the chunks.
     pub(crate) fn unmap(&self, va: Va, chunks: Vec<Chunk>, owned: bool, counted: bool) -> u64 {
+        if self.check_ownership().is_err() {
+            let mut at = va.base;
+            self.stuck.lock().extend(chunks.into_iter().map(|chunk| {
+                let here = at;
+                at += chunk.len;
+                Stuck { at: here, chunk, owned, counted }
+            }));
+            return 0;
+        }
         let stuck = if chunks.is_empty() { Vec::new() } else { self.source.unmap(va, chunks) };
         let mut stuck: Vec<Stuck> = stuck.into_iter().map(|(at, chunk)| Stuck { at, chunk, owned, counted }).collect();
         stuck.sort_unstable_by_key(|s| s.at);
@@ -1398,6 +1474,7 @@ impl Shared {
     }
 
     fn returned(&self, at: u64, len: u64, owned: bool, counted: bool) {
+        if self.check_ownership().is_err() { return; }
         if owned {
             self.space.lock().give(at, len);
         }
@@ -1420,6 +1497,7 @@ impl Shared {
     /// An evicted span's addresses leave it: freed, but where a chunk is still stuck; that range
     /// is freed when its chunk goes back.
     pub(crate) fn release_va(&self, va: Va) {
+        if self.check_ownership().is_err() { return; }
         let mut stuck = self.stuck.lock();
         let mut held: Vec<(u64, u64)> = stuck.iter_mut().filter(|s| s.at < va.base + va.len && va.base < s.at + s.chunk.len).map(|s| {
             s.owned = true;
@@ -1448,7 +1526,7 @@ impl Shared {
 
     fn free_in(&self, a: &Arc<Arena>, st: &mut State, ptr: u64, bytes: u64) {
         let uses = if st.uses.is_empty() { None } else { st.uses.remove(&ptr) };
-        let capture = !a.pool() && self.captures.load(Acquire) > 0;
+        let capture = st.changing || (!a.pool() && self.captures.load(Acquire) > 0);
         if !capture && uses.is_none() {
             return self.release(a, st, ptr, bytes);
         }
@@ -1554,6 +1632,10 @@ impl Shared {
             progress = true;
         }
         let mut st = a.st.lock();
+        if st.changing {
+            self.queue(a, false);
+            return progress;
+        }
         if st.unfenced && a.released.load(Acquire) {
             let streams: Vec<usize> = self.clocks.read().keys().copied().collect();
             if let Some(stamps) = self.stamps(&streams) {
@@ -1701,7 +1783,13 @@ impl Direct {
             e => e,
         })?;
         if let Err(e) = self.backend.map(va, off, &p, Access::ReadWrite) {
-            let _ = self.allowance.destroy(&*self.backend, p);
+            if e.is_sticky() {
+                // A failed map rollback can leave the physical page mapped. Keep its handle
+                // and charge; the caller quarantines the address space before any cleanup.
+                self.held.lock().insert(p.id, p);
+            } else {
+                let _ = self.allowance.destroy(&*self.backend, p);
+            }
             return Err(e);
         }
         let id = p.id;

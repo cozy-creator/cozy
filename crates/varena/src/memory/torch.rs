@@ -6,17 +6,17 @@
 
 #[cfg(unix)]
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 #[cfg(unix)]
 use parking_lot::Mutex;
 
-use super::{Memory, Request};
-use crate::arena::{Direct, Owner, Route, Source, Torch};
+use super::{Inner, Memory, Request};
+use crate::arena::{Chunk, Direct, Kind, Owner, Route, Source, Torch};
+use crate::backend::Va;
 #[cfg(unix)]
 use crate::{
-    arena::{Chunk, Kind},
-    backend::{Access, Backend, Physical, Va},
+    backend::{Access, Backend, Physical},
     lease::{Advice, Agent, Ticket},
 };
 use crate::{Error, Result};
@@ -46,7 +46,10 @@ pub struct Allocating {
 impl Memory {
     /// Serves torch's allocations from `source`, once, before any is made.
     pub fn serve_torch(&self, source: Arc<dyn Source>) -> Result<Arc<Torch>> {
-        let torch = Torch::new(self.inner.backend.clone(), source)?;
+        let weak = Arc::downgrade(&self.inner);
+        let torch = Torch::with_ownership(self.inner.backend.clone(), source, self.inner.ownership_lost.clone(), Box::new(move || {
+            if let Some(inner) = weak.upgrade() { inner.landed.notify_all(); }
+        }))?;
         self.inner.torch.set(torch.clone()).map_err(|_| Error::Invalid("torch's allocations are served already".into()))?;
         Ok(torch)
     }
@@ -65,7 +68,10 @@ impl Memory {
     /// Standalone, chosen explicitly when no compatible manager serves this GPU: the device's
     /// own pages, within the allowance its weight pages share (rev 6).
     pub fn serve_standalone_torch(&self) -> Result<Arc<Torch>> {
-        self.serve_torch(Arc::new(Direct::new(self.inner.backend.clone(), self.inner.allowance.clone())))
+        self.serve_torch(Arc::new(Standalone {
+            memory: Arc::downgrade(&self.inner),
+            direct: Direct::new(self.inner.backend.clone(), self.inner.allowance.clone()),
+        }))
     }
 
     /// The device's torch allocator: refused until one is served.
@@ -79,7 +85,7 @@ impl Memory {
     /// thread's routed arena (a request's or a region's), else the process's. Err is
     /// `Error::Exhausted`, whose text is torch's OOM reason, or `Invalid` before torch is served.
     pub fn torch_alloc(&self, bytes: u64, stream: usize, pool: Option<PoolId>) -> Result<u64> {
-        self.torch()?.alloc(bytes, stream, pool)
+        self.inner.guard(|| self.torch()?.alloc(bytes, stream, pool))
     }
 
     /// Never fails and never waits on the device.
@@ -158,6 +164,34 @@ impl Memory {
     /// The region is gone: its spans leave as they come whole free; the record names survivors.
     pub fn region_close(&self, region: u64) -> Ended {
         self.inner.torch.get().map(|t| t.end(Owner::Region(region))).unwrap_or_default()
+    }
+}
+
+/// The standalone allocator shares placement policy with its weights as well as their budget.
+/// Only the source's slow path calls this, with no arena lock held and outside capture.
+struct Standalone {
+    memory: Weak<Inner>,
+    direct: Direct,
+}
+
+impl Source for Standalone {
+    fn map(&self, va: Va, kind: Kind, into: &mut Vec<Chunk>) -> Result<()> {
+        let memory = self.memory.upgrade().ok_or_else(|| Error::Closed("standalone memory".into()))?;
+        memory.guard(|| {
+            memory.check_ownership()?;
+            // Individually small idle spans may not fit this allocation together. Return
+            // their chunks before evicting weights to obtain a contiguous virtual span.
+            let short = va.len.saturating_sub(memory.allowance.left());
+            if short > 0 {
+                if let Some(torch) = memory.torch.get() { torch.reclaim(short); }
+            }
+            memory.make_room(va.len, &[], "torch", None, false)?;
+            self.direct.map(va, kind, into)
+        })
+    }
+
+    fn unmap(&self, va: Va, chunks: Vec<Chunk>) -> Vec<(u64, Chunk)> {
+        self.direct.unmap(va, chunks)
     }
 }
 
