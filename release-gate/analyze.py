@@ -12,8 +12,8 @@ out, sku, BASE = sys.argv[1].rstrip('/'), sys.argv[2], sys.argv[3]
 accept = '--accept' in sys.argv
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-import quality, stress  # noqa: E402
-CHECKS = [stress.check, quality.check]
+import lm, quality, stress  # noqa: E402
+CHECKS = [stress.check, quality.check, lm.check]
 # Allowed rise over the worst known-good number, unless the good numbers' own spread is wider.
 SLACK = {'execution_ms': 0.25, 'step1_ms': 0.5, 'steady_ms': 0.10, 'peak_vram_mb': 0.10}
 # A step may cost at most 2x its reference plus 5 s: step 1 against step 2 (known-good fresh H3 executors 0.9-1.8x; the
@@ -206,6 +206,10 @@ for leg in ('cuda_init', 'measure_device'):
     if vals:
         notes.append(f'host {leg}: median {sorted(vals)[len(vals) // 2] / 1000:.1f} s, max {max(vals) / 1000:.1f} s over {len(vals)} executors')
 gate = {'out': out, 'sku': sku, 'summary': summary, 'records': recs, 'baseline': base}
+# CLI-behaviour checks a cells/*.sh recorded with gate.sh's `expect` (expect.tsv: check, PASS|FAIL, what happened).
+EXPECT = os.path.join(out, 'expect.tsv')
+for row in (l.rstrip('\n').split('\t') + [''] for l in open(EXPECT)) if os.path.exists(EXPECT) else []:
+    (notes if row[1] == 'PASS' else fails).append(f'{row[0]}: {row[1]} {row[2]}'.rstrip())
 for check in CHECKS:
     f, n = check(gate)
     fails += f; notes += n

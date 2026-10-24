@@ -2,9 +2,11 @@
 # Release regression gate (tracker design ci-v2 §3): before every publish of cozy, the Runtime, TensorFS or a
 # first-party package. Any FAIL blocks the publish. Runs by hand through the default ~/.cozy, and from
 # .github/workflows/release-gate.yaml on a runner signed in with `cozy login --key`.
-#   gate.sh <SKU> [--out DIR] [--establish] [--publish] [--runtime-wheel F|URL] [--tensorfs-wheel F|URL]
-#           [--tensord BIN|URL] [--packages DIR] [--pins name@release,...] [--cells FILE]... [--only cell,cell]
+#   gate.sh <SKU> [--out DIR] [--establish] [--publish] [--runtime F|URL] [--tensorfs F|URL] [--tensord BIN|URL]
+#           [--packages DIR] [--pins name@release,...] [--before FILE]... [--cells FILE]... [--only cell,cell]
 #           [--cli BIN] [--disk GB]
+# A candidate URL is https://…#sha256=<hex>: fetched here, held by its digest, and sent as a file (cozy 0.11.16+
+# `machine update --runtime/--tensorfs/--tensord <path>`; an older --cli gets --runtime-wheel/--tensorfs-wheel).
 # One FRESH rental. The candidate goes on with `cozy machine update` (a new executor), then each cell runs ONCE
 # with a scenario prompt from scenarios.tsv and fresh seeds: H3 first at the product shape (15 s ref2va_turbo,
 # cold executor), SeedVR2 on its first second, every image package's default call, then a restart and one SDXL
@@ -21,8 +23,8 @@ if [ "${1:-}" != --copy ]; then
 fi
 HERE=$2; shift 2
 REPO=cozy-creator/cozy-creator TAG=release-gate-baselines
-SKU=$1; shift; CAND=() ONLY= EXTRA=() CLI=cozy DISK=400 OUT= PKGS= ESTABLISH= PUBLISH= PINS=
-RT= TFS= BIN=
+SKU=$1; shift; CAND=() ONLY= EXTRA=() BEFORE=() CLI=cozy DISK=400 OUT= PKGS= ESTABLISH= PUBLISH= PINS=
+RT= TFS= BIN= RW= TW= TD=
 ver() { basename "${1%%#*}" | cut -d- -f2; }
 while [ $# -gt 0 ]; do
   case $1 in
@@ -31,13 +33,14 @@ while [ $# -gt 0 ]; do
     --out) OUT=$2;;
     --only) ONLY=",$2,";;
     --cells) EXTRA+=("$2");;
+    --before) BEFORE+=("$2");;
     --cli) CLI=$2;;
     --disk) DISK=$2;;
     --packages) PKGS=$(cd "$2" && pwd);;
     --pins) PINS=",$2,";;
-    --runtime-wheel) RT=$(ver "$2"); CAND+=("$1" "$2");;
-    --tensorfs-wheel) TFS=$(ver "$2"); CAND+=("$1" "$2");;
-    --tensord) if [ -f "$2" ]; then BIN=$("$2" --version | awk '{print $2}'); else BIN=$2; fi; CAND+=("$1" "$2");;
+    --runtime|--runtime-wheel) RW=$2; RT=$(ver "$2");;
+    --tensorfs|--tensorfs-wheel) TW=$2; TFS=$(ver "$2");;
+    --tensord) TD=$2; if [ -f "$2" ]; then BIN=$("$2" --version | awk '{print $2}'); else BIN=$(ver "$2"); fi;;
     *) echo "unknown argument $1" >&2; exit 2;;
   esac; shift 2
 done
@@ -49,8 +52,6 @@ OUT=${OUT:-$PWD/gate-$SKU-$LABEL-$(date -u +%Y%m%dT%H%MZ)}
 B=$OUT/baseline
 mkdir -p "$B"; cd "$OUT"; : > cells.tsv; echo "$LABEL" > label
 digest() { case $1 in *'#sha256='*) echo "${1##*#sha256=}";; '') ;; *) [ -f "$1" ] && sha256sum "$1" | cut -d' ' -f1;; esac; }
-TD=; for ((i = 0; i < ${#CAND[@]}; i += 2)); do [ "${CAND[i]}" != --tensord ] || TD=${CAND[i+1]}; done
-RW=; TW=; for ((i = 0; i < ${#CAND[@]}; i += 2)); do case ${CAND[i]} in --runtime-wheel) RW=${CAND[i+1]};; --tensorfs-wheel) TW=${CAND[i+1]};; esac; done
 python3 - "$LABEL" "$BIN" "$(digest "$TD")" "$(basename "${RW%%#*}")" "$(digest "$RW")" "$(basename "${TW%%#*}")" "$(digest "$TW")" \
   "${PINS//,/ }" "${PKGS:+$(git -C "$PKGS" rev-parse HEAD)}" > candidate.json <<'PY'
 import json, sys
@@ -60,6 +61,25 @@ print(json.dumps({"label": label, "cozy": cozy, "cozy_sha256": cozy_sha, "runtim
                  indent=1, sort_keys=True))
 PY
 log() { echo "$(date -u +%H:%M:%SZ) $*" | tee -a gate.log; }
+# expect <check> PASS|FAIL <what happened>: a CLI-behaviour check (cells/*.sh); analyze.py fails the gate on a FAIL.
+expect() { printf '%s\t%s\t%s\n' "$1" "$2" "$(tr '\n\t' '  ' <<< "$3" | cut -c1-400)" >> expect.tsv; log "$1: $2 $3"; }
+# fetch <file|URL#sha256=hex>: the candidate as a file here, its digest checked.
+fetch() {
+  local f
+  case $1 in
+    '') return 0;;
+    *://*#sha256=*) mkdir -p "$OUT/candidate"; f=$OUT/candidate/$(basename "${1%%#*}")
+      [ -f "$f" ] || curl -fsSL --retry 5 "${1%%#*}" -o "$f" || { log "cannot fetch ${1%%#*}"; return 1; }
+      [ "$(sha256sum "$f" | cut -d' ' -f1)" = "${1##*#sha256=}" ] || { log "$f does not hash to ${1##*#sha256=}"; return 1; };;
+    *://*) log "$1 names no #sha256="; return 1;;
+    *) f=$1; [ -f "$f" ] || { log "no file $f"; return 1; };;
+  esac
+  echo "$f"
+}
+RWF=$(fetch "$RW") && TWF=$(fetch "$TW") && TDF=$(fetch "$TD") || exit 1
+[ -z "$TDF" ] || { chmod +x "$TDF"; BIN=$("$TDF" --version | awk '{print $2}'); }
+W=; "$CLI" machine update --help 2>/dev/null | grep -q -- --runtime-wheel && W=-wheel
+[ -z "$RWF" ] || CAND+=("--runtime$W" "$RWF"); [ -z "$TWF" ] || CAND+=("--tensorfs$W" "$TWF"); [ -z "$TDF" ] || CAND+=(--tensord "$TDF")
 gh release download "$TAG" -R "$REPO" -D "$B" -p "gate-$SKU.json" -p "ref-$SKU.*" -p "ref-$SKU-clip.mp4" 2>/dev/null
 if [ -f "$B/gate-$SKU.json" ]; then
   [ -z "$ESTABLISH" ] || { log "$SKU already has a baseline; --establish is only for a SKU without one"; exit 1; }
@@ -114,22 +134,38 @@ while i < len(t):
 [ -n "$M" ] || { log "rent failed: $(tail -c 300 rent.err) $(tail -c 300 rent.json)"; exit 1; }
 echo "$M" > machine
 log "rented $M"
+timeout 60 "$CLI" machine show "$M" > machine-fresh.txt 2>&1
+# `--before FILE`: sourced on the fresh pod, before the candidate goes on (cells/cl650.sh moves its software itself).
+for f in "${BEFORE[@]}"; do . "$f"; done
 if [ ${#CAND[@]} -gt 0 ]; then
-  "$CLI" machine update "$M" "${CAND[@]}" -y >update.log 2>&1; log "candidate on $M: $(grep -E '^status' update.log)"
+  "$CLI" machine update "$M" "${CAND[@]}" -y >update.log 2>&1; code=$?
+  log "candidate on $M: exit $code $(grep -E '^status' update.log)"
+  [ "$code" = 0 ] || expect candidate-update FAIL "$(tail -c 400 update.log)"
 fi
 timeout 60 "$CLI" machine show "$M" > machine.txt 2>&1
-# While cr-215 is open (lead 10-23) H3 takes the image reference only; the 3 s video reference returns with its fix.
-cell h3 "$(pkg minimax-h3 ref2va_turbo)" --asset ref="$REF" seed:=$((R + 1)) duration_s:=15 resolution=768p prompt="$MOTION"
+if [ -n "$BIN" ]; then
+  v=$(timeout 60 "$CLI" --json machine show "$M" | python3 -c 'import json,sys; print(json.load(sys.stdin)["status"]["version"])' 2>/dev/null)
+  [ "$v" = "$BIN" ] && expect candidate-tensord PASS "$M runs cozy $v" || expect candidate-tensord FAIL "$M runs cozy ${v:-?}, not $BIN"
+fi
+# H3's references: BiRefNet cleans the character image and Qwen3.5 describes it (greedy), as for a user's character.
+# While cr-215 is open (lead 10-23) the reference is the image only; the 3 s video reference returns with its fix.
+cell h3 "$(pkg minimax-h3 ref2va_turbo)" references:="[{\"name\": \"$NAME\", \"kind\": \"character\", \"image\": \"$REF\"}]" \
+  seed:=$((R + 1)) duration_s:=15 resolution=768p prompt="<$NAME> $MOTION"
 CLIP=$(output h3 mp4)
 [ -n "$CLIP" ] && nice -n 19 ffmpeg -v error -y -i "$CLIP" -t 1 -an -c:v libx264 -pix_fmt yuv420p clip-1s.mp4
 cell seedvr2 "$(pkg seedvr2 upscale)" --asset video="$OUT/clip-1s.mp4" resolution=1080p seed:=$((R + 2))
 cell sdxl "$(pkg sdxl generate)" prompt="$SCENE, photo" seed:=$((R + 3))
-cell klein "$(pkg flux-3-klein generate_turbo)" prompt="$CHAR" seed:=$((R + 4))
+cell klein "$(pkg flux-3-klein generate_turbo)" prompt="$CHAR" prompt_upsampling:=true seed:=$((R + 4))
 cell qwen "$(pkg qwen-image-2 generate)" seed:=$((R + 5)) prompt="This is an RGBA image with transparency. $OBJECT, semi-transparent with soft reflections. The image has alpha channel and the background is transparent."
 cell anima "$(pkg anima generate)" prompt="masterpiece, best quality, anime illustration of $CHAR" seed:=$((R + 6))
 K=$(output klein 'png|webp|jpg')
 cell birefnet "$(pkg birefnet remove_background)" --asset image="$K"
 cell describer "$(pkg qwen3.5 ask)" prompt="Describe this character: appearance, clothing and pose." --asset images="$K"
+# Every other first-party image package's default call; Fibo's prompt upsampler (greedy VLM) runs, as by default.
+cell fibo "$(pkg fibo-2 generate)" prompt="$SCENE" prompt_upsampling:=true seed:=$((R + 8))
+cell hidream "$(pkg hidream-o1 generate)" prompt="$CHAR, cinematic portrait" seed:=$((R + 9))
+cell moss "$(pkg moss-image generate)" prompt="$OBJECT, studio shot" seed:=$((R + 10))
+cell qwen-image "$(pkg qwen-image generate)" prompt="$SCENE at dusk, wide shot" seed:=$((R + 11))
 # More cells (`--cells FILE`): `name<TAB>target<TAB>args`, args expanded here ($SCENE, $CHAR, $R, $K, $M, $CLI ...).
 for f in "${EXTRA[@]}"; do
   [[ $f == *.sh ]] && continue
