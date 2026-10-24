@@ -9,7 +9,7 @@ parse "$@"
 [ "$(uname -s)" = Darwin ] || fail "the mps suite runs on macOS"
 
 step install; install_cozy
-step "the local machine"; cozy --json up; machine_ready
+step "the local machine"; machine_ready
 step candidates; candidates
 sysctl -n machdep.cpu.brand_string hw.memsize; sw_vers -productVersion
 # An Apple GPU, unified.
