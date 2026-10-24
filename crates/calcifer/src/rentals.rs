@@ -464,14 +464,15 @@ impl Machines {
                 if let Some(ask) = me.store().ask(&key).map_err(internal)? {
                     return Ok(ask);
                 }
-                let (sku, gpus) = match sku {
-                    Some(sku) if gpus > 0 => (sku, Some(gpus)),
+                let (sku, gpus, fallbacks) = match sku {
+                    Some(sku) if gpus > 0 => (sku, Some(gpus), vec![]),
                     sku => me.placed(&run, sku.as_deref()).await?,
                 };
                 let hub = run.hub.as_deref().unwrap_or_default();
                 let shape = Shape {
                     gpus,
                     agreed: run.agreed,
+                    fallbacks,
                     ..Shape::default()
                 };
                 let asked = me.ask_rent(&key, hub, &sku, shape, Some(run.id.clone()));
@@ -509,9 +510,14 @@ impl Machines {
         });
     }
 
-    /// Asks the run's Hub where to run it, on `sku` when the run names one: the product to rent and
-    /// its GPU count. The answer is kept on the run as a warning naming the product, its price and why.
-    async fn placed(&self, run: &RunRow, sku: Option<&str>) -> Result<(String, Option<u32>), Error> {
+    /// Asks the run's Hub where to run it, on `sku` when the run names one: the product to rent, its
+    /// GPU count and the machines the Hub may buy instead. The answer is kept on the run as a
+    /// warning naming the product, its price and why.
+    async fn placed(
+        &self,
+        run: &RunRow,
+        sku: Option<&str>,
+    ) -> Result<(String, Option<u32>, Vec<types::RentalFallback>), Error> {
         let hub = run.hub.as_deref().unwrap_or_default();
         let placed = self.place(hub, &run.spec, sku).await?;
         if !placed.why.is_empty() {
@@ -521,7 +527,7 @@ impl Machines {
             };
             self.calcifer.warn(&run.id, &warning).map_err(internal)?;
         }
-        Ok((placed.sku, placed.gpus))
+        Ok((placed.sku, placed.gpus, placed.fallbacks))
     }
 
     /// Where `hub` places a run of `spec`, on `sku` when the run names one. A named product the Hub
@@ -532,6 +538,7 @@ impl Machines {
             (Err(e), Some(sku)) => Ok(Placed {
                 sku: sku.into(),
                 gpus: None,
+                fallbacks: vec![],
                 why: match e.code.as_str() {
                     "placement_needs_release" => String::new(),
                     _ => format!("{sku} as asked, though {}", e.message),
@@ -603,9 +610,20 @@ impl Machines {
             placement.weight_bytes / 1_000_000_000,
             placement.bits,
         );
+        // The Hub may buy the next machines down its order instead (as fast, when the pick is),
+        // never above the price agreed for the pick.
+        let fallbacks = placement.machines[1..]
+            .iter()
+            .filter(|m| top.fast != Some(true) || m.fast == Some(true))
+            .map(|m| types::RentalFallback {
+                sku: m.name.clone(),
+                accelerator_count: Some(m.accelerator_count),
+            })
+            .collect();
         Ok(Placed {
             sku: top.name.clone(),
             gpus: u32::try_from(top.accelerator_count).ok(),
+            fallbacks,
             why,
             alternatives: alternatives(&placement.machines),
         })
@@ -618,7 +636,9 @@ impl Machines {
         };
         let gpus = (submit.spec.gpus > 0).then_some(submit.spec.gpus);
         let placed = match (sku, gpus) {
-            (Some(sku), Some(_)) => Placed { sku: sku.clone(), gpus, why: String::new(), alternatives: vec![] },
+            (Some(sku), Some(_)) => {
+                Placed { sku: sku.clone(), gpus, fallbacks: vec![], why: String::new(), alternatives: vec![] }
+            }
             (sku, _) => self.place(&submit.hub, &submit.spec, sku.as_deref()).await?,
         };
         let gpus = placed.gpus.or(gpus);
@@ -989,6 +1009,7 @@ impl Hubs {
 struct Placed {
     sku: String,
     gpus: Option<u32>,
+    fallbacks: Vec<types::RentalFallback>,
     why: String,
     alternatives: Vec<Alternative>,
 }
@@ -1205,7 +1226,9 @@ fn hourly(rental: &types::Rental) -> i64 {
 
 fn view(rental: &types::Rental, sku: Option<String>) -> Rental {
     Rental {
-        sku: sku.unwrap_or_else(|| rental.requested_accelerator_model.clone()),
+        // The Hub names the machine bought, which may be a fallback of the one asked.
+        sku: rental.sku.clone().filter(|s| !s.is_empty()).or(sku)
+            .unwrap_or_else(|| rental.requested_accelerator_model.clone()),
         accelerator: rental.requested_accelerator_model.clone(),
         gpus: u32::try_from(rental.accelerator_count).unwrap_or_default(),
         usd_micros_per_hour: hourly(rental),
@@ -1230,6 +1253,8 @@ pub struct Shape {
     pub disk_gb: Option<u32>,
     pub image: Option<String>,
     pub agreed: Option<Agreed>,
+    /// Machines the Hub may buy instead, in order, at or below the asked one's price.
+    pub fallbacks: Vec<types::RentalFallback>,
 }
 
 /// The Hub's request for renting `sku` in `shape`, under a fresh alias and signing key.
@@ -1244,6 +1269,7 @@ fn request(sku: &str, shape: Shape) -> Result<(types::RentalRequest, String, Sig
         creator_public_key: URL_SAFE_NO_PAD.encode(signer.verifying_key().to_bytes()),
         development: None,
         excluded_provider_machines: vec![],
+        fallbacks: shape.fallbacks,
         image: (shape.image.map(|image| image.try_into()).transpose()).map_err(
             |e: types::error::ConversionError| Error::new(Kind::Usage, "image_invalid", e.to_string()),
         )?,

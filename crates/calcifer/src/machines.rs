@@ -1173,6 +1173,7 @@ pub(crate) async fn quote(
         disk_gb,
         image,
         agreed: None,
+        ..Shape::default()
     };
     Ok(Json(api.machines.quote(&hub, &sku, shape).await.map_err(Refusal)?))
 }
@@ -1226,6 +1227,7 @@ pub(crate) async fn create(
                 disk_gb,
                 image,
                 agreed,
+                ..Shape::default()
             };
             let rented = (api.machines.rent(key, &hub, &sku, shape).await).map_err(Refusal)?;
             let status = match rented.replay {
