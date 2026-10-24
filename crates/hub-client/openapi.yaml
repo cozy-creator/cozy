@@ -13,6 +13,13 @@ info:
     `x-raw-body: true` answer bytes that are not JSON (an HTML index, a wheel, plain
     text): a client generator may skip them, and callers read the body themselves.
 
+    This file is the one definition: cozy generates its client from it unedited
+    (cozy-creator `scripts/hub-api.sh`), so a change to a route lands here in the same PR.
+    Clients and the Hub are released apart, and both read leniently: an unknown field is
+    ignored, a missing string, number or bool reads as empty, and so does a missing or null
+    list or map. Add fields freely; never rename or retype one in place, and never drop an
+    object a released client reads.
+
 servers: [{url: 'https://tensorhub.com'}]
 
 tags:
@@ -2290,6 +2297,7 @@ components:
       properties:
         python_version: {type: string}
         downloads: {type: array, items: {$ref: '#/components/schemas/PackageInstallFile'}}
+        package_config: {$ref: '#/components/schemas/ExactDocument', description: 'The release''s package.toml, empty when it has none. Only a cozy before xs-074 reads the field (and nothing of it).'}
         package_interface: {$ref: '#/components/schemas/ExactDocument'}
         pyproject: {$ref: '#/components/schemas/ExactDocument'}
         release: {type: string}
