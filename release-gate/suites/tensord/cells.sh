@@ -56,8 +56,11 @@ fi
 if [ -n "$RWF$TWF" ]; then
   "$CLI" machine update "$M" --runtime 0.31.0 --tensorfs 0.14.0 -y > "$T/runtime-back.log" 2>&1; back=$?
   n=$(submit "sdxl/generate@$NEW" prompt="$CHAR, the Runtime back" seed:=$((R + 32))); until_status "$n" terminal; s1=$(get "$n" status)
-  rw=$RWF tw=$TWF; case $rw in *://*) rw=$(fetch "$rw");; esac; case $tw in *://*) tw=$(fetch "$tw");; esac
-  "$CLI" machine update "$M" ${rw:+--runtime "$rw"} ${tw:+--tensorfs "$tw"} -y > "$T/runtime-forward.log" 2>&1; fwd=$?
+  if [ "$ICLI" != "$CLI" ]; then  # the machine fetches the candidate URLs itself
+    "$ICLI" machine update "$M" ${RWF:+--runtime-wheel "$RWF"} ${TWF:+--tensorfs-wheel "$TWF"} -y > "$T/runtime-forward.log" 2>&1; fwd=$?
+  else
+    "$CLI" machine update "$M" ${RWF:+--runtime "$RWF"} ${TWF:+--tensorfs "$TWF"} -y > "$T/runtime-forward.log" 2>&1; fwd=$?
+  fi
   m=$(submit "sdxl/generate@$NEW" prompt="$CHAR, the Runtime forward" seed:=$((R + 33))); until_status "$m" terminal; s2=$(get "$m" status)
   [ "$back$fwd" = 00 ] && [ "$s1$s2" = completedcompleted ] \
     && expect tensord-runtime-rollback PASS "Runtime back to 0.31.0 (run $n) and forward to the candidate (run $m)" \
@@ -83,14 +86,15 @@ else
 fi
 
 # Executors and leases: models stack on the pod and idle executors end when the last one needs the card (cr-216's
-# describer); the canceled run's executor gave its memory back; a restart gives every run a new executor.
+# describer); the canceled run's executor gave its memory back; a restart gives every run a new executor. (BiRefNet, not
+# Klein: Klein's two slots of one component collide on TFS 0.15.0, var-010.)
 s=$(submit "$(pkg anima generate)" prompt="masterpiece, anime illustration of $CHAR, stacked" seed:=$((R + 37))); until_status "$s" terminal
-k=$(submit "$(pkg flux-3-klein generate_turbo)" prompt="$OBJECT, stacked" seed:=$((R + 38))); until_status "$k" terminal
+k=$(submit "$(pkg birefnet remove_background)" --asset image="$REF"); until_status "$k" terminal
 d=$(submit "$(pkg qwen3.5 ask)" prompt="Describe this image in one sentence." --asset images="$REF"); until_status "$d" terminal
 ended=$(timeout 60 "$CLI" machine logs "$M" tensord -n 0 2>/dev/null | grep -c 'ending idle')
 [ "$(get "$s" status)$(get "$k" status)$(get "$d" status)" = completedcompletedcompleted ] \
-  && expect tensord-leases PASS "SDXL, Anima and Klein stacked, then the describer fit (run $d); $ended idle executors ended" \
-  || expect tensord-leases FAIL "anima $s $(get "$s" status), klein $k $(get "$k" status), describer $d $(get "$d" status) $(get "$d" reason)"
+  && expect tensord-leases PASS "SDXL, Anima and BiRefNet stacked, then the describer fit (run $d); $ended idle executors ended" \
+  || expect tensord-leases FAIL "anima $s $(get "$s" status), birefnet $k $(get "$k" status), describer $d $(get "$d" status) $(get "$d" reason)"
 "$CLI" machine update "$M" --gpu-memory-limit off -y > "$T/restart.log" 2>&1; at=$(( $(date +%s) * 1000 ))
 r=$(submit "sdxl/generate@$NEW" prompt="$SCENE, after the restart" seed:=$((R + 39))); until_status "$r" terminal
 [ "$(get "$r" status)" = completed ] && [ "$(get "$r" executor)" -gt "$at" ] 2>/dev/null \
