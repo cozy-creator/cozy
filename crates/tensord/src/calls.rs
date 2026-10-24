@@ -221,10 +221,8 @@ impl Calls {
             actor: submission.map(|s| s.actor.clone()).unwrap_or_default(),
             spool: spool.into(),
             callables,
-            pure: declarations(document).any(|(declared, entry)| {
-                entry["name"].as_str() == Some(record.invocation.entrypoint.as_str())
-                    && declared["memoize"].as_bool() == Some(true)
-            }),
+            pure: protocol::interface::entrypoint(document, &record.invocation.entrypoint)
+                .is_some_and(protocol::interface::memoized),
             pure_callables: pure_callables(&held.record),
             inputs: record.invocation.inputs.clone(),
             calls: Mutex::new(CallTable::default()),
@@ -592,21 +590,13 @@ pub(crate) fn observe(engine: &Engine, id: &str, seen: &mut Seen, frame: &Frame,
 fn pure_callables(generation: &crate::catalog::Generation) -> std::collections::HashSet<(String, String)> {
     std::iter::once(&generation.interface)
         .chain(generation.callees.iter().map(|c| &c.interface))
-        .flat_map(declarations)
-        .filter(|(declared, _)| declared["memoize"].as_bool() == Some(true))
-        .filter_map(|(declared, _)| {
-            Some((declared["module"].as_str()?.into(), declared["export"].as_str()?.into()))
+        .flat_map(protocol::interface::entrypoints)
+        .filter(|entry| protocol::interface::memoized(entry))
+        .filter_map(|entry| {
+            let (module, export) = protocol::interface::callable(entry)?;
+            Some((module.into(), export.into()))
         })
         .collect()
-}
-
-/// Each declared invocable of an interface: its declaration and its entry.
-fn declarations(interface: &Value) -> impl Iterator<Item = (&Value, &Value)> {
-    interface["entrypoints"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .map(|entry| (&entry["invocable"], entry))
 }
 
 /// Every App this environment holds: its own exports, including internal ones, and the
@@ -631,16 +621,14 @@ fn invocables(
         }));
     for (owner, interface, builtin) in apps {
         let own = owner == application;
-        for (declared, entry) in declarations(interface) {
-            let (Some(module), Some(export), Some(name)) = (
-                declared["module"].as_str(),
-                declared["export"].as_str(),
-                entry["name"].as_str(),
-            ) else {
+        for entry in protocol::interface::entrypoints(interface) {
+            let (Some((module, export)), Some(name)) =
+                (protocol::interface::callable(entry), protocol::interface::name(entry))
+            else {
                 continue;
             };
             // Another package's internal callable is its own business.
-            if !own && entry["internal"].as_bool() == Some(true) {
+            if !own && protocol::interface::internal(entry) {
                 continue;
             }
             let key = (module.to_string(), export.to_string());
@@ -670,10 +658,10 @@ fn invocables(
 /// module's callers from it).
 fn module_interface(interface: &Value, module: &str) -> Value {
     let mut narrowed = interface.clone();
-    if let Some(Value::Array(entries)) = narrowed.get_mut("entrypoints") {
+    if let Some(Value::Array(entries)) = narrowed.get_mut(protocol::interface::ENTRYPOINTS) {
         entries.retain(|entry| {
-            entry["invocable"]["module"].as_str() == Some(module)
-                && entry["internal"].as_bool() != Some(true)
+            protocol::interface::callable(entry).is_some_and(|(m, _)| m == module)
+                && !protocol::interface::internal(entry)
         });
     }
     narrowed

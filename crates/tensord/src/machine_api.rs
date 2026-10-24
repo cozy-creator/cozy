@@ -208,7 +208,7 @@ impl NativeBackend {
             let declaration =
                 entrypoint(&interface, &record.invocation.entrypoint)?;
             schema_digest =
-                Some(identity(declaration.get("result").ok_or_else(|| {
+                Some(identity(protocol::interface::result(declaration).ok_or_else(|| {
                     Error::conflict("precondition_failed", "result schema absent")
                 })?)?);
             let mut references = std::collections::HashMap::new();
@@ -262,8 +262,7 @@ impl NativeBackend {
             if let Some(value) = &mut value {
                 rewrite_assets(
                     value,
-                    declaration
-                        .get("result")
+                    protocol::interface::result(declaration)
                         .ok_or_else(|| Error::internal("custody_corrupt", "result schema absent"))?,
                     "",
                     domain::RunProductOp::Set,
@@ -636,12 +635,8 @@ impl MachineBackend for NativeBackend {
                 .collect();
             let interface: Value = serde_json::from_slice(&installed.interface)
                 .map_err(|_| Error::internal("custody_corrupt", "held interface corrupt"))?;
-            let mut entrypoints = interface
-                .get("entrypoints")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(|e| e.get("name").and_then(Value::as_str).map(str::to_string))
+            let mut entrypoints = protocol::interface::entrypoints(&interface)
+                .filter_map(|e| protocol::interface::name(e).map(str::to_string))
                 .collect::<Vec<_>>();
             entrypoints.sort();
             packages.push(domain::MachinePackage {
@@ -988,14 +983,7 @@ fn digest_bytes(value: &str) -> Result<Vec<u8>, Error> {
 }
 /// A callable's declaration.
 fn entrypoint<'a>(interface: &'a Value, name: &str) -> Result<&'a Value, Error> {
-    interface
-        .get("entrypoints")
-        .and_then(Value::as_array)
-        .and_then(|entries| {
-            entries
-                .iter()
-                .find(|entry| entry.get("name").and_then(Value::as_str) == Some(name))
-        })
+    protocol::interface::entrypoint(interface, name)
         .ok_or_else(|| Error::validation("invalid_request", "entrypoint is not declared by this held package"))
 }
 fn problem(error: io::Error) -> Error {

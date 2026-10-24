@@ -203,10 +203,7 @@ fn declared(engine: &Engine, generation: &Generation, id: &str) -> io::Result<(c
     let (_, _, interface) = generation
         .app(&record.invocation.module)
         .ok_or_else(|| io::Error::other("held application interface absent"))?;
-    let entry = interface
-        .get("entrypoints")
-        .and_then(Value::as_array)
-        .and_then(|rows| rows.iter().find(|row| row.get("name").and_then(Value::as_str) == Some(&record.invocation.entrypoint)))
+    let entry = protocol::interface::entrypoint(interface, &record.invocation.entrypoint)
         .cloned()
         .ok_or_else(|| io::Error::other("declared entrypoint absent"))?;
     Ok((context, entry))
@@ -217,8 +214,7 @@ fn declared(engine: &Engine, generation: &Generation, id: &str) -> io::Result<(c
 pub fn checkpoint(engine: &Engine, generation: &Generation, id: &str, seq: u64, item: &CheckpointItem) -> Answer {
     let record = || -> io::Result<u64> {
         let (_, entry) = declared(engine, generation, id)?;
-        if !entry["weights_outputs"].as_array().into_iter().flatten()
-            .any(|row| row["output_id"].as_str() == Some(item.output.as_str())) {
+        if !protocol::interface::weights_outputs(&entry).any(|(output, _)| output == item.output) {
             return Err(io::Error::new(io::ErrorKind::InvalidInput,
                 format!("{:?} is not a declared weights output", item.output)));
         }
@@ -257,7 +253,7 @@ fn commit(
     publish: &Publish,
 ) -> io::Result<(domain::Ref, u64)> {
     let (context, entry) = declared(engine, generation, id)?;
-    let result = entry.get("result").ok_or_else(|| io::Error::other("declared result schema absent"))?;
+    let result = protocol::interface::result(&entry).ok_or_else(|| io::Error::other("declared result schema absent"))?;
     let op = output_op(result, &publish.output).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,

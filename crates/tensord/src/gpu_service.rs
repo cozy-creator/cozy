@@ -1418,20 +1418,11 @@ impl Pool {
         let invalid = |detail: &str| io::Error::new(io::ErrorKind::InvalidData, detail.to_string());
         let interface: serde_json::Value =
             serde_json::from_slice(&installed.interface).map_err(io::Error::other)?;
-        let entry = interface
-            .get("entrypoints")
-            .and_then(serde_json::Value::as_array)
-            .and_then(|rows| {
-                rows.iter().find(|row| {
-                    row.get("name").and_then(serde_json::Value::as_str) == Some(entrypoint)
-                })
-            })
+        let entry = protocol::interface::entrypoint(&interface, entrypoint)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "declared entrypoint absent"))?;
-        let application = interface
-            .get("application")
-            .and_then(serde_json::Value::as_str)
+        let application = protocol::interface::application(&interface)
             .ok_or_else(|| invalid("declared application absent"))?;
-        let models = entry.get("models").and_then(serde_json::Value::as_array).cloned().unwrap_or_default();
+        let models = protocol::interface::models(entry).to_vec();
         let prefix = format!("{entrypoint}.models.");
         let slot_of = |model: &serde_json::Value| -> io::Result<(String, String)> {
             let path = model
@@ -2857,13 +2848,11 @@ impl Pool {
         let interface = session.executor.root_path().join("package-interface.json");
         let caller = calls.map(|calls| calls.caller(&record, held, document, &interface, &spool).0);
         callbacks.caller = caller.as_ref();
-        let entry = document["entrypoints"].as_array()
-            .and_then(|rows| rows.iter().find(|row| row["name"] == plan.entrypoint))
-            .cloned().unwrap_or_default();
-        let weights = entry["weights_outputs"].as_array().into_iter().flatten()
-            .filter_map(|row| Some((row["output_id"].as_str()?.to_owned(), row["max_bytes"].as_u64()?)))
+        let entry = protocol::interface::entrypoint(document, &plan.entrypoint).cloned().unwrap_or_default();
+        let weights = protocol::interface::weights_outputs(&entry)
+            .filter_map(|(output, max_bytes)| Some((output.to_owned(), max_bytes?)))
             .collect();
-        let operation = crate::call_memo::operation(&held.record, &record.invocation.module, &entry["invocable"])
+        let operation = crate::call_memo::operation(&held.record, &record.invocation.module, protocol::interface::invocable(&entry))
             .unwrap_or_default();
         session.executor.waits = caller.as_ref().map(|caller| caller.waits(engine));
         let invoked = Instant::now();
@@ -2876,7 +2865,7 @@ impl Pool {
                 actor: record.submission.as_ref().map(|submission| submission.actor.clone()).unwrap_or_default(),
                 operation,
                 family: record.family().unwrap_or_default().into(),
-                max_output_bytes: crate::output_capacity::for_callable(document, "entrypoints", &plan.entrypoint)?,
+                max_output_bytes: crate::output_capacity::for_callable(document, &plan.entrypoint)?,
                 request_id: id.into(),
                 construction: construction.clone(),
                 entrypoint: plan.entrypoint.clone(),
@@ -3038,17 +3027,8 @@ fn unpack_runtime(wheel: &Path, into: &Path) -> io::Result<PathBuf> {
 
 /// Whether any entrypoint of an installed interface constructs a model.
 fn binds_models(interface: &serde_json::Value) -> bool {
-    interface
-        .get("entrypoints")
-        .and_then(serde_json::Value::as_array)
-        .is_some_and(|entries| {
-            entries.iter().any(|entry| {
-                entry
-                    .get("models")
-                    .and_then(serde_json::Value::as_array)
-                    .is_some_and(|models| models.iter().any(constructed))
-            })
-        })
+    protocol::interface::entrypoints(interface)
+        .any(|entry| protocol::interface::models(entry).iter().any(constructed))
 }
 
 /// No deadline authorizes release: exact kernel exits wake the existing activity loop.

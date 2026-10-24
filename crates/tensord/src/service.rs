@@ -299,8 +299,7 @@ impl Service {
         let (_, _, interface) = held.record.app(&invocation.module).ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, "this environment holds no such application")
         })?;
-        let entry = interface["entrypoints"].as_array()
-            .and_then(|rows| rows.iter().find(|row| row["name"] == invocation.entrypoint.as_str()))
+        let entry = protocol::interface::entrypoint(interface, &invocation.entrypoint)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "this application declares no such entrypoint"))?;
         self.pool().map_or(Ok(0), |pool| pool.degree(entry, invocation.gpus))
     }

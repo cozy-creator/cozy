@@ -223,13 +223,13 @@ impl PartialEq for Struct {
 impl Interface {
     /// Reads a card's `package_interface`. Only a document that is not an interface at all refuses.
     pub fn parse(document: &Value) -> Result<Self, String> {
-        let format = document["format"].as_str().unwrap_or_default();
+        let format = protocol::interface::format(document);
         if !format.starts_with("cozy.package.interface/") {
             return Err(format!("not a package interface (format {format:?})"));
         }
         let mut out = Self::default();
-        for raw in document["entrypoints"].as_array().into_iter().flatten() {
-            let name = raw["name"].as_str().unwrap_or_default().to_owned();
+        for raw in protocol::interface::entrypoints(document) {
+            let name = protocol::interface::name(raw).unwrap_or_default().to_owned();
             match Callable::deserialize(raw).map_err(|e| e.to_string()) {
                 Ok(callable) => match callable.checked() {
                     Ok(callable) => out.callables.push(callable),
@@ -239,7 +239,7 @@ impl Interface {
             }
         }
         // A recipe this build cannot read is left out; `cozy model quantize` names those it can.
-        out.recipes = (document["recipes"].as_array().into_iter().flatten())
+        out.recipes = protocol::interface::recipes(document)
             .filter_map(|raw| Recipe::deserialize(raw).ok())
             .collect();
         Ok(out)
