@@ -1110,6 +1110,13 @@ impl DeviceExecutor {
         Ok(())
     }
 
+    /// Kills the executor now, without waiting for it to stop: one whose GPU state is lost (a
+    /// poisoned or unsettled reply) has nothing to finish, and its teardown can spin on that
+    /// state, holding its leases, without ever looking wedged. Its reap follows (`terminate`).
+    pub fn kill(&self) -> io::Result<()> {
+        self.exact.kill().map_err(io::Error::from)
+    }
+
     /// Close the channel, let the executor stop at its next exchange, kill it only on a
     /// measured wedge, then reap it and release what it held. Blocks until it is gone.
     pub fn terminate(mut self) -> io::Result<Ended> {
