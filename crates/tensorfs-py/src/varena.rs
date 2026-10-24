@@ -1022,16 +1022,29 @@ fn host_backend(limit: u64) -> HostBackend {
 /// torch's allocator waiting on varena (the manager, its own idle spans) gives up the GIL if
 /// its thread holds it, so an idle capture's thread can end its capture: the token is its
 /// saved thread state, 0 when it held none.
+#[cfg(unix)]
 fn release_gil() -> usize {
+    extern "C" {
+        // Outside the limited API but exported by every CPython since 3.4 (an abi3 extension
+        // resolves it from the interpreter at load): whether this thread holds the GIL.
+        fn PyGILState_Check() -> std::ffi::c_int;
+    }
     // SAFETY: the interpreter runs (this extension is loaded in it); PyGILState_Check only
     // reads, and PyEval_SaveThread is called only by the thread that holds the GIL.
     unsafe {
-        if ffi::PyGILState_Check() == 1 {
+        if PyGILState_Check() == 1 {
             ffi::PyEval_SaveThread() as usize
         } else {
             0
         }
     }
+}
+
+/// Windows links only the stable ABI's python3.dll, which has no PyGILState_Check: nothing is
+/// given up (TensorD leases Linux GPUs only so far).
+#[cfg(not(unix))]
+fn release_gil() -> usize {
+    0
 }
 
 fn reacquire_gil(token: usize) {
