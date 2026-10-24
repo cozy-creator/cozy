@@ -203,7 +203,6 @@ pub enum DeviceCommand {
         leases: Option<u32>,
         /// The memory contract it serves ([`memory_protocol`]): the lease protocol, or 0 (its own).
         memory_protocol: u32,
-        memory_mode: MemoryMode,
         /// Its stage memo tiers, when this machine memoizes ([`DeviceExecutor::memo_settings`]).
         #[serde(skip_serializing_if = "Option::is_none")]
         memo: Option<MemoSettings>,
@@ -2022,23 +2021,4 @@ fn scan(value: &Value) -> io::Result<()> {
         _ => (),
     }
     Ok(())
-}
-
-/// How the machine shares its GPUs, which Start tells every executor, an import-only one too:
-/// `shared` (a local machine: leave the display its floor, give memory back) or `dedicated`
-/// (a rented pod).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum MemoryMode {
-    Shared,
-    Dedicated,
-}
-
-impl From<platform::contain::host_pressure::HostMode> for MemoryMode {
-    fn from(mode: platform::contain::host_pressure::HostMode) -> Self {
-        match mode {
-            platform::contain::host_pressure::HostMode::Shared => Self::Shared,
-            platform::contain::host_pressure::HostMode::Dedicated => Self::Dedicated,
-        }
-    }
 }
