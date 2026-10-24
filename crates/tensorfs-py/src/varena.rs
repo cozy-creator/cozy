@@ -959,6 +959,8 @@ fn torch_stats(memory: &Memory) -> TorchFigures {
 pub fn install(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     let py = parent.py();
     let m = PyModule::new(py, "varena")?;
+    // The lease protocol, read from the module here and from the extension's bytes by TensorD.
+    m.add("LEASE_PROTOCOL", varena::lease::MARKER)?;
     m.add_class::<PyGpuId>()?;
     m.add_class::<PyFill>()?;
     m.add_class::<PyLevel>()?;

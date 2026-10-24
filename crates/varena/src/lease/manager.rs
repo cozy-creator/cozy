@@ -41,8 +41,23 @@ use crate::{Error, GpuId, Result};
 
 /// The largest chunk: one handle each (§3).
 pub const CHUNK: u64 = 32 << 20;
+macro_rules! protocol {
+    () => {
+        2
+    };
+}
 /// The lease protocol an agent speaks in its Hello (1 is the ledger's).
-pub const PROTOCOL: u32 = 2;
+pub const PROTOCOL: u32 = protocol!();
+/// [`PROTOCOL`] as TensorFS's extension carries it, for TensorD to read from a wheel's zip
+/// without importing it.
+pub const MARKER: &str = concat!("cozy-lease-protocol=", protocol!(), ";");
+/// The first lease protocol: the manager never serves the ledger's.
+const FIRST: u32 = 2;
+
+/// Whether this manager serves an agent speaking `protocol`: its own and the one before (§2).
+pub fn accepts(protocol: u32) -> bool {
+    protocol == PROTOCOL || (protocol >= FIRST && protocol + 1 == PROTOCOL)
+}
 /// The stall look's cadence (TensorD's sampler's): a period, never a verdict.
 const LOOK: Duration = Duration::from_millis(500);
 /// Looks in a row with neither a release nor any of its GPU work completing, while an unpinned
@@ -556,7 +571,7 @@ impl Manager {
         if self.open.is_none() {
             return end.send(&ToAgent::Refuse { id: 0, code: Refusal::Incompatible, why: "this GPU has no VMM for leases (exclusive compute mode)".into() }, None);
         }
-        if protocol != PROTOCOL || again.is_some() {
+        if !accepts(protocol) || again.is_some() {
             // A re-attach after a manager restart comes after slice 1: that agent runs standalone.
             let why = if again.is_some() { "re-attach is not served yet".into() } else { format!("lease protocol {protocol}; this manager speaks {PROTOCOL}") };
             return end.send(&ToAgent::Refuse { id: 0, code: Refusal::Incompatible, why }, None);

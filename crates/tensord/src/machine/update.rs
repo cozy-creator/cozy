@@ -495,6 +495,10 @@ impl Updates {
         }
         status.to = this_binary(identified(&self.paths.sdk())?);
         status.error.clear();
+        if let Some(note) = lease_note(&self.paths.sdk()) {
+            tracing::warn!("{note}");
+            status.notes.push(note);
+        }
         // Nothing rolls back to an older store now: it goes.
         if let Some(note) = super::older_store::reclaim(&self.paths)? {
             tracing::warn!("{note}");
@@ -1121,6 +1125,45 @@ fn build(path: &Path, sha256: &str) -> io::Result<String> {
     let commit = provenance.lines().find_map(|l| l.strip_prefix("COMMIT = ")).map(|c| c.trim().trim_matches('"'));
     let id = commit.filter(|c| c.len() >= 8 && c.chars().all(|c| c.is_ascii_hexdigit())).unwrap_or(sha256);
     Ok(format!("{version}+{}", &id[..8]))
+}
+
+/// The line an update leaves when the executors' TensorFS speaks a lease protocol this TensorD
+/// does not serve: they run standalone, never refused.
+fn lease_note(sdk: &Path) -> Option<String> {
+    let wheel = existing_wheel(sdk, "tensorfs").ok()?;
+    let version = wheel.file_name().and_then(|n| n.to_str()).and_then(wheel_name).map(|(_, v)| v).unwrap_or_default();
+    let ours = varena::lease::PROTOCOL;
+    match wheel_protocol(&wheel) {
+        Ok(Some(theirs)) if varena::lease::accepts(theirs) => None,
+        Ok(Some(theirs)) => Some(format!("executors run standalone: TensorFS {version} speaks lease protocol {theirs}, this TensorD {ours}")),
+        Ok(None) => Some(format!("executors may run standalone: TensorFS {version} names no lease protocol (this TensorD speaks {ours})")),
+        Err(error) => {
+            tracing::debug!("the lease protocol of {}: {error}", wheel.display());
+            None
+        }
+    }
+}
+
+/// The lease protocol a TensorFS wheel's extension carries (`varena::lease::MARKER`), read from
+/// the zip, never imported; `None` when it carries none.
+fn wheel_protocol(path: &Path) -> io::Result<Option<u32>> {
+    let marker = varena::lease::MARKER;
+    let needle = &marker.as_bytes()[..=marker.find('=').unwrap_or_default()];
+    let mut archive = zip::ZipArchive::new(fs::File::open(path)?).map_err(io::Error::other)?;
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i).map_err(io::Error::other)?;
+        let name = entry.name().map_err(io::Error::other)?.to_owned();
+        if !name.starts_with("tensorfs/") || ![".so", ".pyd", ".dylib"].iter().any(|ext| name.ends_with(ext)) {
+            continue;
+        }
+        let mut bytes = Vec::new();
+        entry.read_to_end(&mut bytes)?;
+        if let Some(at) = bytes.windows(needle.len()).position(|w| w == needle) {
+            let digits: String = bytes[at + needle.len()..].iter().take_while(|b| b.is_ascii_digit()).map(|&b| b as char).collect();
+            return Ok(digits.parse().ok());
+        }
+    }
+    Ok(None)
 }
 
 /// `cozy_runtime-0.18.102-cp312-…whl` → ("cozy_runtime", "0.18.102").
