@@ -1,13 +1,13 @@
 //! The machine's idle clock. A rental releases itself after 15 minutes with no job queued for it
 //! or running on it, used or not (owner ruling 2026-10-10); every run asked of it is a job (a
-//! call, a job, a warm-up, an upload); an explicit keepalive restarts that clock once. The clock
-//! is durable state, never a sample held in memory: the journal's last job end and the ledger's
-//! idle start (this rental's first boot, or a keepalive), so restarts and updates neither shorten
-//! nor lose it. This computer's machine counts the same clock from its start: after 5 minutes its
+//! call, a job, a warm-up, an upload, an update); an explicit keepalive restarts that clock once.
+//! The clock is durable state, never a sample held in memory: the journal's last job end and the
+//! ledger's idle start (this rental's first boot, a keepalive, or an update's activation or end),
+//! so restarts and updates neither shorten nor lose it. This computer's machine counts the same clock from its start: after 5 minutes its
 //! executors exit and give back every byte they held, after 15 it exits itself (Calcifer starts
 //! it again when something uses it), unless another computer's controller is authorized to use
-//! it. A client following a run or a log, or reading an output, holds either clock. Also the Hub
-//! lease of authorized keys.
+//! it. A client following a run or a log, reading an output or uploading an object, holds either
+//! clock. Also the Hub lease of authorized keys.
 use super::hub::{Hub, Refusal};
 use crate::api::auth::Keys;
 use std::{
@@ -60,9 +60,11 @@ pub struct Lifecycle {
     epoch: AtomicU64,
     /// Clients following a run's events or a log now.
     following: AtomicUsize,
+    /// Updates in progress here: each is a job until it ends (`Updating`).
+    updating: AtomicUsize,
     /// This computer's machine stays up: another computer's controller is authorized to use it.
     kept: AtomicBool,
-    /// When an output read last moved bytes (unix ms).
+    /// When an output read or an object upload last moved bytes (unix ms).
     transferred: AtomicI64,
     /// Called when an activation starts or ends without its restart (the runs it holds change),
     /// and when an admission or a follower lets go: the idle clock may start.
@@ -77,6 +79,16 @@ pub struct Follow(Arc<Lifecycle>);
 impl Drop for Follow {
     fn drop(&mut self) {
         self.0.following.fetch_sub(1, Ordering::AcqRel);
+        self.0.changed();
+    }
+}
+
+/// Holds the idle clock while an update runs; its end starts the clock again.
+pub struct Updating(Arc<Lifecycle>);
+impl Drop for Updating {
+    fn drop(&mut self) {
+        self.0.updating.fetch_sub(1, Ordering::AcqRel);
+        self.0.used();
         self.0.changed();
     }
 }
@@ -128,6 +140,7 @@ impl Lifecycle {
             admissions: AtomicUsize::new(0),
             epoch: AtomicU64::new(0),
             following: AtomicUsize::new(0),
+            updating: AtomicUsize::new(0),
             kept: AtomicBool::new(false),
             transferred: AtomicI64::new(0),
             changed: Default::default(),
@@ -141,14 +154,15 @@ impl Lifecycle {
     }
 
     /// When the idle clock runs out: 15 minutes after the latest of its start, the last job's end
-    /// and the last bytes an output read moved.
+    /// and the last bytes an output read or an upload moved.
     fn idle_end(&self, state: &State) -> i64 {
         let used = state.jobs.ended_ms.max(self.transferred.load(Ordering::Acquire));
         state.ledger.idle_since_ms.max(used) + self.grace
     }
 
-    /// An output read moved bytes: the rental is in use, and its idle clock starts again now. A
-    /// read that stalls moves nothing, so it never holds the rental past one window.
+    /// An output read or an object upload moved bytes: the rental is in use, and its idle clock
+    /// starts again now. A transfer that stalls moves nothing, so it never holds the rental past one
+    /// window.
     pub fn transferred(&self) {
         self.transferred.fetch_max(now_ms(), Ordering::AcqRel);
     }
@@ -157,11 +171,12 @@ impl Lifecycle {
         state.ledger.released || (!state.jobs.working && now >= self.idle_end(state))
     }
 
-    /// A job is queued or running, a call that may queue one is in flight (on this computer, a
-    /// follower too: a rental bills, so only jobs hold it), or a call was admitted since the
-    /// journal was last read.
+    /// A job is queued or running, an update is in progress, a call that may queue one is in
+    /// flight (on this computer, a follower too: a rental bills, so only jobs hold it), or a call
+    /// was admitted since the journal was last read.
     fn working(&self, state: &State) -> bool {
         state.jobs.working
+            || self.updating.load(Ordering::Acquire) > 0
             || self.admitted() > 0
             || (!self.rental && self.following.load(Ordering::Acquire) > 0)
             || state.sampled != self.epoch()
@@ -206,6 +221,30 @@ impl Lifecycle {
         self.admissions.fetch_add(1, Ordering::AcqRel);
         self.epoch.fetch_add(1, Ordering::AcqRel);
         Ok(Admission(self.clone()))
+    }
+
+    /// An update is a job: it holds the idle clock from its request to its end. Refused as `admit`
+    /// refuses; the admission it takes holds the clock until the update's own hold does.
+    pub fn update(self: &Arc<Self>) -> Result<Updating, Error> {
+        let admission = self.admit()?;
+        self.updating.fetch_add(1, Ordering::AcqRel);
+        drop(admission);
+        Ok(Updating(self.clone()))
+    }
+
+    /// Work that is not in the journal ended (an update, or its activation): the idle clock starts
+    /// again now, durably, so the service an update restarts counts its window from here.
+    pub fn used(&self) {
+        let mut state = self.state.lock().unwrap();
+        if state.ledger.released {
+            return;
+        }
+        let mut ledger = state.ledger.clone();
+        ledger.idle_since_ms = ledger.idle_since_ms.max(now_ms());
+        match self.save(&ledger) {
+            Ok(()) => state.ledger = ledger,
+            Err(error) => tracing::warn!("the idle ledger could not be written: {error}"),
+        }
     }
 
     /// Closes admission under the lock `admit` takes: a call is either admitted (and counted)

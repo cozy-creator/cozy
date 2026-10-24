@@ -522,6 +522,9 @@ impl Updates {
             status.notes.push(note);
         }
         status.enter("succeeded");
+        if let Some(lifecycle) = &self.lifecycle {
+            lifecycle.used();
+        }
         if let Some(launch) = &pending.binary {
             let marker = self.paths.engine.join(DEV);
             match pending.dev {
@@ -677,10 +680,10 @@ impl Updates {
         // A committed terminal outcome may still have cleanup to do. Finish that before a
         // different operation overwrites its status and loses the pending decision's meaning.
         recover_activation(&self.paths).map_err(server)?;
-        // An update is not a job: a released or activating machine refuses it, and preparing it
-        // never holds the rental's idle release. Activation then closes admission.
-        drop(self.lifecycle.as_ref().map(|l| l.admit()).transpose()
-            .map_err(|refused| (503, refused.to_string()))?);
+        // An update is a job: it holds the idle clock until it ends, and a released or activating
+        // machine refuses it. Activation then closes admission.
+        let holding = self.lifecycle.as_ref().map(|l| l.update()).transpose()
+            .map_err(|refused| (503, refused.to_string()))?;
         let mut status = Status {
             operation: request.operation.clone(),
             toolchain: request.toolchain,
@@ -697,6 +700,7 @@ impl Updates {
         std::thread::Builder::new()
             .name("runtime-update".into())
             .spawn(move || {
+                let _holding = holding;
                 if let Err(error) = updates.run(&request, exit) {
                     let failed = updates.set(|s| {
                         if !s.terminal() {
@@ -842,6 +846,10 @@ impl Updates {
             "update {}: restarting on cozy {}, Runtime {} / TensorFS {}",
             request.operation, to.cozy, to.runtime, to.tensorfs
         );
+        // The restarted service's idle window starts here; its commit starts it again.
+        if let Some(lifecycle) = &self.lifecycle {
+            lifecycle.used();
+        }
         exit(if binary.is_some() { super::binary::EXEC_EXIT } else { REPLACE_EXIT });
         Ok(())
     }
