@@ -98,6 +98,44 @@ machine_stop() {
   return 1
 }
 
+# The process holding the local machine's root (on Windows its service, whose parent is TensorD's own).
+machine_pid() { grep -o '"pid": *[0-9]*' "$HOME/.cozy/machine/var/lib/cozy/machine/agent.lock.holder" | grep -o '[0-9]*$'; }
+parent_of() {
+  if [ "$RUNNER_OS" = Windows ]; then
+    powershell -NoProfile -c "(Get-CimInstance Win32_Process -Filter 'ProcessId=$1').ParentProcessId" | tr -d '\r '
+  else
+    ps -o ppid= -p "$1" | tr -d ' '
+  fi
+}
+# Whether process $1 is gone, a zombie not: one answers kill -0 until its parent reaps it.
+gone() {
+  if [ "$RUNNER_OS" = Windows ]; then ! tasklist //FI "PID eq $1" | grep -q " $1 "; else ! kill -0 "$1" 2>/dev/null; fi
+}
+
+# cl-646: the local machine Calcifer started, ended, is reaped by Calcifer (gone, no zombie), and the next
+# `machine show local` starts another. One the installer's `cozy-machine` service still runs is ended
+# first, until the machine is the one Calcifer started.
+machine_reaped() {
+  local calcifer pid top='' i
+  calcifer=$(cozy --json status | grep -o '"pid": *[0-9]*' | head -1 | grep -o '[0-9]*$')
+  for i in 1 2 3; do
+    machine_ready
+    pid=$(machine_pid) || { check "no process holds the local machine's root"; return; }
+    top=$pid
+    [ "$RUNNER_OS" != Windows ] || top=$(parent_of "$pid")
+    [ "$(parent_of "$top")" = "$calcifer" ] && break
+    echo "the local machine (pid $top) is $(parent_of "$top")'s, not Calcifer's ($calcifer): ending it"
+    machine_stop || true
+  done
+  [ "$(parent_of "$top")" = "$calcifer" ] || { check "Calcifer (pid $calcifer) never started the local machine"; return; }
+  if [ "$RUNNER_OS" = Windows ]; then taskkill //F //T //PID "$top"; else kill "$top"; fi
+  for i in $(seq 30); do gone "$top" && break; sleep 1; done
+  gone "$top" || check "Calcifer left the local machine it started (pid $top) behind: state $(ps -o stat= -p "$top" 2>/dev/null)"
+  machine_ready
+  [ "$(machine_pid)" != "$pid" ] || check "the next machine show local did not start another machine"
+  echo "the local machine Calcifer started (pid $top) was reaped; the next one is pid $(machine_pid)"
+}
+
 # The local machine is up and reports itself (`machine show local` starts it); its record lands in
 # $OUT/machine.json. A cozy before cl-646 (#1883; the installer's release until one carries it) makes its
 # machine with `cozy machine enable`; a later one starts it on first use.

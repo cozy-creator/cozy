@@ -39,6 +39,8 @@ machine_ready
 dog=$(picture dog2.jpg)
 if cell second "$(birefnet)" --asset "image=$dog"; then white_background "$(output second webp)" "$dog" || check "second: not a background removal"; fi
 
+step "Calcifer reaps the machine it started"; machine_reaped
+
 step down; cozy --json down || check "cozy down failed"
 step uninstall; cozy uninstall --yes || check "cozy uninstall failed"
 [ ! -e "$COZY" ] || check "cozy uninstall left $COZY"
