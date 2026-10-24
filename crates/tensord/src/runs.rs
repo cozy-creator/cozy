@@ -141,11 +141,8 @@ fn addressed(parameter: &str, package: &str, interface: &Value) -> Option<String
         .strip_prefix(package)
         .and_then(|rest| rest.strip_prefix('/'))
         .unwrap_or(parameter);
-    interface["entrypoints"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .any(|entry| entry["models"].as_array().into_iter().flatten().any(|slot| slot["path"] == path))
+    protocol::interface::entrypoints(interface)
+        .any(|entry| protocol::interface::models(entry).iter().any(|slot| protocol::interface::slot_path(slot) == Some(path)))
         .then(|| path.to_string())
 }
 
@@ -154,16 +151,10 @@ fn addressed(parameter: &str, package: &str, interface: &Value) -> Option<String
 fn internal_models(installation: &Installation) -> Result<Vec<String>, Refused> {
     let interface: Value = serde_json::from_slice(&installation.interface)
         .map_err(|_| refused("package_interface_invalid", "held interface is corrupt"))?;
-    let constructs = |entry: &Value| {
-        let models = entry["models"].as_array().into_iter().flatten();
-        models.into_iter().any(crate::gpu_service::constructed)
-    };
-    Ok(interface["entrypoints"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|entry| entry["internal"].as_bool() == Some(true) && constructs(entry))
-        .filter_map(|entry| entry["name"].as_str().map(str::to_owned))
+    let constructs = |entry: &Value| protocol::interface::models(entry).iter().any(crate::gpu_service::constructed);
+    Ok(protocol::interface::entrypoints(&interface)
+        .filter(|entry| protocol::interface::internal(entry) && constructs(entry))
+        .filter_map(|entry| protocol::interface::name(entry).map(str::to_owned))
         .collect())
 }
 
@@ -171,18 +162,17 @@ fn internal_models(installation: &Installation) -> Result<Vec<String>, Refused> 
 fn declares(installation: &Installation, name: &str) -> Result<bool, Refused> {
     let interface: Value = serde_json::from_slice(&installation.interface)
         .map_err(|_| refused("package_interface_invalid", "held interface is corrupt"))?;
-    let entry = interface["entrypoints"].as_array()
-        .and_then(|rows| rows.iter().find(|row| row["name"] == name));
+    let entry = protocol::interface::entrypoint(&interface, name);
     if let Some(entry) = entry {
         public_root(entry)?;
     }
     Ok(entry.is_some())
 }
 fn public_root(entry: &Value) -> Result<(), Refused> {
-    if entry["internal"].as_bool() == Some(true) {
+    if protocol::interface::internal(entry) {
         return Err(refused(
             "callable_internal",
-            format!("{} is an internal package function", entry["name"].as_str().unwrap_or_default()),
+            format!("{} is an internal package function", protocol::interface::name(entry).unwrap_or_default()),
         ));
     }
     Ok(())
@@ -709,9 +699,7 @@ impl Runs {
                 tracing::warn!("run {id}: {warning} ({error})");
             }
         }
-        let declared = interface["entrypoints"]
-            .as_array()
-            .and_then(|rows| rows.iter().find(|row| row["name"] == spec.entrypoint.as_str()));
+        let declared = protocol::interface::entrypoint(&interface, &spec.entrypoint);
         if declared.is_none() && !install_only {
             return Err(refused(
                 "invalid_entrypoint",
@@ -777,14 +765,14 @@ impl Runs {
         // A memoized callable's run is answered from the success this machine holds for its
         // signer under the same computation, and starts nothing. A writer (weights outputs,
         // published media) has an effect beyond its result: it always runs.
-        let writer = entry["weights_outputs"].as_array().is_some_and(|rows| !rows.is_empty())
-            || entry["publishes"].as_bool() == Some(true)
+        let writer = protocol::interface::weights_outputs(entry).next().is_some()
+            || protocol::interface::publishes(entry)
             || !spec.weights_destination.is_empty();
         let memo = match writer {
             false => call_memo::of(
                 &generation.record,
                 &spec.application,
-                &entry["invocable"],
+                protocol::interface::invocable(entry),
                 &spec.input,
                 &spec.inputs,
                 (&spec.attention_kernel, spec.bits),

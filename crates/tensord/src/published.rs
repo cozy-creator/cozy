@@ -967,7 +967,7 @@ impl Publisher {
                 job.stop.as_ref())?;
         }
         let interface = &card.interface;
-        let application = interface.get("application").and_then(Value::as_str).ok_or((
+        let application = protocol::interface::application(interface).ok_or((
             "package_prepare_interface_invalid",
             "the package interface names no application".to_string(),
         ))?;
@@ -1804,14 +1804,8 @@ pub(crate) fn choice_absent(path: &str, package: &str) -> Failure {
 }
 
 fn model_slots(interface: &Value, entrypoint: &str) -> Option<Vec<Value>> {
-    interface
-        .get("entrypoints")?
-        .as_array()?
-        .iter()
-        .find(|e| e.get("name").and_then(Value::as_str) == Some(entrypoint))?
-        .get("models")?
-        .as_array()
-        .cloned()
+    let entry = protocol::interface::entrypoint(interface, entrypoint)?;
+    entry["models"].is_array().then(|| protocol::interface::models(entry).to_vec())
 }
 
 fn declares_models(installation: &Installation, entrypoint: &str) -> bool {

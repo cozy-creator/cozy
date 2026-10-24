@@ -33,12 +33,7 @@ impl Card {
     /// A callable's request struct as its card spells it, with `accelerator: false` for a CPU
     /// function: what `--describe --json` prints.
     pub fn request(&self, name: &str) -> Value {
-        let entrypoints = self.document["package_interface"]["entrypoints"].as_array();
-        let Some(entry) = entrypoints
-            .into_iter()
-            .flatten()
-            .find(|e| e["name"] == name)
-        else {
+        let Some(entry) = protocol::interface::entrypoint(&self.document["package_interface"], name) else {
             return Value::Null;
         };
         let mut request = entry["request"].clone();

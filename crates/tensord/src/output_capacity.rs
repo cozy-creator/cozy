@@ -6,12 +6,10 @@ pub const DEFAULT_BYTES: u64 = 256 << 20;
 
 /// Keep the ordinary working allowance, but honor larger declared fixed output slots.
 /// Model manifests use their separate weights grant and contribute no asset capacity.
-pub fn for_callable(interface: &Value, kind: &str, name: &str) -> io::Result<u64> {
-    let row = interface[kind]
-        .as_array()
-        .and_then(|rows| rows.iter().find(|row| row["name"] == name))
+pub fn for_callable(interface: &Value, name: &str) -> io::Result<u64> {
+    let row = protocol::interface::entrypoint(interface, name)
         .ok_or_else(|| invalid("installed output callable is absent"))?;
-    Ok(capacity(&row["result"], None)?.max(DEFAULT_BYTES))
+    Ok(capacity(protocol::interface::result(row).unwrap_or(&Value::Null), None)?.max(DEFAULT_BYTES))
 }
 
 fn invalid(detail: &str) -> io::Error {
