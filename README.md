@@ -23,9 +23,28 @@ the installer prints. `cozy update` moves to the newest release.
 
 ## Use
 
+Write the request in a YAML file, `request.yaml`:
+
+```yaml
+prompt: a lighthouse on a basalt cliff at dusk, oil painting
+aspect_ratio: "16:9"
+steps: 30
+seed: 7
+```
+
 ```sh
 cozy login you@example.com
-cozy run sdxl/generate prompt='a lighthouse at dusk' seed=7
+cozy run sdxl/generate --input request.yaml
+cozy run sdxl/generate --input request.yaml seed=8      # an inline input overrides the file
+cozy run birefnet/remove_background --asset image=./character.png
+cozy run sdxl/generate --describe                       # the fields a function takes
+```
+
+Inline `key=value` inputs are the quick form: `cozy run sdxl/generate prompt='a fox in fresh snow'`.
+Files go in with `--asset` (or by path inside the YAML, relative to it). A run is followed to its end;
+Ctrl-C stops following, never the run, and `cozy run show <N>` picks it up again.
+
+```sh
 cozy machine rent            # what is for rent; then cozy machine rent <sku>
 cozy model search sdxl
 ```

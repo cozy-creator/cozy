@@ -221,18 +221,25 @@ struct Model {
     manifest: String,
 }
 
+/// A run not yet settled is followed to its end in every mode (Ctrl-C stops following, never the
+/// run): with `--json`, Calcifer's events as NDJSON, then the run's whole record as the last line.
+/// `once`: a snapshot instead. The exit code is the run's: 1 when it failed or was canceled.
 pub async fn exec(ctx: &Context, id: &str, once: bool) -> Result<ExitCode, Error> {
     let calcifer = ctx.calcifer().await?;
-    let run: Run = calcifer
-        .get_query(&format!("/v1/runs/{id}"), &[("detail", "full")])
-        .await?;
-    // A run not yet settled is followed on a terminal, as `cozy run watch` follows it.
-    if !once && !ctx.json && ctx.term.stdout && !follow::settled(&run) {
-        return Ok(follow::exit_code(&follow::follow(ctx, run, false).await?));
+    let full = format!("/v1/runs/{id}");
+    let mut run: Run = calcifer.get_query(&full, &[("detail", "full")]).await?;
+    if !once && !follow::settled(&run) {
+        let ended = follow::follow(ctx, run).await?;
+        if !ctx.json {
+            return Ok(follow::exit_code(&ended));
+        }
+        run = calcifer.get_query(&format!("/v1/runs/{}", ended.id), &[("detail", "full")]).await?;
+        output::ndjson(&run);
+        return Ok(follow::exit_code(&run));
     }
     if ctx.json {
         output::json(&run);
-        return Ok(ExitCode::SUCCESS);
+        return Ok(follow::exit_code(&run));
     }
     let execution = run
         .settled_at_ms
@@ -325,7 +332,7 @@ pub async fn exec(ctx: &Context, id: &str, once: bool) -> Result<ExitCode, Error
         true => follow::toolchain_offer(ctx, &run),
         false => follow::next(ctx, &run),
     }
-    Ok(ExitCode::SUCCESS)
+    Ok(follow::exit_code(&run))
 }
 
 /// One executor's measurements, by who measured them (`run`, or the call's index), and the

@@ -104,7 +104,7 @@ M=
 end_it() {
   [ -n "$M" ] || return
   "$CLI" machine end "$M" -y >end.log 2>&1
-  for _ in $(seq 1 30); do timeout 30 "$CLI" machine list --once 2>/dev/null | grep -q "^$M " || { log "ended $M, gone"; M=; return; }; sleep 10; done
+  for _ in $(seq 1 30); do timeout 30 "$CLI" machine list 2>/dev/null | grep -q "^$M " || { log "ended $M, gone"; M=; return; }; sleep 10; done
   log "WARNING $M still listed"
 }
 trap end_it EXIT

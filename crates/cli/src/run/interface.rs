@@ -36,14 +36,14 @@ pub struct RecipeModel {
     pub component_use: BTreeMap<String, Vec<String>>,
 }
 
-/// The lanes `cozy model quantize` names by a flag of their own (`--int8`).
+/// The lanes `cozy model quantize --format` names (`--format int8,fp8`).
 pub const LANE_FLAGS: [&str; 5] = ["int8", "fp8", "nvfp4", "w4a8", "svdq-nvfp4"];
 
 impl Recipe {
     /// The `cozy model quantize` flag that runs it: its lane's, else its name.
     pub fn flag(&self) -> String {
         match LANE_FLAGS.contains(&self.lane.as_str()) {
-            true => format!("--{}", self.lane),
+            true => format!("--format {}", self.lane),
             false => format!("--recipe {}", self.name),
         }
     }

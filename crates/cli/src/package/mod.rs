@@ -41,24 +41,12 @@ enum Command {
         package: String,
     },
     /// Install a published package ([org/]name[@release]), a directory or a script on a machine:
-    /// its environment, no weights.
+    /// its environment, no weights. Without a release, the newest; over an installed package, its
+    /// older releases there go (an update). Follows the install; Ctrl-C stops following, never it.
     Install {
         /// [org/]name[@release], a directory such as `.` or `./project`, or a PEP 723 `script.py`.
         #[arg(add = clap_complete::ArgValueCompleter::new(crate::completion::local))]
         package: String,
-        #[command(flatten)]
-        placement: Placement,
-        /// Print the run and return instead of following it.
-        #[arg(long)]
-        detach: bool,
-    },
-    /// Move a machine's packages to a release, their Hub's newest unless named: the named ones,
-    /// else every one. A directory or script installs live, as `install` does.
-    Update {
-        /// [org/]name[@release], a directory such as `.` or `./project`, or a PEP 723 `script.py`;
-        /// none moves every published package on the machine to its newest release.
-        #[arg(add = clap_complete::ArgValueCompleter::new(crate::completion::local))]
-        packages: Vec<String>,
         #[command(flatten)]
         placement: Placement,
     },
@@ -75,9 +63,6 @@ enum Command {
         /// Only this machine.
         #[arg(long, value_name = "MACHINE")]
         on: Option<String>,
-        /// One snapshot even on a terminal, instead of the live view.
-        #[arg(long)]
-        once: bool,
     },
     /// Lock this project's dependencies for the Hub and account it publishes to (needs uv).
     Lock {
@@ -108,31 +93,15 @@ pub async fn exec(ctx: &Context, args: Args) -> Result<ExitCode, Error> {
     match args.command {
         Command::Search { query, limit } => catalog::search(ctx, &query.join(" "), limit).await,
         Command::Info { package } => catalog::info(ctx, &PackageRef::parse(&package)?).await,
-        Command::Install {
-            package,
-            placement,
-            detach,
-        } => match directory(&package) {
-            Some(path) => machine::install_directory(ctx, &path, placement.on(), detach).await,
-            None => {
-                machine::install(ctx, &PackageRef::parse(&package)?, placement.on(), detach).await
-            }
+        Command::Install { package, placement } => match directory(&package) {
+            Some(path) => machine::install_directory(ctx, &path, placement.on()).await,
+            None => machine::install(ctx, &PackageRef::parse(&package)?, placement.on()).await,
         },
-        Command::Update {
-            packages,
-            placement,
-        } => {
-            let paths: Vec<PathBuf> = packages.iter().filter_map(|p| directory(p)).collect();
-            let named = (packages.iter().filter(|p| directory(p).is_none()))
-                .map(|text| PackageRef::parse(text).map(|r| (r.package(), r.release)))
-                .collect::<Result<Vec<_>, _>>()?;
-            machine::update(ctx, &named, &paths, placement.on()).await
-        }
         Command::Remove {
             packages,
             placement,
         } => machine::remove(ctx, &names(&packages)?, placement.on()).await,
-        Command::List { on, once } => machine::list(ctx, on.map(Into::into), once).await,
+        Command::List { on } => machine::list(ctx, on.map(Into::into)).await,
         Command::Lock { upgrade, root } => author::lock(ctx, &upgrade, root).await,
         Command::Publish { root } => author::publish(ctx, root).await,
         Command::Yank { release, undo } => {

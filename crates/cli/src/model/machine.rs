@@ -119,7 +119,6 @@ fn escape(name: &str) -> String {
 async fn warm(
     ctx: &Context,
     placement: &Placement,
-    detach: bool,
     target: String,
     input: ModelInput,
     destination: String,
@@ -145,7 +144,7 @@ async fn warm(
         warnings: vec![],
     };
     let submitted = crate::run::submit(ctx, submit, None).await?;
-    let run = crate::run::follow(ctx, submitted.run, detach).await?;
+    let run = crate::run::follow(ctx, submitted.run).await?;
     made(ctx, &run);
     Ok(crate::run::exit_code(&run))
 }
@@ -203,11 +202,14 @@ pub(crate) async fn download(ctx: &Context, args: Download) -> Result<ExitCode, 
         made.0.lane = refs::variant(variant)?;
     }
     let lane = args.lane.as_deref().map_or(0, |b| b.parse().expect("clap admits 16, 8 or 4"));
-    warm(ctx, &args.placement, args.detach, args.model.clone(), made.into(), destination, lane).await
+    warm(ctx, &args.placement, args.model.clone(), made.into(), destination, lane).await
 }
 
 pub(crate) async fn upload(ctx: &Context, args: Upload) -> Result<ExitCode, Error> {
     let destination = refs::destination(&args.destination)?;
+    if let Some(reference) = args.source.strip_prefix("run:") {
+        return super::from_run::upload(ctx, reference, &destination).await;
+    }
     if !ctx.signed_in(&ctx.hub()?) {
         // The machine publishes under this computer's sign-in; refuse before anything is made.
         return Err(Error::new(Kind::Credential, "not_logged_in", "an upload publishes as your account: sign in first")
@@ -220,7 +222,7 @@ pub(crate) async fn upload(ctx: &Context, args: Upload) -> Result<ExitCode, Erro
         source(&args.source, &args.profiles)?.into()
     };
     let target = format!("{} → {destination}", args.source);
-    warm(ctx, &args.placement, args.detach, target, made, destination, 0).await
+    warm(ctx, &args.placement, target, made, destination, 0).await
 }
 
 /// One checkpoint a machine holds, and its repository's bytes there.

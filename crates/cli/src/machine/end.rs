@@ -339,7 +339,7 @@ pub async fn update(
         warnings: vec![],
     };
     let submitted = crate::run::submit(ctx, submit, None).await?;
-    let run = crate::run::follow(ctx, submitted.run, false).await?;
+    let run = crate::run::follow(ctx, submitted.run).await?;
     if run.status == calcifer::Status::Completed {
         updated(ctx, &m.name, &verify(ctx, &m.name, run.id.as_str(), &want).await?);
     }
@@ -640,7 +640,7 @@ pub async fn toolchain(ctx: &Context, name: &str) -> Result<ExitCode, Error> {
         warnings: vec![],
     };
     let submitted = crate::run::submit(ctx, submit, None).await?;
-    let run = crate::run::follow(ctx, submitted.run, false).await?;
+    let run = crate::run::follow(ctx, submitted.run).await?;
     Ok(crate::run::exit_code(&run))
 }
 

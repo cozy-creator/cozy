@@ -25,12 +25,6 @@ pub struct Rent {
     /// Disk in GB, at least (the Hub's default is 100).
     #[arg(long, requires = "sku", value_parser = clap::value_parser!(u32).range(1..))]
     disk_gb: Option<u32>,
-    /// Return once the Hub accepts the order, without following the boot.
-    #[arg(long, requires = "sku")]
-    detach: bool,
-    /// Resume this paid order instead of placing a new one.
-    #[arg(long, requires = "sku")]
-    idempotency_key: Option<String>,
     /// A Hub admin's worker image by digest (sha256:<hex>), for a gated image bake.
     #[arg(long, requires = "sku", hide = true, value_parser = image_digest)]
     image_digest: Option<String>,
@@ -57,8 +51,8 @@ pub async fn exec(ctx: &Context, rent: Rent) -> Result<ExitCode, Error> {
     };
     let gpus = rent.gpus.unwrap_or(1);
     admit(ctx, &hub, &sku, gpus).await?;
-    let minted = rent.idempotency_key.is_none();
-    let key = rent.idempotency_key.unwrap_or_else(mint_key);
+    // One key names this order: Calcifer keeps the ask under it, and a retry never orders twice.
+    let key = mint_key();
     let ask = |agreed| NewMachine::Rent {
         sku: sku.clone(),
         hub: hub.origin.to_string(),
@@ -83,12 +77,11 @@ pub async fn exec(ctx: &Context, rent: Rent) -> Result<ExitCode, Error> {
     }
     let agreed = Some(quoted.quote.agreed());
     let rented: Rented = match calcifer.post("/v1/machines", &ask(agreed), Some(&key)).await {
-        // An answer lost on the way back may still have placed the order: only its key resumes it.
-        Err(e) if minted && matches!(e.kind, Kind::Unavailable | Kind::Internal) => {
-            return Err(e.remedy(format!(
-                "the order may stand; resume it (never a second one) with \
-                 `cozy machine rent {sku} --idempotency-key {key}`"
-            )));
+        // An answer lost on the way back may still have placed the order, which Calcifer keeps.
+        Err(e) if matches!(e.kind, Kind::Unavailable | Kind::Internal) => {
+            return Err(e
+                .remedy("the order may stand: `cozy machine list` shows it before you rent again")
+                .next("cozy machine list"));
         }
         answer => answer?,
     };
@@ -105,12 +98,9 @@ pub async fn exec(ctx: &Context, rent: Rent) -> Result<ExitCode, Error> {
     if rented.replay {
         output::say(ctx, "this order was placed already; following it");
     }
-    let machine = match rent.detach {
-        true => rented.machine.clone(),
-        false => match follow(ctx, rented.machine.clone(), notices).await? {
-            Some(machine) => machine,
-            None => return Ok(ExitCode::SUCCESS),
-        },
+    let machine = match follow(ctx, rented.machine.clone(), notices).await? {
+        Some(machine) => machine,
+        None => return Ok(ExitCode::SUCCESS),
     };
     if ctx.json {
         output::json(&Rented { machine, ..rented });
