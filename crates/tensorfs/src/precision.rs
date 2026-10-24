@@ -14,7 +14,8 @@ const VOCABULARY: [&str; 7] = ["bf16", "fp16", "int8", "fp8", "nvfp4", "w4a8", "
 /// The GPUs a function runs on as the rule reads them (design §2.1, §2.7): the native formats
 /// every one runs (`mma`: cc 8.0 or later, where `nvfp4` serves at least weight-only; 10.3 has
 /// no int8; `bf16`: unless a GPU is known below cc 8.0; `fp4`: FP4 tensor cores, cc 10.0 or later)
-/// and how a warning names them (`sm90`, `sm86+sm89`).
+/// and how a warning names them (`sm90`, `sm86+sm89`). An Apple GPU's row is its Metal family
+/// (`apple9`): it runs bf16 and fp16 and no encoded format until Metal kernels exist.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Gpus {
     pub mma: bool,
@@ -22,6 +23,7 @@ pub struct Gpus {
     pub int8: bool,
     pub fp8: bool,
     pub fp4: bool,
+    pub apple: bool,
     pub name: String,
     pub capabilities: Vec<String>,
 }
@@ -41,7 +43,12 @@ impl Gpus {
             Some(major.parse::<u32>().ok()? * 10 + minor.parse::<u32>().ok()?)
         });
         let all = |runs: fn(u32) -> bool| !ccs.is_empty() && ccs.iter().all(|cc| runs(number(cc).unwrap_or(0)));
-        let mut names: Vec<String> = ccs.iter().filter(|cc| !cc.is_empty()).map(|cc| format!("sm{}", cc.replace('.', ""))).collect();
+        let apple = !ccs.is_empty() && ccs.iter().all(|cc| cc.starts_with("apple"));
+        let named = |cc: &&str| match cc.starts_with("apple") {
+            true => cc.to_string(),
+            false => format!("sm{}", cc.replace('.', "")),
+        };
+        let mut names: Vec<String> = ccs.iter().filter(|cc| !cc.is_empty()).map(named).collect();
         names.sort();
         names.dedup();
         let name = if names.is_empty() { "no GPU".into() } else { names.join("+") };
@@ -52,6 +59,7 @@ impl Gpus {
             int8: all(|cc| cc >= 80 && cc != 103),
             fp8: all(|cc| cc >= 89),
             fp4: all(|cc| cc >= 100),
+            apple,
             name,
             capabilities: ccs.iter().map(|cc| cc.to_string()).collect(),
         }
@@ -137,10 +145,12 @@ impl Slot {
     /// `min_bits` unasked; no encoded weights unless it takes encoded leaves.
     pub fn constraints(&self, gpus: &Gpus, asked: u32) -> Constraints {
         let bits = (!self.raw && matches!(asked, 4 | 8 | 16)).then_some(asked);
+        // An Apple GPU's only width is 16 bits: its lanes are named so.
+        let width = if gpus.apple { 16 } else { self.bits(asked) };
         Constraints {
             gpus: gpus.capabilities.clone(),
             bits,
-            prefer: bits.is_none().then(|| self.bits(asked)),
+            prefer: bits.is_none().then_some(width),
             min_bits: u32::try_from(self.min_bits).ok(),
             plain: !self.encoded,
         }
@@ -245,11 +255,15 @@ pub struct Constraints {
 }
 
 impl Constraints {
-    /// Refused unless each width they name is 4, 8 or 16.
+    /// Refused unless each width they name is 4, 8 or 16, and asked 16 on Apple GPUs.
     pub fn check(&self) -> crate::Result<()> {
-        match [self.bits, self.prefer, self.min_bits].into_iter().flatten().find(|bits| ![4, 8, 16].contains(bits)) {
-            Some(bits) => crate::failure::fail(crate::Kind::Invalid, format!("bits {bits} is not 4, 8 or 16")),
-            None => Ok(()),
+        if let Some(bits) = [self.bits, self.prefer, self.min_bits].into_iter().flatten().find(|bits| ![4, 8, 16].contains(bits)) {
+            return crate::failure::fail(crate::Kind::Invalid, format!("bits {bits} is not 4, 8 or 16"));
+        }
+        match self.bits {
+            Some(bits @ (4 | 8)) if self.rule().0.apple => crate::failure::fail(crate::Kind::Invalid, format!(
+                "precision {bits}: Apple GPUs run 16-bit weights until Metal kernels exist; run without --lane, or with --lane 16")),
+            _ => Ok(()),
         }
     }
 
