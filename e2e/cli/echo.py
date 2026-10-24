@@ -6,5 +6,5 @@
 reply and back, with no model, so it runs on any computer."""
 
 
-def main(text: str) -> str:
+def main(*, text: str) -> str:
     return text[::-1]

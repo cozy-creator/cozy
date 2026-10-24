@@ -47,7 +47,7 @@ install() {
 }
 
 step "published packages"
-cozy --json package search --limit 500 > "$OUT/search.json" || fail "cozy package search failed"
+cozy --json package search --limit 200 > "$OUT/search.json" || fail "cozy package search failed"
 releases=$(jq -r '.packages[] | select((.package | contains("/") | not) and .latest_release != null) | "\(.package) \(.latest_release)"' "$OUT/search.json")
 [ -n "$releases" ] || fail "the Hub lists no first-party package release"
 while read -r name release; do
