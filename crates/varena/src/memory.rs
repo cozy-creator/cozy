@@ -1766,6 +1766,7 @@ impl Inner {
     /// (a fill: waited for). `why` and `req` name it in the request's record.
     fn make_room(&self, bytes: u64, keep: &[Key], why: &'static str, req: Option<u64>, free_only: bool) -> Result<u64> {
         let mut record = MakeRoom { step: 0, trigger: why.into(), need: bytes, freed: 0, waited: 0 };
+        let mut graphs_tried = false;
         let out = loop {
             let mut st = self.lock();
             // A refused create, or a manager's refusal, says there is less than the figures: the
@@ -1784,6 +1785,14 @@ impl Inner {
             if free >= bytes {
                 self.unlock(st);
                 break Ok(free);
+            }
+            // Short with pages pinned: its own graphs no replay holds go first (their pins keep
+            // a whole model; it runs eager and records again), never the manager's Reclaim.
+            if !graphs_tried && st.table.pages().any(|(k, p)| p.mapped && !p.pins.is_empty() && !keep.contains(&k)) {
+                graphs_tried = true;
+                self.unlock(st);
+                crate::region::drop_quiet_graphs(|m| std::ptr::eq(Arc::as_ptr(&m.inner), self));
+                continue;
             }
             // Idle work (a request opened idle, a free-only bind) takes free bytes only; nothing
             // takes more than it could ever have (its pinned pages stay).

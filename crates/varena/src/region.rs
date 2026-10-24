@@ -636,7 +636,8 @@ impl Memory {
         Ok(GraphRegion { g })
     }
 
-    /// The manager's Reclaim of region `id`, whole (from the agent's mechanism thread, never its
+    
+/// The manager's Reclaim of region `id`, whole (from the agent's mechanism thread, never its
     /// reader): a cache region is swapped (`swap`, when it spills) or discarded once unpinned; a graph
     /// region is dropped.
     pub fn region_reclaim(&self, id: u64, swap: bool) -> Result<Reclaimed> {
@@ -692,4 +693,15 @@ pub(crate) fn reclaim(id: u64, swap: bool) -> Result<Reclaimed> {
         Some(Found::Graph(g)) => g.drop_now(),
         None => Ok(Reclaimed::Gone),
     }
+}
+
+/// A Memory's own make_room, before it waits on anything: its graph regions (`mine`) that no
+/// replay holds are dropped, their pins with them (the Runtime runs eager and records again
+/// later). Never the manager's Reclaim to wait for. How many went.
+pub(crate) fn drop_quiet_graphs(mine: impl Fn(&Memory) -> bool) -> usize {
+    let graphs: Vec<Arc<Graph>> = LIVE.lock().values().filter_map(|l| match l {
+        Live::Graph(g) => g.upgrade(),
+        Live::Cache(_) => None,
+    }).filter(|g| mine(&g.memory) && !g.dropped.load(Ordering::Acquire) && g.word.replays() == 0).collect();
+    graphs.iter().filter(|g| matches!(g.drop_now(), Ok(Reclaimed::Dropped))).count()
 }
