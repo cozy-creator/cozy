@@ -6,7 +6,6 @@ use crate::{
     machine::grant::Lifetime,
 };
 use std::{io, path::PathBuf, process::ExitCode, sync::Arc};
-use fs2::FileExt;
 use crate::{origin::Machine, storage::Store};
 
 /// `cozy machine serve [--rental]`, from the arguments after `machine`: this computer's or a
@@ -49,11 +48,12 @@ fn run(lifetime: Lifetime, service_ready: Option<u64>) -> io::Result<()> {
         }
     }
     // Whatever this process inherited (its own re-execution's credential pipe) reaches nothing
-    // it starts; descriptors it hands on are handed explicitly. Windows hands on none.
+    // it starts; descriptors it hands on are handed explicitly. 3 to 5 stay reserved for them: a
+    // log file at 5 would be read as the credential pipe. Windows hands on none.
     #[cfg(unix)]
     {
         platform::process::cloexec_from(3);
-        hold_handed_descriptors();
+        platform::process::reserve_handed()?;
     }
     let mut config = config::load(lifetime)?;
     config::init_logs(Some(&config.logs));
@@ -93,25 +93,6 @@ fn run(lifetime: Lifetime, service_ready: Option<u64>) -> io::Result<()> {
             run_machine(config, ready)
         })
         .inspect_err(|error| update::service_failed(&paths, error))
-}
-
-/// Descriptor 5 carries a re-executed machine's credential pipe. Until it is read, nothing else
-/// may take 3 to 5: a log file at 5 would be read as the pipe.
-#[cfg(unix)]
-fn hold_handed_descriptors() {
-    for fd in 3..=5 {
-        // SAFETY: plain syscalls on this process's own descriptor table, before any thread.
-        unsafe {
-            if libc::fcntl(fd, libc::F_GETFD) < 0 {
-                let null = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC);
-                if null >= 0 && null != fd {
-                    libc::dup2(null, fd);
-                    libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
-                    libc::close(null);
-                }
-            }
-        }
-    }
 }
 
 /// The machine's async runtime: its API and its lifecycle, where every request in flight is a
@@ -215,7 +196,7 @@ fn own(root: &std::path::Path, store: &std::path::Path, paths: Option<&crate::ma
     std::fs::create_dir_all(root)?;
     let lock = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false)
         .open(root.join("owner.lock"))?;
-    lock.try_lock_exclusive()
+    lock.try_lock()
         .map_err(|_| io::Error::new(io::ErrorKind::AlreadyExists, "state already has a machine owner"))?;
     platform::durable::set_mode(root, 0o700)?;
     let store = match paths {

@@ -136,8 +136,7 @@ fn glibc_needed(path: &Path) -> Option<(String, String)> {
             parse(&tail[..end])
         })
         .max()?;
-    // SAFETY: glibc returns a static NUL-terminated string.
-    let have = unsafe { std::ffi::CStr::from_ptr(libc::gnu_get_libc_version()) }.to_string_lossy().into_owned();
+    let have = platform::process::glibc_version();
     (parse(have.as_bytes())? < need).then(|| (format!("{}.{}", need.0, need.1), have))
 }
 

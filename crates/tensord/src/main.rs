@@ -1,5 +1,6 @@
 //! The `tensord` binary: the machine role for TensorD's and Calcifer's tests. `cozy machine
 //! serve` is the product's entry.
+#![forbid(unsafe_code)]
 use clap::{Parser, Subcommand};
 use std::process::ExitCode;
 use tensord::{

@@ -2,7 +2,6 @@
 //! The service commits actor/installation aliases in its one execution journal.
 use super::workspaces::{RootSet, UploadedPackage};
 use platform::durable::Mode;
-use fs2::FileExt;
 use serde::Deserialize;
 use std::{
     fs::{self, File, OpenOptions},
@@ -84,7 +83,7 @@ pub fn materialize_uploaded(
         .mode(0o600)
         .open(root.join("active.lock"))
         .map_err(storage)?;
-    hold.lock_exclusive().map_err(storage)?;
+    hold.lock().map_err(storage)?;
     let mut materialized = MaterializedPackage {
         root_set: uploaded.root.clone(),
         project: None,

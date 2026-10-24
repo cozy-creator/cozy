@@ -398,6 +398,24 @@ pub fn primary_context(ordinal: c_int) -> Result<(CUdevice, CUcontext)> {
     Ok((dev, ctx))
 }
 
+/// How many devices the driver shows this process.
+pub fn device_count() -> Result<c_int> {
+    let d = driver()?;
+    let mut count: c_int = 0;
+    // SAFETY: out-param.
+    check("cuDeviceGetCount", unsafe { (d.device_get_count)(&mut count) })?;
+    Ok(count)
+}
+
+/// The device at `ordinal`; a bad ordinal is a driver error.
+pub fn device_at(ordinal: c_int) -> Result<CUdevice> {
+    let d = driver()?;
+    let mut dev: CUdevice = 0;
+    // SAFETY: out-param; a bad ordinal is a driver error, not UB.
+    check("cuDeviceGet", unsafe { (d.device_get)(&mut dev, ordinal) })?;
+    Ok(dev)
+}
+
 pub fn attribute(dev: CUdevice, attr: c_int) -> Result<i32> {
     let d = driver()?;
     let mut v: c_int = 0;

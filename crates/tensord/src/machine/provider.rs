@@ -200,15 +200,11 @@ fn reexec(own: Option<&ProviderSelf>) -> io::Error {
 /// closed); None when it handed none.
 #[cfg(target_os = "linux")]
 fn inherited() -> Option<ProviderSelf> {
-    use std::os::fd::FromRawFd;
-    // SAFETY: CREDENTIAL_FD is the parent's pipe, or not open (F_GETFD then fails).
-    if unsafe { libc::fcntl(CREDENTIAL_FD, libc::F_GETFD) } < 0 {
-        return None;
-    }
-    // SAFETY: the open fd is owned by nothing else in this process. The pipe was written and
-    // closed before the exec, so a read never waits on it.
-    let pipe = unsafe { File::from_raw_fd(CREDENTIAL_FD) };
-    unsafe { libc::fcntl(CREDENTIAL_FD, libc::F_SETFL, libc::O_NONBLOCK) };
+    use nix::fcntl::{fcntl, FcntlArg, OFlag};
+    // The parent's pipe, written and closed before the exec; nonblocking, so whatever else
+    // sits there never makes a read wait.
+    let pipe = platform::process::take_handed(CREDENTIAL_FD)?;
+    fcntl(&pipe, FcntlArg::F_SETFL(OFlag::O_NONBLOCK)).ok()?;
     let mut bytes = Vec::new();
     let _ = pipe.take(64 << 10).read_to_end(&mut bytes);
     serde_json::from_slice(&bytes).ok()

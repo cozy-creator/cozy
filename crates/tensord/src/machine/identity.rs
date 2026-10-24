@@ -81,13 +81,14 @@ pub fn open(layout: &Layout) -> io::Result<Lifetime> {
     }
     let cert_pem = fs::read_to_string(&cert_path)?;
     let key_pem = fs::read_to_string(&key_path)?;
-    let certs: Vec<_> =
-        rustls_pemfile::certs(&mut cert_pem.as_bytes()).collect::<Result<_, _>>()?;
+    use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
+    let certs: Vec<_> = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
+        .collect::<Result<_, _>>()
+        .map_err(io::Error::other)?;
     let [cert] = certs.as_slice() else {
         return Err(invalid("the machine leaf must be exactly one certificate"));
     };
-    rustls_pemfile::private_key(&mut key_pem.as_bytes())?
-        .ok_or_else(|| invalid("the machine leaf has no private key"))?;
+    PrivateKeyDer::from_pem_slice(key_pem.as_bytes()).map_err(|_| invalid("the machine leaf has no private key"))?;
     Ok(Lifetime {
         boot_id,
         cert_der: cert.as_ref().to_vec(),

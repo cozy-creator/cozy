@@ -2,12 +2,11 @@
 use super::{auth::Authority, server::MachineIdentity};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use ed25519_dalek::VerifyingKey;
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use platform::durable::Mode;
 use std::{
     fs::{self, File, OpenOptions},
-    io::{self, BufReader, Read, Write},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -70,7 +69,7 @@ impl MachineIdentity {
         private_directory(&config.identity_directory)?;
         let lock = platform::durable::open_nofollow(&config.identity_directory.join("identity.lock"), OpenOptions::new().create(true).truncate(false).read(true).write(true).mode(0o600)).map_err(std::io::Error::from)?;
         check_file(&lock, true)?;
-        lock.lock_exclusive()?;
+        lock.lock()?;
         let path = config.identity_directory.join("identity.json");
         let pending = config.identity_directory.join("identity.pending");
         let retained = if path.exists() {
@@ -111,15 +110,15 @@ impl MachineIdentity {
         if key.algorithm() != &rcgen::PKCS_ECDSA_P256_SHA256 {
             return Err(invalid("retained TLS key must be P256"));
         }
-        let certificates: Vec<_> =
-            rustls_pemfile::certs(&mut BufReader::new(retained.certificate_pem.as_bytes()))
-                .collect::<Result<_, _>>()?;
+        use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
+        let certificates: Vec<_> = CertificateDer::pem_slice_iter(retained.certificate_pem.as_bytes())
+            .collect::<Result<_, _>>()
+            .map_err(other)?;
         if certificates.len() != 1 {
             return Err(invalid("retained identity must contain one exact TLS leaf"));
         }
-        let private_key =
-            rustls_pemfile::private_key(&mut BufReader::new(retained.private_key_pem.as_bytes()))?
-                .ok_or_else(|| invalid("retained identity has no TLS key"))?;
+        let private_key = PrivateKeyDer::from_pem_slice(retained.private_key_pem.as_bytes())
+            .map_err(|_| invalid("retained identity has no TLS key"))?;
         rustls::sign::CertifiedKey::from_der(
             certificates.clone(),
             private_key,
